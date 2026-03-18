@@ -27,6 +27,7 @@ typedef enum {
     SPINEL_TYPE_PROC,    /* sp_Val * (lambda/closure) */
     SPINEL_TYPE_VALUE,   /* boxed mrb_value (fallback) */
     SPINEL_TYPE_STR_ARRAY, /* sp_StrArray * (string array from split) */
+    SPINEL_TYPE_REGEXP,    /* compiled regex pattern (regex_t *) */
 } spinel_type_t;
 
 /* Extended type: kind + optional class name for OBJECT types */
@@ -185,6 +186,17 @@ typedef struct {
     bool needs_gc;
     int gc_type_count;  /* number of GC-managed types (for type_id assignment) */
     bool gc_scope_active; /* true when inside a function with GC roots */
+
+    /* Regexp: true when any regex literal is used */
+    bool needs_regexp;
+    int regexp_counter;   /* unique ID for each compiled regex pattern */
+
+    /* Regexp pattern storage (source strings for initialization) */
+    #define MAX_REGEXPS 64
+    struct {
+        char pattern[256];  /* regex source pattern */
+        int id;             /* unique ID (_re_N) */
+    } regexps[MAX_REGEXPS];
 
     /* Lambda scope stack for capture analysis */
     #define MAX_LAMBDA_DEPTH 64

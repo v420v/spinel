@@ -951,6 +951,8 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                 if (strcmp(method, "strip") == 0 || strcmp(method, "chomp") == 0 ||
                     strcmp(method, "capitalize") == 0 || strcmp(method, "reverse") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
                 if (strcmp(method, "gsub") == 0 || strcmp(method, "sub") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
+                if (strcmp(method, "match?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
+                if (strcmp(method, "=~") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
                 if (strcmp(method, "count") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
                 if (strcmp(method, "start_with?") == 0 || strcmp(method, "end_with?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
                 if (strcmp(method, "==") == 0 || strcmp(method, "!=") == 0 || strcmp(method, "<") == 0 ||
@@ -1162,6 +1164,17 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
         return vt_prim(SPINEL_TYPE_NIL);
     }
 
+    case PM_REGULAR_EXPRESSION_NODE:
+        return vt_prim(SPINEL_TYPE_REGEXP);
+
+    case PM_NUMBERED_REFERENCE_READ_NODE:
+        return vt_prim(SPINEL_TYPE_STRING);
+
+    case PM_MATCH_WRITE_NODE: {
+        pm_match_write_node_t *mw = (pm_match_write_node_t *)node;
+        return infer_type(ctx, (pm_node_t *)mw->call);
+    }
+
     default:
         return vt_prim(SPINEL_TYPE_VALUE);
     }
@@ -1354,12 +1367,19 @@ static void infer_pass(codegen_ctx_t *ctx, pm_node_t *node) {
                             }
                         }
                     } else if (bp->parameters->requireds.size > 0) {
-                        /* Register block parameter as integer */
+                        /* Determine block parameter type based on method */
+                        spinel_type_t bp_type = SPINEL_TYPE_INTEGER;
+                        {
+                            char *meth = cstr(ctx, call->name);
+                            if (strcmp(meth, "scan") == 0)
+                                bp_type = SPINEL_TYPE_STRING;
+                            free(meth);
+                        }
                         pm_node_t *p = bp->parameters->requireds.nodes[0];
                         if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE) {
                             pm_required_parameter_node_t *rp = (pm_required_parameter_node_t *)p;
                             char *pname = cstr(ctx, rp->name);
-                            var_declare(ctx, pname, vt_prim(SPINEL_TYPE_INTEGER), false);
+                            var_declare(ctx, pname, vt_prim(bp_type), false);
                             free(pname);
                         }
                     }
@@ -2576,6 +2596,15 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                 free(left); free(right); free(method);
                 return r;
             }
+            /* str =~ /regexp/ → (sp_re_match(_re_N, str) >= 0) */
+            if (lt.kind == SPINEL_TYPE_STRING && rt.kind == SPINEL_TYPE_REGEXP &&
+                strcmp(method, "=~") == 0) {
+                char *left = codegen_expr(ctx, call->receiver);
+                char *right = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                char *r = sfmt("(sp_re_match(%s, %s) >= 0)", right, left);
+                free(left); free(right); free(method);
+                return r;
+            }
         }
 
         /* Binary operators on numeric types → direct C ops */
@@ -3031,25 +3060,61 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     r = sfmt("sp_str_ends_with(%s, %s)", recv, arg);
                     free(arg);
                 }
+                else if (strcmp(method, "match?") == 0 && call->arguments &&
+                         call->arguments->arguments.size == 1) {
+                    vtype_t argt = infer_type(ctx, call->arguments->arguments.nodes[0]);
+                    if (argt.kind == SPINEL_TYPE_REGEXP) {
+                        char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                        r = sfmt("sp_re_match_p(%s, %s)", arg, recv);
+                        free(arg);
+                    } else {
+                        char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                        r = sfmt("(strstr(%s, %s) != NULL)", recv, arg);
+                        free(arg);
+                    }
+                }
                 else if (strcmp(method, "gsub") == 0 && call->arguments &&
                          call->arguments->arguments.size == 2) {
-                    char *from = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    char *to = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
-                    r = sfmt("sp_str_gsub(%s, %s, %s)", recv, from, to);
-                    free(from); free(to);
+                    vtype_t argt = infer_type(ctx, call->arguments->arguments.nodes[0]);
+                    if (argt.kind == SPINEL_TYPE_REGEXP) {
+                        char *pat = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                        char *to = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
+                        r = sfmt("sp_re_gsub(%s, %s, %s)", pat, recv, to);
+                        free(pat); free(to);
+                    } else {
+                        char *from = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                        char *to = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
+                        r = sfmt("sp_str_gsub(%s, %s, %s)", recv, from, to);
+                        free(from); free(to);
+                    }
                 }
                 else if (strcmp(method, "sub") == 0 && call->arguments &&
                          call->arguments->arguments.size == 2) {
-                    char *from = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    char *to = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
-                    r = sfmt("sp_str_sub(%s, %s, %s)", recv, from, to);
-                    free(from); free(to);
+                    vtype_t argt = infer_type(ctx, call->arguments->arguments.nodes[0]);
+                    if (argt.kind == SPINEL_TYPE_REGEXP) {
+                        char *pat = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                        char *to = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
+                        r = sfmt("sp_re_sub(%s, %s, %s)", pat, recv, to);
+                        free(pat); free(to);
+                    } else {
+                        char *from = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                        char *to = codegen_expr(ctx, call->arguments->arguments.nodes[1]);
+                        r = sfmt("sp_str_sub(%s, %s, %s)", recv, from, to);
+                        free(from); free(to);
+                    }
                 }
                 else if (strcmp(method, "split") == 0 && call->arguments &&
                          call->arguments->arguments.size == 1) {
-                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                    r = sfmt("sp_str_split(%s, %s)", recv, arg);
-                    free(arg);
+                    vtype_t argt = infer_type(ctx, call->arguments->arguments.nodes[0]);
+                    if (argt.kind == SPINEL_TYPE_REGEXP) {
+                        char *pat = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                        r = sfmt("sp_re_split(%s, %s)", pat, recv);
+                        free(pat);
+                    } else {
+                        char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                        r = sfmt("sp_str_split(%s, %s)", recv, arg);
+                        free(arg);
+                    }
                 }
                 if (r) {
                     free(recv); free(method);
@@ -3721,6 +3786,40 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
         return r;
     }
 
+    case PM_REGULAR_EXPRESSION_NODE: {
+        pm_regular_expression_node_t *re = (pm_regular_expression_node_t *)node;
+        const uint8_t *src = pm_string_source(&re->unescaped);
+        size_t len = pm_string_length(&re->unescaped);
+        /* Check if this pattern is already registered */
+        char pat[256];
+        size_t plen = len < 255 ? len : 255;
+        memcpy(pat, src, plen);
+        pat[plen] = '\0';
+        for (int i = 0; i < ctx->regexp_counter; i++) {
+            if (strcmp(ctx->regexps[i].pattern, pat) == 0)
+                return sfmt("_re_%d", ctx->regexps[i].id);
+        }
+        /* Register new regexp */
+        int id = ctx->regexp_counter;
+        if (ctx->regexp_counter < MAX_REGEXPS) {
+            snprintf(ctx->regexps[ctx->regexp_counter].pattern, 256, "%s", pat);
+            ctx->regexps[ctx->regexp_counter].id = id;
+            ctx->regexp_counter++;
+        }
+        ctx->needs_regexp = true;
+        return sfmt("_re_%d", id);
+    }
+
+    case PM_NUMBERED_REFERENCE_READ_NODE: {
+        pm_numbered_reference_read_node_t *nr = (pm_numbered_reference_read_node_t *)node;
+        return sfmt("sp_re_group(%d)", (int)nr->number);
+    }
+
+    case PM_MATCH_WRITE_NODE: {
+        pm_match_write_node_t *mw = (pm_match_write_node_t *)node;
+        return codegen_expr(ctx, (pm_node_t *)mw->call);
+    }
+
     default:
         return sfmt("0 /* TODO: expr %d */", PM_NODE_TYPE(node));
     }
@@ -4287,6 +4386,60 @@ static void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 ctx->indent--;
                 emit(ctx, "}\n");
                 free(recv); free(kname); free(vname); free(method);
+                break;
+            }
+        }
+
+        /* String#scan(regexp) { |m| ... } → inline loop with onig_search */
+        if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE &&
+            strcmp(method, "scan") == 0 && call->receiver &&
+            call->arguments && call->arguments->arguments.size == 1) {
+            vtype_t recv_t = infer_type(ctx, call->receiver);
+            vtype_t arg_t = infer_type(ctx, call->arguments->arguments.nodes[0]);
+            if (recv_t.kind == SPINEL_TYPE_STRING && arg_t.kind == SPINEL_TYPE_REGEXP) {
+                pm_block_node_t *blk = (pm_block_node_t *)call->block;
+                char *recv = codegen_expr(ctx, call->receiver);
+                char *pat = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                char *bpname = NULL;
+                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+                    if (bp->parameters && bp->parameters->requireds.size > 0) {
+                        pm_node_t *p = bp->parameters->requireds.nodes[0];
+                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+                    }
+                }
+                int tmp = ctx->temp_counter++;
+                emit(ctx, "{ /* scan */\n");
+                ctx->indent++;
+                emit(ctx, "const char *_ss_%d = %s;\n", tmp, recv);
+                emit(ctx, "OnigRegion *_sr_%d = onig_region_new();\n", tmp);
+                emit(ctx, "const OnigUChar *_se_%d = (const OnigUChar *)_ss_%d + strlen(_ss_%d);\n", tmp, tmp, tmp);
+                emit(ctx, "int _sp_%d = 0;\n", tmp);
+                emit(ctx, "while (_sp_%d >= 0) {\n", tmp);
+                ctx->indent++;
+                emit(ctx, "_sp_%d = onig_search(%s, (const OnigUChar *)_ss_%d, _se_%d,\n", tmp, pat, tmp, tmp);
+                emit(ctx, "    (const OnigUChar *)_ss_%d + _sp_%d, _se_%d, _sr_%d, ONIG_OPTION_NONE);\n", tmp, tmp, tmp, tmp);
+                emit(ctx, "if (_sp_%d >= 0) {\n", tmp);
+                ctx->indent++;
+                if (bpname) {
+                    char *cn = make_cname(bpname, false);
+                    emit(ctx, "int _ml_%d = _sr_%d->end[0] - _sr_%d->beg[0];\n", tmp, tmp, tmp);
+                    emit(ctx, "char *%s = (char *)malloc(_ml_%d + 1);\n", cn, tmp);
+                    emit(ctx, "memcpy(%s, _ss_%d + _sr_%d->beg[0], _ml_%d);\n", cn, tmp, tmp, tmp);
+                    emit(ctx, "%s[_ml_%d] = '\\0';\n", cn, tmp);
+                    free(cn);
+                }
+                if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+                emit(ctx, "_sp_%d = _sr_%d->end[0];\n", tmp, tmp);
+                ctx->indent--;
+                emit(ctx, "}\n");
+                ctx->indent--;
+                emit(ctx, "}\n");
+                emit(ctx, "onig_region_free(_sr_%d, 1);\n", tmp);
+                ctx->indent--;
+                emit(ctx, "}\n");
+                free(recv); free(pat); free(bpname); free(method);
                 break;
             }
         }
@@ -5353,6 +5506,144 @@ static void emit_header(codegen_ctx_t *ctx) {
     emit_raw(ctx, "    for (mrb_int i = 0; i < n; i++) memcpy(r + sl * i, s, sl);\n");
     emit_raw(ctx, "    r[sl * n] = '\\0'; return r;\n}\n\n");
 
+    /* ---- Regexp runtime (only when needed) ---- */
+    if (ctx->needs_regexp) {
+        emit_raw(ctx, "/* ---- Regexp runtime (oniguruma) ---- */\n");
+        emit_raw(ctx, "/* Link with: /usr/lib/x86_64-linux-gnu/libonig.so.5 */\n");
+        emit_raw(ctx, "/* Minimal oniguruma declarations — no header needed */\n");
+        emit_raw(ctx, "typedef unsigned char OnigUChar;\n");
+        emit_raw(ctx, "typedef struct OnigEncodingTypeST OnigEncodingType;\n");
+        emit_raw(ctx, "typedef OnigEncodingType *OnigEncoding;\n");
+        emit_raw(ctx, "typedef struct { int num_regs; int *beg; int *end; } OnigRegion;\n");
+        emit_raw(ctx, "typedef struct re_pattern_buffer regex_t;\n");
+        emit_raw(ctx, "typedef struct { int ret; const OnigUChar *s; } OnigErrorInfo;\n");
+        emit_raw(ctx, "typedef struct OnigSyntaxTypeST OnigSyntaxType;\n");
+        emit_raw(ctx, "#define ONIG_OPTION_DEFAULT 0\n");
+        emit_raw(ctx, "#define ONIG_OPTION_NONE 0\n");
+        emit_raw(ctx, "extern OnigEncodingType OnigEncodingUTF8;\n");
+        emit_raw(ctx, "extern OnigSyntaxType OnigSyntaxRuby;\n");
+        emit_raw(ctx, "extern int onig_initialize(OnigEncoding *encs, int n);\n");
+        emit_raw(ctx, "extern int onig_new(regex_t **reg, const OnigUChar *pattern,\n");
+        emit_raw(ctx, "    const OnigUChar *pattern_end, int option, OnigEncoding enc,\n");
+        emit_raw(ctx, "    OnigSyntaxType *syntax, OnigErrorInfo *einfo);\n");
+        emit_raw(ctx, "extern int onig_search(regex_t *reg, const OnigUChar *str,\n");
+        emit_raw(ctx, "    const OnigUChar *end, const OnigUChar *start, const OnigUChar *range,\n");
+        emit_raw(ctx, "    OnigRegion *region, int option);\n");
+        emit_raw(ctx, "extern OnigRegion *onig_region_new(void);\n");
+        emit_raw(ctx, "extern void onig_region_free(OnigRegion *region, int free_self);\n\n");
+
+        /* Global match region for $1..$9 */
+        emit_raw(ctx, "static OnigRegion *sp_match_region;\n");
+        emit_raw(ctx, "static const char *sp_match_str;\n\n");
+
+        /* Static regex variables */
+        for (int i = 0; i < ctx->regexp_counter; i++)
+            emit_raw(ctx, "static regex_t *_re_%d;\n", ctx->regexps[i].id);
+        emit_raw(ctx, "\n");
+
+        /* sp_regexp_init — compile all patterns at startup */
+        emit_raw(ctx, "static void sp_regexp_init(void) {\n");
+        emit_raw(ctx, "    OnigEncoding enc = &OnigEncodingUTF8;\n");
+        emit_raw(ctx, "    OnigErrorInfo einfo;\n");
+        emit_raw(ctx, "    onig_initialize(&enc, 1);\n");
+        emit_raw(ctx, "    sp_match_region = onig_region_new();\n");
+        for (int i = 0; i < ctx->regexp_counter; i++) {
+            /* Escape the pattern for C string literal */
+            const char *pat = ctx->regexps[i].pattern;
+            size_t plen = strlen(pat);
+            char escaped[1024];
+            int ep = 0;
+            for (size_t j = 0; j < plen && ep < 1020; j++) {
+                if (pat[j] == '\\') { escaped[ep++] = '\\'; escaped[ep++] = '\\'; }
+                else if (pat[j] == '"') { escaped[ep++] = '\\'; escaped[ep++] = '"'; }
+                else escaped[ep++] = pat[j];
+            }
+            escaped[ep] = '\0';
+            emit_raw(ctx, "    onig_new(&_re_%d, (const OnigUChar *)\"%s\", (const OnigUChar *)\"%s\" + %zu,\n",
+                     ctx->regexps[i].id, escaped, escaped, plen);
+            emit_raw(ctx, "        ONIG_OPTION_DEFAULT, &OnigEncodingUTF8, &OnigSyntaxRuby, &einfo);\n");
+        }
+        emit_raw(ctx, "}\n\n");
+
+        /* sp_re_match — perform match, store results, return position or -1 */
+        emit_raw(ctx, "static mrb_int sp_re_match(regex_t *re, const char *s) {\n");
+        emit_raw(ctx, "    sp_match_str = s;\n");
+        emit_raw(ctx, "    const OnigUChar *end = (const OnigUChar *)s + strlen(s);\n");
+        emit_raw(ctx, "    int r = onig_search(re, (const OnigUChar *)s, end,\n");
+        emit_raw(ctx, "        (const OnigUChar *)s, end, sp_match_region, ONIG_OPTION_NONE);\n");
+        emit_raw(ctx, "    return (mrb_int)r;\n");
+        emit_raw(ctx, "}\n\n");
+
+        /* sp_re_match_p — check if match exists (boolean) */
+        emit_raw(ctx, "static mrb_bool sp_re_match_p(regex_t *re, const char *s) {\n");
+        emit_raw(ctx, "    const OnigUChar *end = (const OnigUChar *)s + strlen(s);\n");
+        emit_raw(ctx, "    int r = onig_search(re, (const OnigUChar *)s, end,\n");
+        emit_raw(ctx, "        (const OnigUChar *)s, end, sp_match_region, ONIG_OPTION_NONE);\n");
+        emit_raw(ctx, "    return r >= 0;\n");
+        emit_raw(ctx, "}\n\n");
+
+        /* sp_re_group — extract $N from last match */
+        emit_raw(ctx, "static const char *sp_re_group(int n) {\n");
+        emit_raw(ctx, "    if (n < 0 || n >= sp_match_region->num_regs) return \"\";\n");
+        emit_raw(ctx, "    int beg = sp_match_region->beg[n], end = sp_match_region->end[n];\n");
+        emit_raw(ctx, "    if (beg < 0) return \"\";\n");
+        emit_raw(ctx, "    int len = end - beg;\n");
+        emit_raw(ctx, "    char *r = (char *)malloc(len + 1);\n");
+        emit_raw(ctx, "    memcpy(r, sp_match_str + beg, len);\n");
+        emit_raw(ctx, "    r[len] = '\\0';\n");
+        emit_raw(ctx, "    return r;\n");
+        emit_raw(ctx, "}\n\n");
+
+        /* sp_re_gsub — global substitution with regexp */
+        emit_raw(ctx, "static const char *sp_re_gsub(regex_t *re, const char *s, const char *repl) {\n");
+        emit_raw(ctx, "    size_t slen = strlen(s), rlen = strlen(repl);\n");
+        emit_raw(ctx, "    size_t cap = slen * 2 + 16; char *out = (char *)malloc(cap); size_t oi = 0;\n");
+        emit_raw(ctx, "    OnigRegion *region = onig_region_new();\n");
+        emit_raw(ctx, "    const OnigUChar *end = (const OnigUChar *)s + slen;\n");
+        emit_raw(ctx, "    int pos = 0;\n");
+        emit_raw(ctx, "    while (pos <= (int)slen) {\n");
+        emit_raw(ctx, "        int r = onig_search(re, (const OnigUChar *)s, end,\n");
+        emit_raw(ctx, "            (const OnigUChar *)s + pos, end, region, ONIG_OPTION_NONE);\n");
+        emit_raw(ctx, "        if (r < 0) break;\n");
+        emit_raw(ctx, "        int mbeg = region->beg[0], mend = region->end[0];\n");
+        emit_raw(ctx, "        size_t need = oi + (mbeg - pos) + rlen + (slen - mend) + 1;\n");
+        emit_raw(ctx, "        if (need > cap) { cap = need * 2; out = (char *)realloc(out, cap); }\n");
+        emit_raw(ctx, "        memcpy(out + oi, s + pos, mbeg - pos); oi += mbeg - pos;\n");
+        emit_raw(ctx, "        memcpy(out + oi, repl, rlen); oi += rlen;\n");
+        emit_raw(ctx, "        pos = mend;\n");
+        emit_raw(ctx, "        if (mend == mbeg) pos++; /* avoid infinite loop on zero-width match */\n");
+        emit_raw(ctx, "    }\n");
+        emit_raw(ctx, "    size_t rest = slen - pos;\n");
+        emit_raw(ctx, "    if (oi + rest + 1 > cap) { cap = oi + rest + 1; out = (char *)realloc(out, cap); }\n");
+        emit_raw(ctx, "    memcpy(out + oi, s + pos, rest); oi += rest;\n");
+        emit_raw(ctx, "    out[oi] = '\\0';\n");
+        emit_raw(ctx, "    onig_region_free(region, 1);\n");
+        emit_raw(ctx, "    return out;\n");
+        emit_raw(ctx, "}\n\n");
+
+        /* sp_re_sub — single substitution with regexp */
+        emit_raw(ctx, "static const char *sp_re_sub(regex_t *re, const char *s, const char *repl) {\n");
+        emit_raw(ctx, "    size_t slen = strlen(s), rlen = strlen(repl);\n");
+        emit_raw(ctx, "    OnigRegion *region = onig_region_new();\n");
+        emit_raw(ctx, "    const OnigUChar *end = (const OnigUChar *)s + slen;\n");
+        emit_raw(ctx, "    int r = onig_search(re, (const OnigUChar *)s, end,\n");
+        emit_raw(ctx, "        (const OnigUChar *)s, end, region, ONIG_OPTION_NONE);\n");
+        emit_raw(ctx, "    if (r < 0) {\n");
+        emit_raw(ctx, "        onig_region_free(region, 1);\n");
+        emit_raw(ctx, "        char *dup = (char *)malloc(slen + 1); memcpy(dup, s, slen + 1); return dup;\n");
+        emit_raw(ctx, "    }\n");
+        emit_raw(ctx, "    int mbeg = region->beg[0], mend = region->end[0];\n");
+        emit_raw(ctx, "    size_t olen = slen - (mend - mbeg) + rlen;\n");
+        emit_raw(ctx, "    char *out = (char *)malloc(olen + 1);\n");
+        emit_raw(ctx, "    memcpy(out, s, mbeg);\n");
+        emit_raw(ctx, "    memcpy(out + mbeg, repl, rlen);\n");
+        emit_raw(ctx, "    memcpy(out + mbeg + rlen, s + mend, slen - mend + 1);\n");
+        emit_raw(ctx, "    onig_region_free(region, 1);\n");
+        emit_raw(ctx, "    return out;\n");
+        emit_raw(ctx, "}\n\n");
+
+    }
+
     /* ---- GC runtime (only when needed) ---- */
     if (ctx->needs_gc) {
         emit_raw(ctx, "/* ---- Mark-and-sweep GC runtime ---- */\n");
@@ -5543,6 +5834,37 @@ static void emit_header(codegen_ctx_t *ctx) {
         emit_raw(ctx, "        size_t n = p - s; char *t = (char *)malloc(n+1); memcpy(t,s,n); t[n]='\\0'; sp_StrArray_push(a, t); s = p + dl;\n");
         emit_raw(ctx, "    }\n");
         emit_raw(ctx, "    return a;\n}\n\n");
+    }
+
+    /* sp_re_split — split string by regexp (depends on sp_StrArray) */
+    if (ctx->needs_regexp && ctx->needs_str_split) {
+        emit_raw(ctx, "static sp_StrArray *sp_re_split(regex_t *re, const char *s) {\n");
+        emit_raw(ctx, "    sp_StrArray *a = sp_StrArray_new();\n");
+        emit_raw(ctx, "    size_t slen = strlen(s);\n");
+        emit_raw(ctx, "    OnigRegion *region = onig_region_new();\n");
+        emit_raw(ctx, "    const OnigUChar *end = (const OnigUChar *)s + slen;\n");
+        emit_raw(ctx, "    int pos = 0;\n");
+        emit_raw(ctx, "    while (pos <= (int)slen) {\n");
+        emit_raw(ctx, "        int r = onig_search(re, (const OnigUChar *)s, end,\n");
+        emit_raw(ctx, "            (const OnigUChar *)s + pos, end, region, ONIG_OPTION_NONE);\n");
+        emit_raw(ctx, "        if (r < 0) break;\n");
+        emit_raw(ctx, "        int mbeg = region->beg[0], mend = region->end[0];\n");
+        emit_raw(ctx, "        int plen = mbeg - pos;\n");
+        emit_raw(ctx, "        char *part = (char *)malloc(plen + 1);\n");
+        emit_raw(ctx, "        memcpy(part, s + pos, plen); part[plen] = '\\0';\n");
+        emit_raw(ctx, "        sp_StrArray_push(a, part);\n");
+        emit_raw(ctx, "        pos = mend;\n");
+        emit_raw(ctx, "        if (mend == mbeg) pos++;\n");
+        emit_raw(ctx, "    }\n");
+        emit_raw(ctx, "    if (pos <= (int)slen) {\n");
+        emit_raw(ctx, "        int rlen = (int)slen - pos;\n");
+        emit_raw(ctx, "        char *part = (char *)malloc(rlen + 1);\n");
+        emit_raw(ctx, "        memcpy(part, s + pos, rlen); part[rlen] = '\\0';\n");
+        emit_raw(ctx, "        sp_StrArray_push(a, part);\n");
+        emit_raw(ctx, "    }\n");
+        emit_raw(ctx, "    onig_region_free(region, 1);\n");
+        emit_raw(ctx, "    return a;\n");
+        emit_raw(ctx, "}\n\n");
     }
 
     /* Built-in sp_StrIntHash for Hash support (only when hashes are used) */
@@ -5913,6 +6235,94 @@ static bool has_split_calls(codegen_ctx_t *ctx, pm_node_t *node) {
     }
     default:
         return false;
+    }
+}
+
+/* Check if AST contains any regexp nodes and collect patterns */
+static void collect_regexp_patterns(codegen_ctx_t *ctx, pm_node_t *node) {
+    if (!node) return;
+    switch (PM_NODE_TYPE(node)) {
+    case PM_PROGRAM_NODE: {
+        pm_program_node_t *p = (pm_program_node_t *)node;
+        if (p->statements) collect_regexp_patterns(ctx, (pm_node_t *)p->statements);
+        break;
+    }
+    case PM_STATEMENTS_NODE: {
+        pm_statements_node_t *s = (pm_statements_node_t *)node;
+        for (size_t i = 0; i < s->body.size; i++)
+            collect_regexp_patterns(ctx, s->body.nodes[i]);
+        break;
+    }
+    case PM_LOCAL_VARIABLE_WRITE_NODE: {
+        pm_local_variable_write_node_t *n = (pm_local_variable_write_node_t *)node;
+        collect_regexp_patterns(ctx, n->value);
+        break;
+    }
+    case PM_CALL_NODE: {
+        pm_call_node_t *c = (pm_call_node_t *)node;
+        if (c->receiver) collect_regexp_patterns(ctx, c->receiver);
+        if (c->arguments) {
+            for (size_t i = 0; i < c->arguments->arguments.size; i++)
+                collect_regexp_patterns(ctx, c->arguments->arguments.nodes[i]);
+        }
+        if (c->block) collect_regexp_patterns(ctx, (pm_node_t *)c->block);
+        break;
+    }
+    case PM_BLOCK_NODE: {
+        pm_block_node_t *b = (pm_block_node_t *)node;
+        if (b->body) collect_regexp_patterns(ctx, (pm_node_t *)b->body);
+        break;
+    }
+    case PM_IF_NODE: {
+        pm_if_node_t *n = (pm_if_node_t *)node;
+        if (n->predicate) collect_regexp_patterns(ctx, n->predicate);
+        if (n->statements) collect_regexp_patterns(ctx, (pm_node_t *)n->statements);
+        if (n->subsequent) collect_regexp_patterns(ctx, (pm_node_t *)n->subsequent);
+        break;
+    }
+    case PM_ELSE_NODE: {
+        pm_else_node_t *n = (pm_else_node_t *)node;
+        if (n->statements) collect_regexp_patterns(ctx, (pm_node_t *)n->statements);
+        break;
+    }
+    case PM_WHILE_NODE: {
+        pm_while_node_t *n = (pm_while_node_t *)node;
+        if (n->predicate) collect_regexp_patterns(ctx, n->predicate);
+        if (n->statements) collect_regexp_patterns(ctx, (pm_node_t *)n->statements);
+        break;
+    }
+    case PM_DEF_NODE: {
+        pm_def_node_t *d = (pm_def_node_t *)node;
+        if (d->body) collect_regexp_patterns(ctx, (pm_node_t *)d->body);
+        break;
+    }
+    case PM_MATCH_WRITE_NODE: {
+        pm_match_write_node_t *mw = (pm_match_write_node_t *)node;
+        collect_regexp_patterns(ctx, (pm_node_t *)mw->call);
+        break;
+    }
+    case PM_REGULAR_EXPRESSION_NODE: {
+        pm_regular_expression_node_t *re = (pm_regular_expression_node_t *)node;
+        const uint8_t *src = pm_string_source(&re->unescaped);
+        size_t len = pm_string_length(&re->unescaped);
+        char pat[256];
+        size_t plen = len < 255 ? len : 255;
+        memcpy(pat, src, plen);
+        pat[plen] = '\0';
+        /* Check if already registered */
+        for (int i = 0; i < ctx->regexp_counter; i++)
+            if (strcmp(ctx->regexps[i].pattern, pat) == 0) return;
+        /* Register */
+        if (ctx->regexp_counter < MAX_REGEXPS) {
+            snprintf(ctx->regexps[ctx->regexp_counter].pattern, 256, "%s", pat);
+            ctx->regexps[ctx->regexp_counter].id = ctx->regexp_counter;
+            ctx->regexp_counter++;
+        }
+        ctx->needs_regexp = true;
+        break;
+    }
+    default:
+        break;
     }
 }
 
@@ -6288,6 +6698,9 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
     /* Detect string split usage */
     ctx->needs_str_split = has_split_calls(ctx, root);
 
+    /* Detect regexp usage and collect patterns (must be before emit_header) */
+    collect_regexp_patterns(ctx, root);
+
     /* Pass 1: Analyze classes, modules, functions */
     class_analysis_pass(ctx, root);
 
@@ -6580,6 +6993,8 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
         }
         emit_raw(ctx, "\n");
 
+        if (ctx->needs_regexp)
+            emit_raw(ctx, "    sp_regexp_init();\n\n");
         /* Generate top-level code (this will collect lambda functions into lambda_buf) */
         codegen_stmts(ctx, (pm_node_t *)prog->statements);
 
@@ -6676,6 +7091,8 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
         }
         emit_raw(ctx, "\n");
 
+        if (ctx->needs_regexp)
+            emit_raw(ctx, "    sp_regexp_init();\n\n");
         /* Top-level code */
         codegen_stmts(ctx, (pm_node_t *)prog->statements);
 
