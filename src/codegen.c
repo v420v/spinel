@@ -611,6 +611,7 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
     case PM_FLOAT_NODE:    return vt_prim(SPINEL_TYPE_FLOAT);
     case PM_STRING_NODE:
     case PM_INTERPOLATED_STRING_NODE:
+    case PM_SYMBOL_NODE:
                            return vt_prim(SPINEL_TYPE_STRING);
     case PM_TRUE_NODE:
     case PM_FALSE_NODE:    return vt_prim(SPINEL_TYPE_BOOLEAN);
@@ -758,6 +759,13 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                 if (strcmp(method, "delete") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
                 if (strcmp(method, "each") == 0) { free(method); return vt_prim(SPINEL_TYPE_HASH); }
                 if (strcmp(method, "keys") == 0) { free(method); return vt_prim(SPINEL_TYPE_ARRAY); }
+            }
+            /* String methods */
+            if (recv_t.kind == SPINEL_TYPE_STRING) {
+                if (strcmp(method, "length") == 0 || strcmp(method, "size") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
+                if (strcmp(method, "upcase") == 0 || strcmp(method, "downcase") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
+                if (strcmp(method, "include?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
+                if (strcmp(method, "+") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
             }
         }
 
@@ -2081,6 +2089,18 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
     case PM_FALSE_NODE: return xstrdup("FALSE");
     case PM_NIL_NODE:   return xstrdup("/* nil */");
 
+    case PM_SYMBOL_NODE: {
+        pm_symbol_node_t *n = (pm_symbol_node_t *)node;
+        const uint8_t *src = pm_string_source(&n->unescaped);
+        size_t len = pm_string_length(&n->unescaped);
+        char *buf = malloc(len + 3);
+        buf[0] = '"';
+        memcpy(buf + 1, src, len);
+        buf[len + 1] = '"';
+        buf[len + 2] = '\0';
+        return buf;
+    }
+
     case PM_LOCAL_VARIABLE_READ_NODE: {
         pm_local_variable_read_node_t *n = (pm_local_variable_read_node_t *)node;
         char *name = cstr(ctx, n->name);
@@ -2530,6 +2550,35 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                 free(recv);
             }
 
+            /* String method calls */
+            if (recv_t.kind == SPINEL_TYPE_STRING) {
+                char *recv = codegen_expr(ctx, call->receiver);
+                char *r = NULL;
+                if (strcmp(method, "length") == 0 || strcmp(method, "size") == 0)
+                    r = sfmt("((mrb_int)strlen(%s))", recv);
+                else if (strcmp(method, "upcase") == 0)
+                    r = sfmt("sp_str_upcase(%s)", recv);
+                else if (strcmp(method, "downcase") == 0)
+                    r = sfmt("sp_str_downcase(%s)", recv);
+                else if (strcmp(method, "include?") == 0 && call->arguments &&
+                         call->arguments->arguments.size == 1) {
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    r = sfmt("(strstr(%s, %s) != NULL)", recv, arg);
+                    free(arg);
+                }
+                else if (strcmp(method, "+") == 0 && call->arguments &&
+                         call->arguments->arguments.size == 1) {
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    r = sfmt("sp_str_concat(%s, %s)", recv, arg);
+                    free(arg);
+                }
+                if (r) {
+                    free(recv); free(method);
+                    return r;
+                }
+                free(recv);
+            }
+
             if (recv_t.kind == SPINEL_TYPE_OBJECT) {
                 class_info_t *cls = find_class(ctx, recv_t.klass);
                 if (cls) {
@@ -2592,6 +2641,12 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
             if (strcmp(method, "to_f") == 0 && recv_t.kind == SPINEL_TYPE_INTEGER) {
                 char *recv = codegen_expr(ctx, call->receiver);
                 char *r = sfmt("((mrb_float)%s)", recv);
+                free(recv); free(method);
+                return r;
+            }
+            if (strcmp(method, "to_s") == 0 && recv_t.kind == SPINEL_TYPE_INTEGER) {
+                char *recv = codegen_expr(ctx, call->receiver);
+                char *r = sfmt("sp_int_to_s(%s)", recv);
                 free(recv); free(method);
                 return r;
             }
@@ -3373,6 +3428,10 @@ static void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 } else if (at.kind == SPINEL_TYPE_STRING) {
                     char *ae = codegen_expr(ctx, arg);
                     emit(ctx, "puts(%s);\n", ae);
+                    free(ae);
+                } else if (at.kind == SPINEL_TYPE_BOOLEAN) {
+                    char *ae = codegen_expr(ctx, arg);
+                    emit(ctx, "puts(%s ? \"true\" : \"false\");\n", ae);
                     free(ae);
                 } else {
                     char *ae = codegen_expr(ctx, arg);
@@ -4447,12 +4506,29 @@ static void emit_header(codegen_ctx_t *ctx) {
     emit_raw(ctx, "#include <string.h>\n");
     emit_raw(ctx, "#include <math.h>\n");
     emit_raw(ctx, "#include <stdbool.h>\n");
-    emit_raw(ctx, "#include <stdint.h>\n\n");
+    emit_raw(ctx, "#include <stdint.h>\n");
+    emit_raw(ctx, "#include <ctype.h>\n\n");
     emit_raw(ctx, "typedef int64_t mrb_int;\n");
     emit_raw(ctx, "typedef double mrb_float;\n");
     emit_raw(ctx, "typedef bool mrb_bool;\n");
     emit_raw(ctx, "#ifndef TRUE\n#define TRUE true\n#endif\n");
     emit_raw(ctx, "#ifndef FALSE\n#define FALSE false\n#endif\n\n");
+
+    /* ---- String helpers ---- */
+    emit_raw(ctx, "static const char *sp_str_upcase(const char *s) {\n");
+    emit_raw(ctx, "    size_t n = strlen(s); char *r = (char *)malloc(n + 1);\n");
+    emit_raw(ctx, "    for (size_t i = 0; i <= n; i++) r[i] = toupper((unsigned char)s[i]);\n");
+    emit_raw(ctx, "    return r;\n}\n");
+    emit_raw(ctx, "static const char *sp_str_downcase(const char *s) {\n");
+    emit_raw(ctx, "    size_t n = strlen(s); char *r = (char *)malloc(n + 1);\n");
+    emit_raw(ctx, "    for (size_t i = 0; i <= n; i++) r[i] = tolower((unsigned char)s[i]);\n");
+    emit_raw(ctx, "    return r;\n}\n");
+    emit_raw(ctx, "static const char *sp_str_concat(const char *a, const char *b) {\n");
+    emit_raw(ctx, "    size_t la = strlen(a), lb = strlen(b);\n");
+    emit_raw(ctx, "    char *r = (char *)malloc(la + lb + 1);\n");
+    emit_raw(ctx, "    memcpy(r, a, la); memcpy(r + la, b, lb + 1); return r;\n}\n");
+    emit_raw(ctx, "static const char *sp_int_to_s(mrb_int n) {\n");
+    emit_raw(ctx, "    char *r = (char *)malloc(24); snprintf(r, 24, \"%%lld\", (long long)n); return r;\n}\n\n");
 
     /* ---- GC runtime (only when needed) ---- */
     if (ctx->needs_gc) {
