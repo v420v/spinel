@@ -9,7 +9,7 @@ No runtime dependencies (no mruby, no GC library — GC is generated inline).
 
 ## 現状 (Status)
 
-### コンパイラアーキテクチャ (~6700行のC)
+### コンパイラアーキテクチャ (~7300行のC)
 
 - Prism (libprism) によるRubyパース
 - 多パスコード生成:
@@ -219,8 +219,8 @@ spinel/
 ├── src/
 │   ├── main.c          # CLI、ファイル読み込み、Prismパース
 │   ├── codegen.h       # 型システム、クラス/メソッド/モジュール情報構造体
-│   └── codegen.c       # 多パスコード生成器 (~6700行)
-├── examples/           # 18テストプログラム
+│   └── codegen.c       # 多パスコード生成器 (~7300行)
+├── examples/           # 22テストプログラム
 │   ├── bm_so_mandelbrot.rb   # Mandelbrot集合
 │   ├── bm_ao_render.rb       # AOレイトレーサー (6クラス、モジュール)
 │   ├── bm_so_lists.rb        # 配列操作
