@@ -968,8 +968,14 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
             if (recv_t.kind == SPINEL_TYPE_INTEGER) {
                 if (strcmp(method, "abs") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
                 if (strcmp(method, "even?") == 0 || strcmp(method, "odd?") == 0 ||
-                    strcmp(method, "zero?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
+                    strcmp(method, "zero?") == 0 || strcmp(method, "positive?") == 0 ||
+                    strcmp(method, "negative?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
                 if (strcmp(method, "**") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
+            }
+            /* Universal methods */
+            if (strcmp(method, "nil?") == 0 || strcmp(method, "is_a?") == 0 ||
+                strcmp(method, "respond_to?") == 0) {
+                free(method); return vt_prim(SPINEL_TYPE_BOOLEAN);
             }
             if (recv_t.kind == SPINEL_TYPE_FLOAT) {
                 if (strcmp(method, "abs") == 0) { free(method); return vt_prim(SPINEL_TYPE_FLOAT); }
@@ -3148,6 +3154,10 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     r = sfmt("((%s) %% 2 != 0)", recv);
                 else if (strcmp(method, "zero?") == 0)
                     r = sfmt("((%s) == 0)", recv);
+                else if (strcmp(method, "positive?") == 0)
+                    r = sfmt("((%s) > 0)", recv);
+                else if (strcmp(method, "negative?") == 0)
+                    r = sfmt("((%s) < 0)", recv);
                 else if (strcmp(method, "**") == 0 && call->arguments &&
                          call->arguments->arguments.size == 1) {
                     char *exp = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
@@ -3170,6 +3180,52 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     r = sfmt("((mrb_int)round(%s))", recv);
                 if (r) { free(recv); free(method); return r; }
                 free(recv);
+            }
+
+            /* Universal methods: nil?, is_a?, respond_to? */
+            if (strcmp(method, "nil?") == 0) {
+                /* nil? is always false for non-nil values, true for nil */
+                if (PM_NODE_TYPE(call->receiver) == PM_NIL_NODE) {
+                    free(method); return xstrdup("TRUE");
+                }
+                free(method); return xstrdup("FALSE");
+            }
+            if (strcmp(method, "is_a?") == 0 && call->arguments &&
+                call->arguments->arguments.size == 1 &&
+                PM_NODE_TYPE(call->arguments->arguments.nodes[0]) == PM_CONSTANT_READ_NODE) {
+                pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->arguments->arguments.nodes[0];
+                char *cls_name = cstr(ctx, cr->name);
+                bool result = false;
+                if (recv_t.kind == SPINEL_TYPE_OBJECT) {
+                    /* Check class and superclass chain */
+                    class_info_t *c = find_class(ctx, recv_t.klass);
+                    while (c) {
+                        if (strcmp(c->name, cls_name) == 0) { result = true; break; }
+                        c = c->superclass[0] ? find_class(ctx, c->superclass) : NULL;
+                    }
+                } else if (recv_t.kind == SPINEL_TYPE_INTEGER && strcmp(cls_name, "Integer") == 0) result = true;
+                else if (recv_t.kind == SPINEL_TYPE_FLOAT && strcmp(cls_name, "Float") == 0) result = true;
+                else if (recv_t.kind == SPINEL_TYPE_STRING && strcmp(cls_name, "String") == 0) result = true;
+                free(cls_name); free(method);
+                return xstrdup(result ? "TRUE" : "FALSE");
+            }
+            if (strcmp(method, "respond_to?") == 0 && call->arguments &&
+                call->arguments->arguments.size == 1 &&
+                PM_NODE_TYPE(call->arguments->arguments.nodes[0]) == PM_SYMBOL_NODE) {
+                pm_symbol_node_t *sym = (pm_symbol_node_t *)call->arguments->arguments.nodes[0];
+                const uint8_t *src = pm_string_source(&sym->unescaped);
+                size_t len = pm_string_length(&sym->unescaped);
+                char mname[64]; snprintf(mname, sizeof(mname), "%.*s", (int)len, src);
+                bool result = false;
+                if (recv_t.kind == SPINEL_TYPE_OBJECT) {
+                    class_info_t *c = find_class(ctx, recv_t.klass);
+                    if (c) {
+                        class_info_t *owner;
+                        result = find_method_inherited(ctx, c, mname, &owner) != NULL;
+                    }
+                }
+                free(method);
+                return xstrdup(result ? "TRUE" : "FALSE");
             }
 
             if (recv_t.kind == SPINEL_TYPE_OBJECT) {
