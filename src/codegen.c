@@ -291,6 +291,7 @@ static void analyze_method(codegen_ctx_t *ctx, class_info_t *cls,
     m->param_count = 0;
     m->is_getter = false;
     m->is_setter = false;
+    m->is_class_method = false;
     m->return_type = vt_prim(SPINEL_TYPE_VALUE);
 
     /* Extract parameters */
@@ -358,10 +359,13 @@ static void analyze_ivars_from_init(codegen_ctx_t *ctx, class_info_t *cls,
             pm_instance_variable_write_node_t *iw =
                 (pm_instance_variable_write_node_t *)s;
             char *ivname = cstr(ctx, iw->name);
-            ivar_info_t *iv = &cls->ivars[cls->ivar_count++];
-            snprintf(iv->name, sizeof(iv->name), "%s", ivname + 1); /* skip @ */
-            /* Type will be resolved in pass 2 */
-            iv->type = vt_prim(SPINEL_TYPE_VALUE);
+            /* Skip if already registered (e.g., from attr_accessor) */
+            if (!find_ivar(cls, ivname + 1) && cls->ivar_count < MAX_IVARS) {
+                ivar_info_t *iv = &cls->ivars[cls->ivar_count++];
+                snprintf(iv->name, sizeof(iv->name), "%s", ivname + 1); /* skip @ */
+                /* Type will be resolved in pass 2 */
+                iv->type = vt_prim(SPINEL_TYPE_VALUE);
+            }
             free(ivname);
         }
     }
@@ -398,6 +402,38 @@ static void analyze_class(codegen_ctx_t *ctx, pm_class_node_t *node) {
         pm_node_t *s = stmts->body.nodes[i];
         if (PM_NODE_TYPE(s) == PM_DEF_NODE) {
             pm_def_node_t *def = (pm_def_node_t *)s;
+
+            /* def self.foo → class method */
+            if (def->receiver && PM_NODE_TYPE(def->receiver) == PM_SELF_NODE) {
+                method_info_t *m = &cls->methods[cls->method_count++];
+                char *name = cstr(ctx, def->name);
+                snprintf(m->name, sizeof(m->name), "%s", name);
+                free(name);
+                m->body_node = def->body ? (pm_node_t *)def->body : NULL;
+                m->params_node = def->parameters ? (pm_node_t *)def->parameters : NULL;
+                m->param_count = 0;
+                m->is_getter = false;
+                m->is_setter = false;
+                m->is_class_method = true;
+                m->return_type = vt_prim(SPINEL_TYPE_VALUE);
+
+                if (def->parameters) {
+                    pm_parameters_node_t *params = def->parameters;
+                    for (size_t pi = 0; pi < params->requireds.size && m->param_count < MAX_PARAMS; pi++) {
+                        pm_node_t *p = params->requireds.nodes[pi];
+                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE) {
+                            pm_required_parameter_node_t *rp = (pm_required_parameter_node_t *)p;
+                            char *pname = cstr(ctx, rp->name);
+                            snprintf(m->params[m->param_count].name, 64, "%s", pname);
+                            m->params[m->param_count].type = vt_prim(SPINEL_TYPE_VALUE);
+                            m->param_count++;
+                            free(pname);
+                        }
+                    }
+                }
+                continue;
+            }
+
             analyze_method(ctx, cls, def);
 
             /* Extract ivars from initialize */
@@ -406,6 +442,63 @@ static void analyze_class(codegen_ctx_t *ctx, pm_class_node_t *node) {
                 analyze_ivars_from_init(ctx, cls, def->body ? (pm_node_t *)def->body : NULL);
             }
             free(mname);
+        }
+        /* attr_accessor / attr_reader / attr_writer */
+        else if (PM_NODE_TYPE(s) == PM_CALL_NODE) {
+            pm_call_node_t *call = (pm_call_node_t *)s;
+            char *cname = cstr(ctx, call->name);
+            bool is_accessor = (strcmp(cname, "attr_accessor") == 0);
+            bool is_reader = (strcmp(cname, "attr_reader") == 0);
+            bool is_writer = (strcmp(cname, "attr_writer") == 0);
+            if ((is_accessor || is_reader || is_writer) && call->arguments) {
+                for (size_t ai = 0; ai < call->arguments->arguments.size; ai++) {
+                    pm_node_t *arg = call->arguments->arguments.nodes[ai];
+                    if (PM_NODE_TYPE(arg) != PM_SYMBOL_NODE) continue;
+                    pm_symbol_node_t *sym = (pm_symbol_node_t *)arg;
+                    const uint8_t *src = pm_string_source(&sym->unescaped);
+                    size_t len = pm_string_length(&sym->unescaped);
+                    char sym_name[64];
+                    snprintf(sym_name, sizeof(sym_name), "%.*s", (int)len, (const char *)src);
+
+                    /* Register ivar if not already present */
+                    if (!find_ivar(cls, sym_name) && cls->ivar_count < MAX_IVARS) {
+                        ivar_info_t *iv = &cls->ivars[cls->ivar_count++];
+                        snprintf(iv->name, sizeof(iv->name), "%s", sym_name);
+                        iv->type = vt_prim(SPINEL_TYPE_VALUE);
+                    }
+
+                    /* Generate getter */
+                    if (is_accessor || is_reader) {
+                        method_info_t *m = &cls->methods[cls->method_count++];
+                        snprintf(m->name, sizeof(m->name), "%s", sym_name);
+                        m->body_node = NULL;
+                        m->params_node = NULL;
+                        m->param_count = 0;
+                        m->is_getter = true;
+                        m->is_setter = false;
+                        m->is_class_method = false;
+                        snprintf(m->accessor_ivar, sizeof(m->accessor_ivar), "%s", sym_name);
+                        m->return_type = vt_prim(SPINEL_TYPE_VALUE);
+                    }
+
+                    /* Generate setter */
+                    if (is_accessor || is_writer) {
+                        method_info_t *m = &cls->methods[cls->method_count++];
+                        snprintf(m->name, sizeof(m->name), "%.62s=", sym_name);
+                        m->body_node = NULL;
+                        m->params_node = NULL;
+                        m->param_count = 1;
+                        snprintf(m->params[0].name, 64, "v");
+                        m->params[0].type = vt_prim(SPINEL_TYPE_VALUE);
+                        m->is_getter = false;
+                        m->is_setter = true;
+                        m->is_class_method = false;
+                        snprintf(m->accessor_ivar, sizeof(m->accessor_ivar), "%s", sym_name);
+                        m->return_type = vt_prim(SPINEL_TYPE_VALUE);
+                    }
+                }
+            }
+            free(cname);
         }
     }
 
@@ -829,6 +922,18 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                 free(mod_name); free(method);
                 return vt_prim(SPINEL_TYPE_FLOAT);
             }
+            /* Class method calls: ClassName.method → look up class method return type */
+            {
+                class_info_t *cls = find_class(ctx, mod_name);
+                if (cls) {
+                    method_info_t *cm = find_method(cls, method);
+                    if (cm && cm->is_class_method) {
+                        vtype_t rt = cm->return_type;
+                        free(mod_name); free(method);
+                        return rt;
+                    }
+                }
+            }
             free(mod_name);
         }
 
@@ -1059,6 +1164,19 @@ static void infer_pass(codegen_ctx_t *ctx, pm_node_t *node) {
         pm_until_node_t *n = (pm_until_node_t *)node;
         infer_pass(ctx, n->predicate);
         if (n->statements) infer_pass(ctx, (pm_node_t *)n->statements);
+        break;
+    }
+    case PM_FOR_NODE: {
+        pm_for_node_t *fn = (pm_for_node_t *)node;
+        /* Register the loop variable */
+        if (PM_NODE_TYPE(fn->index) == PM_LOCAL_VARIABLE_TARGET_NODE) {
+            pm_local_variable_target_node_t *t =
+                (pm_local_variable_target_node_t *)fn->index;
+            char *vname = cstr(ctx, t->name);
+            var_declare(ctx, vname, vt_prim(SPINEL_TYPE_INTEGER), false);
+            free(vname);
+        }
+        if (fn->statements) infer_pass(ctx, (pm_node_t *)fn->statements);
         break;
     }
     case PM_UNLESS_NODE: {
@@ -1304,6 +1422,58 @@ static void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root) {
             }
         }
 
+        /* Infer method param types from body: if param.foo() where foo is a method
+         * of the current class, infer param type as the current class.
+         * Uses a stack-based recursive scan of all call nodes in the body. */
+        for (int ci = 0; ci < ctx->class_count; ci++) {
+            class_info_t *cls = &ctx->classes[ci];
+            for (int mi = 0; mi < cls->method_count; mi++) {
+                method_info_t *m = &cls->methods[mi];
+                if (m->is_getter || m->is_setter || !m->body_node) continue;
+                if (strcmp(m->name, "initialize") == 0) continue;
+                for (int pi = 0; pi < m->param_count; pi++) {
+                    if (m->params[pi].type.kind != SPINEL_TYPE_VALUE) continue;
+                    /* Stack-based scan for CallNodes with param as receiver */
+                    pm_node_t *scan_stack[128];
+                    int scan_sp = 0;
+                    scan_stack[scan_sp++] = m->body_node;
+                    while (scan_sp > 0) {
+                        pm_node_t *n = scan_stack[--scan_sp];
+                        if (!n) continue;
+                        if (PM_NODE_TYPE(n) == PM_CALL_NODE) {
+                            pm_call_node_t *call = (pm_call_node_t *)n;
+                            /* Check if receiver is the parameter */
+                            if (call->receiver && PM_NODE_TYPE(call->receiver) == PM_LOCAL_VARIABLE_READ_NODE) {
+                                pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
+                                if (ceq(ctx, lv->name, m->params[pi].name)) {
+                                    char *called = cstr(ctx, call->name);
+                                    if (find_method(cls, called))
+                                        m->params[pi].type = vt_obj(cls->name);
+                                    free(called);
+                                }
+                            }
+                            /* Recurse into receiver and arguments */
+                            if (call->receiver && scan_sp < 127)
+                                scan_stack[scan_sp++] = call->receiver;
+                            if (call->arguments) {
+                                for (size_t ai = 0; ai < call->arguments->arguments.size && scan_sp < 127; ai++)
+                                    scan_stack[scan_sp++] = call->arguments->arguments.nodes[ai];
+                            }
+                        }
+                        else if (PM_NODE_TYPE(n) == PM_STATEMENTS_NODE) {
+                            pm_statements_node_t *ss = (pm_statements_node_t *)n;
+                            for (size_t si = 0; si < ss->body.size && scan_sp < 127; si++)
+                                scan_stack[scan_sp++] = ss->body.nodes[si];
+                        }
+                        else if (PM_NODE_TYPE(n) == PM_LOCAL_VARIABLE_WRITE_NODE) {
+                            pm_local_variable_write_node_t *lw = (pm_local_variable_write_node_t *)n;
+                            if (scan_sp < 127) scan_stack[scan_sp++] = lw->value;
+                        }
+                    }
+                }
+            }
+        }
+
         /* Propagate constructor arg types to initialize params */
         for (int ci = 0; ci < ctx->class_count; ci++) {
             class_info_t *cls = &ctx->classes[ci];
@@ -1405,6 +1575,63 @@ static void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root) {
                 if (strcmp(f->name, "to_string") == 0 && f->param_count >= 1) {
                     f->params[0].type = vt_prim(SPINEL_TYPE_PROC);
                     f->return_type = vt_prim(SPINEL_TYPE_STRING);
+                }
+            }
+        }
+
+        /* Generic: infer method param types from call sites in top-level code */
+        if (prog_root && PM_NODE_TYPE(prog_root) == PM_PROGRAM_NODE) {
+            pm_program_node_t *prog = (pm_program_node_t *)prog_root;
+            if (prog->statements) {
+                pm_node_t *ms_stack[256];
+                int ms_sp = 0;
+                for (size_t si = 0; si < prog->statements->body.size && ms_sp < 255; si++)
+                    ms_stack[ms_sp++] = prog->statements->body.nodes[si];
+                while (ms_sp > 0) {
+                    pm_node_t *s = ms_stack[--ms_sp];
+                    if (!s) continue;
+                    if (PM_NODE_TYPE(s) == PM_CALL_NODE) {
+                        pm_call_node_t *call = (pm_call_node_t *)s;
+                        if (call->receiver && call->arguments) {
+                            vtype_t recv_t = infer_type(ctx, call->receiver);
+                            if (recv_t.kind == SPINEL_TYPE_OBJECT) {
+                                class_info_t *rcls = find_class(ctx, recv_t.klass);
+                                if (rcls) {
+                                    char *mname = cstr(ctx, call->name);
+                                    method_info_t *target = find_method(rcls, mname);
+                                    if (target) {
+                                        for (int pi = 0; pi < target->param_count &&
+                                             pi < (int)call->arguments->arguments.size; pi++) {
+                                            if (target->params[pi].type.kind == SPINEL_TYPE_VALUE) {
+                                                vtype_t at = infer_type(ctx, call->arguments->arguments.nodes[pi]);
+                                                if (at.kind != SPINEL_TYPE_VALUE && at.kind != SPINEL_TYPE_UNKNOWN)
+                                                    target->params[pi].type = at;
+                                            }
+                                        }
+                                    }
+                                    free(mname);
+                                }
+                            }
+                        }
+                    }
+                    /* Recurse into statement types */
+                    if (PM_NODE_TYPE(s) == PM_LOCAL_VARIABLE_WRITE_NODE) {
+                        pm_local_variable_write_node_t *lw = (pm_local_variable_write_node_t *)s;
+                        if (ms_sp < 255) ms_stack[ms_sp++] = lw->value;
+                    }
+                    if (PM_NODE_TYPE(s) == PM_STATEMENTS_NODE) {
+                        pm_statements_node_t *ss = (pm_statements_node_t *)s;
+                        for (size_t si2 = 0; si2 < ss->body.size && ms_sp < 255; si2++)
+                            ms_stack[ms_sp++] = ss->body.nodes[si2];
+                    }
+                    if (PM_NODE_TYPE(s) == PM_IF_NODE) {
+                        pm_if_node_t *ifn = (pm_if_node_t *)s;
+                        if (ifn->statements && ms_sp < 255) ms_stack[ms_sp++] = (pm_node_t *)ifn->statements;
+                    }
+                    if (PM_NODE_TYPE(s) == PM_WHILE_NODE) {
+                        pm_while_node_t *wn = (pm_while_node_t *)s;
+                        if (wn->statements && ms_sp < 255) ms_stack[ms_sp++] = (pm_node_t *)wn->statements;
+                    }
                 }
             }
         }
@@ -2359,6 +2586,28 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     free(method);
                     return r;
                 }
+                /* Class method call: ClassName.method(args) */
+                {
+                    char *cls_name = cstr(ctx, cr->name);
+                    class_info_t *cls = find_class(ctx, cls_name);
+                    if (cls) {
+                        method_info_t *cm = find_method(cls, method);
+                        if (cm && cm->is_class_method) {
+                            int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
+                            char *args = xstrdup("");
+                            for (int i = 0; i < argc; i++) {
+                                char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                                char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", a);
+                                free(args); free(a);
+                                args = na;
+                            }
+                            char *r = sfmt("sp_%s_%s(%s)", cls_name, method, args);
+                            free(cls_name); free(args); free(method);
+                            return r;
+                        }
+                    }
+                    free(cls_name);
+                }
             }
 
             /* Hash#keys.length → sp_StrIntHash_length (chained call optimization) */
@@ -3240,6 +3489,33 @@ static void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
         break;
     }
 
+    case PM_FOR_NODE: {
+        pm_for_node_t *fn = (pm_for_node_t *)node;
+        /* for i in start..end → for (i = start; i <= end; i++) */
+        if (PM_NODE_TYPE(fn->index) == PM_LOCAL_VARIABLE_TARGET_NODE &&
+            PM_NODE_TYPE(fn->collection) == PM_RANGE_NODE) {
+            pm_local_variable_target_node_t *t =
+                (pm_local_variable_target_node_t *)fn->index;
+            pm_range_node_t *rng = (pm_range_node_t *)fn->collection;
+            char *vname = cstr(ctx, t->name);
+            char *cn = make_cname(vname, false);
+            char *lo = codegen_expr(ctx, rng->left);
+            char *hi = codegen_expr(ctx, rng->right);
+            bool exclude_end = PM_NODE_FLAG_P(rng, PM_RANGE_FLAGS_EXCLUDE_END);
+            emit(ctx, "for (%s = %s; %s %s %s; %s++) {\n",
+                 cn, lo, cn, exclude_end ? "<" : "<=", hi, cn);
+            free(lo); free(hi);
+            ctx->indent++;
+            ctx->for_depth++;
+            if (fn->statements) codegen_stmts(ctx, (pm_node_t *)fn->statements);
+            ctx->for_depth--;
+            ctx->indent--;
+            emit(ctx, "}\n");
+            free(vname); free(cn);
+        }
+        break;
+    }
+
     case PM_IF_NODE: {
         pm_if_node_t *n = (pm_if_node_t *)node;
         char *cond = codegen_expr(ctx, n->predicate);
@@ -3570,6 +3846,21 @@ static void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
         /* srand */
         if (!call->receiver && strcmp(method, "srand") == 0) {
             emit(ctx, "/* srand — handled by Rand module init */\n");
+            free(method);
+            break;
+        }
+
+        /* loop do ... end → while (1) { body } */
+        if (!call->receiver && strcmp(method, "loop") == 0 &&
+            call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
+            pm_block_node_t *blk = (pm_block_node_t *)call->block;
+            emit(ctx, "while (1) {\n");
+            ctx->indent++;
+            ctx->for_depth++;
+            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+            ctx->for_depth--;
+            ctx->indent--;
+            emit(ctx, "}\n");
             free(method);
             break;
         }
@@ -4076,18 +4367,29 @@ static void emit_method(codegen_ctx_t *ctx, class_info_t *cls, method_info_t *m)
     emit_raw(ctx, "static %s sp_%s_%s(",
              ret_void ? "void" : ret_ct, cls->name, m->name);
 
-    /* Self parameter */
-    if (cls->is_value_type)
-        emit_raw(ctx, "sp_%s self", cls->name);
-    else
-        emit_raw(ctx, "sp_%s *self", cls->name);
+    if (m->is_class_method) {
+        /* Class method: no self parameter */
+        for (int i = 0; i < m->param_count; i++) {
+            if (i > 0) emit_raw(ctx, ", ");
+            char *pct = vt_ctype(ctx, m->params[i].type, false);
+            emit_raw(ctx, "%s lv_%s", pct, m->params[i].name);
+            free(pct);
+        }
+        if (m->param_count == 0) emit_raw(ctx, "void");
+    } else {
+        /* Self parameter */
+        if (cls->is_value_type)
+            emit_raw(ctx, "sp_%s self", cls->name);
+        else
+            emit_raw(ctx, "sp_%s *self", cls->name);
 
-    /* Method parameters — use lv_ prefix to match codegen variable references */
-    for (int i = 0; i < m->param_count; i++) {
-        emit_raw(ctx, ", ");
-        char *pct = vt_ctype(ctx, m->params[i].type, !cls->is_value_type);
-        emit_raw(ctx, "%s lv_%s", pct, m->params[i].name);
-        free(pct);
+        /* Method parameters — use lv_ prefix to match codegen variable references */
+        for (int i = 0; i < m->param_count; i++) {
+            emit_raw(ctx, ", ");
+            char *pct = vt_ctype(ctx, m->params[i].type, !cls->is_value_type);
+            emit_raw(ctx, "%s lv_%s", pct, m->params[i].name);
+            free(pct);
+        }
     }
     emit_raw(ctx, ") {\n");
 
@@ -4107,7 +4409,7 @@ static void emit_method(codegen_ctx_t *ctx, class_info_t *cls, method_info_t *m)
 
     /* Check if this method needs GC rooting */
     bool method_has_gc_vars = false;
-    if (ctx->needs_gc) {
+    if (ctx->needs_gc && !m->is_class_method) {
         /* Check self (non-value-type class pointer) */
         if (!cls->is_value_type) method_has_gc_vars = true;
         /* Check parameters */

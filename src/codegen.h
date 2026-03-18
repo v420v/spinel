@@ -61,6 +61,7 @@ typedef struct {
     bool is_getter;        /* simple ivar getter: def x; @x; end */
     bool is_setter;        /* simple ivar setter: def x=(v); @x = v; end */
     char accessor_ivar[64]; /* ivar name for getter/setter */
+    bool is_class_method;  /* true for def self.foo (class method) */
 } method_info_t;
 
 /* Class info */
