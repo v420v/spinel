@@ -10,7 +10,7 @@ Regexp対応プログラムのみ libonig をリンク。
 
 ## 現状 (Status)
 
-### コンパイラアーキテクチャ (~9400行のC)
+### コンパイラアーキテクチャ (~9700行のC)
 
 - Prism (libprism) によるRubyパース
 - 多パスコード生成:
@@ -94,7 +94,7 @@ Regexp対応プログラムのみ libonig をリンク。
 | | シャドウスタックルート管理, ファイナライザ |
 | | GC不要なプログラムではGCコード省略 |
 
-### テストプログラム (39例)
+### テストプログラム (40例)
 
 | プログラム | テスト対象 |
 |-----------|-----------|
@@ -137,6 +137,7 @@ Regexp対応プログラムのみ libonig をリンク。
 | bm_proc | &block, proc {}, Proc.new, Proc#call |
 | bm_poly | 多相変数 (sp_RbValue Phase 1) |
 | bm_poly2 | 異種配列, bimorphicダックタイピング (Phase 2) |
+| bm_pattern | パターンマッチ case/in (Phase 3) |
 
 ### ベンチマーク結果
 
@@ -165,13 +166,14 @@ Regexp使用時のみ libonig をリンク。
 | 5 | **完全なString** | 未着手 | sp_String構造体 (ミュータブル + encoding) |
 | 6 | **オブジェクトシステム完全性** | 一部完了 | Comparable完了。method_missing等はフォールバック |
 | 7 | **制御フロー完全性** | **完了** ✅ | catch/throw含む全制御フロー |
-| 8 | **パターンマッチ** | **着手可能** | sp_RbValue完了、case/in実装可 |
+| 8 | **パターンマッチ** | **完了** ✅ | case/in (型/値/nil/alternation) |
 | 9 | **例外階層** | **完了** ✅ | raise ClassName, rescue ClassName, 継承チェック |
 | 10 | **GC完全性** | 一部完了 | 文字列GC (sp_String), 世代別GC |
 
 ### 完了した項目
 - ✅ **sp_RbValue Phase 1**: 多相変数、boxing/unboxing、sp_poly_puts、nil?
 - ✅ **sp_RbValue Phase 2**: 異種配列(sp_RbArray)、bimorphicダックタイピング、クラスタグ
+- ✅ **パターンマッチ**: `case/in` (型チェック、値マッチ、AlternationPattern、nil)
 - ✅ **Block/Proc**: yield, block_given?, &block, proc {}, Proc.new, Proc#call, method(:name)
 - ✅ **Comparable**: 演算子メソッドC名サニタイズ (<=> → _cmp等)、self参照
 - ✅ **Range as object**: first, last, each, include?, to_a, sum
@@ -358,7 +360,7 @@ sp_RbValue sp_dispatch_puts(sp_RbValue v) {
 | **2a** | 異種配列 `[1, "two", 3.0]` → sp_RbArray | ✅ 完了 |
 | **2b** | bimorphicダックタイピング (クラスタグ) | ✅ 完了 |
 | **2c** | 異種Hash `{a: 1, b: "str"}` | 未着手 |
-| **3** | パターンマッチ `case/in` (型チェック分岐) | **次** |
+| **3** | パターンマッチ `case/in` (型チェック分岐) | ✅ 完了 |
 | **4** | megamorphic dispatch関数生成 (3型以上) | 未着手 |
 | **5** | sp_String (ミュータブル文字列 + GC) | 未着手 |
 | **6** | NaN-boxing (8バイト化) | 未着手 |
@@ -377,11 +379,11 @@ sp_RbValue sp_dispatch_puts(sp_RbValue v) {
 - ✅ bimorphicダックタイピング (2クラス)
 - ✅ nilable変数
 
-### 次に解放される機能 (Phase 3以降)
-- パターンマッチ `case/in` (型チェック分岐) — **次のステップ**
+### 次に解放される機能
 - 異種Hash `{a: 1, b: "str"}`
-- megamorphicダックタイピング (3クラス以上)
+- megamorphicダックタイピング (3クラス以上 → dispatch関数)
 - 条件で型が変わるメソッド戻り値
+- sp_RbValue上の算術演算 (+, -, *, / on POLY)
 
 ---
 
@@ -392,8 +394,8 @@ spinel/
 ├── src/
 │   ├── main.c          # CLI、ファイル読み込み、Prismパース
 │   ├── codegen.h       # 型システム、クラス/メソッド/モジュール情報構造体
-│   └── codegen.c       # 多パスコード生成器 (~9400行)
-├── examples/           # 39テストプログラム
+│   └── codegen.c       # 多パスコード生成器 (~9700行)
+├── examples/           # 40テストプログラム
 ├── prototype/
 │   └── tools/          # Step 0プロトタイプ (RBS抽出、LumiTrace等)
 ├── Makefile
