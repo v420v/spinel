@@ -175,9 +175,10 @@ Regexp使用時のみ libonig をリンク。
 
 ## ポリモーフィズム設計
 
-### 方針: ハイブリッド型システム (Crystal方式)
+### 方針: ハイブリッド型 + 3段階ディスパッチ
 
 現在の**単相最適化を維持**しつつ、必要な箇所にのみ**ボックス化**を導入する。
+ディスパッチは多相度に応じた3段階方式。
 
 ```
 型推論の結果:
@@ -208,37 +209,161 @@ typedef struct {
 // Phase 2 (将来): NaN-boxing (8バイト、高速)
 ```
 
-### メソッドディスパッチ
+### 3段階メソッドディスパッチ
 
-| 多相度 | 方式 | 速度 |
-|--------|------|------|
-| 単相 (型確定) | 直接C関数呼び出し | 最速 (現在) |
-| 少多相 (2-3型) | switch on tag | 高速 |
-| 多多相 (4型+) | vtable/hash | 中速 |
+JITコンパイラのインラインキャッシュと同じ発想。多相度に応じて最適な方式を選択。
+
+| 多相度 | 名称 | 方式 | コード例 | 速度 |
+|--------|------|------|---------|------|
+| 1型 | **monomorphic** | 直接呼び出し (現行) | `sp_Duck_speak(obj)` | 最速 |
+| 2型 | **bimorphic** | call-site inline switch | `if (obj.tag == T_DUCK) ... else ...` | 高速 |
+| 3型以上 | **megamorphic** | dispatch関数 | `sp_dispatch_speak(obj)` | 中速 |
+
+#### Monomorphic (型が1つに確定 — 変更なし)
+
+```c
+// 型推論で obj: Duck と確定 → 直接呼び出し
+sp_Duck_speak(lv_obj);
+```
+
+現在の全37例がこのパス。**性能影響ゼロ**。
+
+#### Bimorphic (2型のUnion — call-site switch)
+
+```c
+// 型推論で obj: Duck | Person と判明 → call siteでswitch
+if (lv_obj.tag == SP_T_DUCK)
+    result = sp_box_str(sp_Duck_speak((sp_Duck *)lv_obj.p));
+else
+    result = sp_box_str(sp_Person_speak((sp_Person *)lv_obj.p));
+```
+
+実用上最も頻出するケース:
+- `Integer | Float` (数値演算)
+- `SomeClass | nil` (nilable)
+- `ClassA | ClassB` (2種の具象型)
+
+関数呼び出しオーバーヘッドゼロ。Cコンパイラの分岐予測最適化が効く。
+
+#### Megamorphic (3型以上 — dispatch関数)
+
+```c
+// コンパイル末尾で自動生成: speakを持つ全クラスを集約
+sp_RbValue sp_dispatch_speak(sp_RbValue obj) {
+    switch (obj.tag) {
+        case SP_T_DUCK:   return sp_box_str(sp_Duck_speak((sp_Duck *)obj.p));
+        case SP_T_PERSON: return sp_box_str(sp_Person_speak((sp_Person *)obj.p));
+        case SP_T_ROBOT:  return sp_box_str(sp_Robot_speak((sp_Robot *)obj.p));
+        default:          sp_raise("NoMethodError: speak");
+    }
+}
+
+// call siteはシンプル
+result = sp_dispatch_speak(lv_obj);
+```
+
+dispatch関数はメソッド名ごとに1つ。コンパイル時に全クラス情報があるため、
+実行時ハッシュ不要の有限switch文で実装。
+
+### Boxing / Unboxing
+
+```c
+// Boxing: アンボックス型 → sp_RbValue
+sp_RbValue sp_box_int(int64_t n)      { return (sp_RbValue){SP_T_INT,    .i = n}; }
+sp_RbValue sp_box_float(double f)     { return (sp_RbValue){SP_T_FLOAT,  .f = f}; }
+sp_RbValue sp_box_str(const char *s)  { return (sp_RbValue){SP_T_STRING, .s = s}; }
+sp_RbValue sp_box_bool(int b)         { return (sp_RbValue){SP_T_BOOL,   .i = b}; }
+sp_RbValue sp_box_nil(void)           { return (sp_RbValue){SP_T_NIL,    .i = 0}; }
+
+// Unboxing: sp_RbValue → アンボックス型 (型チェック付き)
+int64_t sp_unbox_int(sp_RbValue v)    { return v.i; }
+double sp_unbox_float(sp_RbValue v)   { return v.tag == SP_T_FLOAT ? v.f : (double)v.i; }
+const char *sp_unbox_str(sp_RbValue v){ return v.s; }
+```
+
+Boxing/Unboxingは**MONO↔POLY境界**でのみ発生:
+```ruby
+def add(a, b)   # a: Integer (MONO) → アンボックスのまま
+  a + b         # → lv_a + lv_b (直接C演算)
+end
+
+def show(x)     # x: Integer | String (POLY) → sp_RbValue
+  puts x        # → sp_dispatch_puts(lv_x)
+end
+
+n = add(1, 2)   # n: Integer (MONO)
+show(n)          # ← ここでboxingが発生: sp_box_int(lv_n)
+show("hello")   # ← sp_box_str("hello")
+```
+
+### 組込型の演算ディスパッチ
+
+```c
+// sp_RbValue上の + 演算 (bimorphic: Integer | Float)
+if (a.tag == SP_T_INT && b.tag == SP_T_INT)
+    result = sp_box_int(a.i + b.i);           // 整数加算
+else
+    result = sp_box_float(                     // Float昇格
+        (a.tag == SP_T_FLOAT ? a.f : (double)a.i) +
+        (b.tag == SP_T_FLOAT ? b.f : (double)b.i));
+
+// sp_RbValue上の puts (megamorphic: 全型)
+sp_RbValue sp_dispatch_puts(sp_RbValue v) {
+    switch (v.tag) {
+        case SP_T_INT:    printf("%lld\n", (long long)v.i); break;
+        case SP_T_FLOAT:  { char buf[32]; snprintf(buf,32,"%g",v.f);
+                            printf("%s%s\n", buf, strchr(buf,'.')||strchr(buf,'e') ? "" : ".0"); break; }
+        case SP_T_STRING: { fputs(v.s, stdout); if (!*v.s || v.s[strlen(v.s)-1]!='\n') putchar('\n'); break; }
+        case SP_T_BOOL:   puts(v.i ? "true" : "false"); break;
+        case SP_T_NIL:    puts(""); break;
+        default:          puts("(object)"); break;
+    }
+    return sp_box_nil();
+}
+```
+
+### 型推論の拡張
+
+```
+現在: 変数に1つの型を割り当て (MONO)
+      Integer + Float → Float (暗黙変換)
+      Integer + String → VALUE (フォールバック — 実質エラー)
+
+拡張: Union型を追跡 (POLY)
+      Integer + Float → Float (変換可能なら維持)
+      Integer + String → POLY{Integer, String} (boxing)
+      Duck + Person → POLY{Duck, Person} (bimorphic dispatch)
+      Duck + Person + Robot → POLY{Duck, Person, Robot} (megamorphic dispatch)
+```
 
 ### 実装ロードマップ
 
 | Phase | 内容 | 前提 |
 |-------|------|------|
-| 1 | sp_RbValue + boxing/unboxing + 基本演算 | — |
-| 2 | Union型追跡 + switch dispatch | Phase 1 |
-| 3 | 異種Array/Hash | Phase 1 |
-| 4 | ダックタイピング + vtable | Phase 2 |
-| 5 | NaN-boxing + inline cache + LumiTrace | Phase 1-4 |
+| **1a** | sp_RbValue型定義 + boxing/unboxing関数 | — |
+| **1b** | sp_RbValue上の基本演算 (+, puts等) | 1a |
+| **1c** | SPINEL_TYPE_POLY + Union型追跡 | 1a |
+| **1d** | bimorphic call-site switch生成 | 1a, 1c |
+| **2a** | megamorphic dispatch関数生成 | 1a, 1c |
+| **2b** | 異種配列 `[1, "two", 3.0]` → Array<sp_RbValue> | 1a |
+| **2c** | 異種Hash `{a: 1, b: "str"}` → Hash<sp_RbValue> | 1a |
+| **3** | パターンマッチ `case/in` (型チェック分岐) | 1a, 1c |
+| **4** | sp_String (ミュータブル文字列 + GC) | 1a |
+| **5** | NaN-boxing (8バイト化) | 1a-2a |
 
 ### 設計原則
 
-1. **段階的導入**: 既存の単相コンパイルを壊さない
-2. **性能優先**: 単相パスは現在の速度を維持
-3. **互換性**: 最終的に全valid Rubyをコンパイル可能に
-4. **NaN-boxing準備**: Phase 1をPhase 5で置き換え可能な設計
+1. **段階的導入**: 既存の単相コンパイルを壊さない。POLYは必要な変数にのみ適用
+2. **3段階最適化**: mono→直接, bi→inline switch, mega→dispatch関数
+3. **性能優先**: 単相パスは現在の速度 (20-57× vs CRuby) を維持
+4. **互換性**: 最終的に全valid Rubyをコンパイル可能に
+5. **NaN-boxing準備**: Phase 1のsp_RbValueをPhase 5で8バイト化可能な設計
 
 ### sp_RbValue待ちの機能
-- `Comparable` モジュール (演算子メソッド `<=>` のC名サニタイズが必要)
-- `Range` as object (sp_Range構造体 + メソッドセット)
 - パターンマッチ `case/in` (型チェック分岐)
 - 異種配列/Hash
-- ダックタイピング
+- ダックタイピング (3型以上)
+- 条件で型が変わる変数・戻り値
 
 ---
 
