@@ -33,6 +33,7 @@ typedef enum {
     SPINEL_TYPE_TIME,      /* sp_Time (wraps time_t) */
     SPINEL_TYPE_RB_ARRAY,  /* sp_RbArray * (heterogeneous array of sp_RbValue) */
     SPINEL_TYPE_RB_HASH,   /* sp_RbHash * (heterogeneous hash: string key → sp_RbValue) */
+    SPINEL_TYPE_SP_STRING, /* sp_String * (mutable, GC-managed string) */
 } spinel_type_t;
 
 /* Extended type: kind + optional class name for OBJECT types */
@@ -217,6 +218,9 @@ typedef struct {
 
     /* Proc: true when sp_Proc (block param / proc {} / Proc.new) is used */
     bool needs_proc;
+
+    /* sp_String: true when mutable strings (<<) are used */
+    bool needs_sp_string;
 
     /* Regexp: true when any regex literal is used */
     bool needs_regexp;

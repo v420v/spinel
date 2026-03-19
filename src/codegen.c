@@ -175,6 +175,7 @@ const char *spinel_type_cname(spinel_type_t k) {
     case SPINEL_TYPE_TIME:    return "sp_Time";
     case SPINEL_TYPE_RB_ARRAY: return "sp_RbArray *";
     case SPINEL_TYPE_RB_HASH:  return "sp_RbHash *";
+    case SPINEL_TYPE_SP_STRING: return "sp_String *";
     default:                  return "mrb_int"; /* fallback for standalone mode */
     }
 }
@@ -1337,6 +1338,15 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                 if (strcmp(method, "*") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
                 if (strcmp(method, "split") == 0) { free(method); return vt_prim(SPINEL_TYPE_STR_ARRAY); }
             }
+            /* sp_String (mutable string) methods */
+            if (recv_t.kind == SPINEL_TYPE_SP_STRING) {
+                if (strcmp(method, "length") == 0 || strcmp(method, "size") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
+                if (strcmp(method, "upcase") == 0 || strcmp(method, "downcase") == 0 ||
+                    strcmp(method, "reverse") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
+                if (strcmp(method, "include?") == 0) { free(method); return vt_prim(SPINEL_TYPE_BOOLEAN); }
+                if (strcmp(method, "<<") == 0) { free(method); return vt_prim(SPINEL_TYPE_SP_STRING); }
+                if (strcmp(method, "to_s") == 0) { free(method); return vt_prim(SPINEL_TYPE_STRING); }
+            }
             /* Time methods on TIME-typed receiver */
             if (recv_t.kind == SPINEL_TYPE_TIME) {
                 if (strcmp(method, "to_i") == 0) { free(method); return vt_prim(SPINEL_TYPE_INTEGER); }
@@ -1874,6 +1884,18 @@ static void infer_pass(codegen_ctx_t *ctx, pm_node_t *node) {
         if (call->arguments) {
             for (size_t i = 0; i < call->arguments->arguments.size; i++)
                 infer_pass(ctx, call->arguments->arguments.nodes[i]);
+        }
+        /* Detect String << : widen STRING variable to SP_STRING (mutable) */
+        if (call->receiver && ceq(ctx, call->name, "<<") &&
+            PM_NODE_TYPE(call->receiver) == PM_LOCAL_VARIABLE_READ_NODE) {
+            vtype_t recv_t = infer_type(ctx, call->receiver);
+            if (recv_t.kind == SPINEL_TYPE_STRING || recv_t.kind == SPINEL_TYPE_SP_STRING) {
+                pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
+                char *vn = cstr(ctx, lv->name);
+                var_entry_t *v = var_lookup(ctx, vn);
+                if (v) v->type = vt_prim(SPINEL_TYPE_SP_STRING);
+                free(vn);
+            }
         }
         /* Recurse into blocks (for .times do ... end) */
         if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
@@ -4450,6 +4472,31 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                 free(recv);
             }
 
+            /* sp_String (mutable string) method calls */
+            if (recv_t.kind == SPINEL_TYPE_SP_STRING) {
+                char *recv = codegen_expr(ctx, call->receiver);
+                char *r = NULL;
+                if (strcmp(method, "length") == 0 || strcmp(method, "size") == 0)
+                    r = sfmt("sp_String_length(%s)", recv);
+                else if (strcmp(method, "upcase") == 0)
+                    r = sfmt("sp_String_upcase(%s)", recv);
+                else if (strcmp(method, "reverse") == 0)
+                    r = sfmt("sp_String_reverse(%s)", recv);
+                else if (strcmp(method, "include?") == 0 && call->arguments &&
+                         call->arguments->arguments.size == 1) {
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    r = sfmt("sp_String_include(%s, %s)", recv, arg);
+                    free(arg);
+                }
+                else if (strcmp(method, "to_s") == 0)
+                    r = sfmt("sp_String_cstr(%s)", recv);
+                if (r) {
+                    free(recv); free(method);
+                    return r;
+                }
+                free(recv);
+            }
+
             /* String array method calls */
             if (recv_t.kind == SPINEL_TYPE_STR_ARRAY) {
                 char *recv = codegen_expr(ctx, call->receiver);
@@ -5622,7 +5669,13 @@ static char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
         char *val = codegen_expr(ctx, n->value);
         var_entry_t *v = var_lookup(ctx, name);
         char *r;
-        if (v && v->type.kind == SPINEL_TYPE_POLY) {
+        if (v && v->type.kind == SPINEL_TYPE_SP_STRING) {
+            vtype_t rhs_t = infer_type(ctx, n->value);
+            if (rhs_t.kind == SPINEL_TYPE_STRING)
+                r = sfmt("(%s = sp_String_new(%s))", cn, val);
+            else
+                r = sfmt("(%s = %s)", cn, val);
+        } else if (v && v->type.kind == SPINEL_TYPE_POLY) {
             vtype_t rhs_t = infer_type(ctx, n->value);
             if (rhs_t.kind != SPINEL_TYPE_POLY) {
                 char *boxed = poly_box_expr(rhs_t.kind, val);
@@ -5784,7 +5837,16 @@ static void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
         /* Skip array_init — array vars are declared already */
         if (strstr(val, "array_init") == NULL) {
             var_entry_t *v = var_lookup(ctx, name);
-            if (v && v->type.kind == SPINEL_TYPE_POLY) {
+            if (v && v->type.kind == SPINEL_TYPE_SP_STRING) {
+                /* Wrap string literal/expr in sp_String_new() */
+                vtype_t rhs_t = infer_type(ctx, n->value);
+                if (rhs_t.kind == SPINEL_TYPE_STRING)
+                    emit(ctx, "%s = sp_String_new(%s);\n", cn, val);
+                else if (rhs_t.kind == SPINEL_TYPE_SP_STRING)
+                    emit(ctx, "%s = %s;\n", cn, val);
+                else
+                    emit(ctx, "%s = sp_String_new(%s);\n", cn, val);
+            } else if (v && v->type.kind == SPINEL_TYPE_POLY) {
                 vtype_t rhs_t = infer_type(ctx, n->value);
                 if (rhs_t.kind != SPINEL_TYPE_POLY) {
                     char *boxed = poly_box_expr(rhs_t.kind, val);
@@ -6221,6 +6283,10 @@ static void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 } else if (at.kind == SPINEL_TYPE_STRING) {
                     char *ae = codegen_expr(ctx, arg);
                     emit(ctx, "{ const char *_ps = %s; fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '\\n') putchar('\\n'); }\n", ae);
+                    free(ae);
+                } else if (at.kind == SPINEL_TYPE_SP_STRING) {
+                    char *ae = codegen_expr(ctx, arg);
+                    emit(ctx, "{ const char *_ps = sp_String_cstr(%s); fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '\\n') putchar('\\n'); }\n", ae);
                     free(ae);
                 } else if (at.kind == SPINEL_TYPE_BOOLEAN) {
                     char *ae = codegen_expr(ctx, arg);
@@ -6990,19 +7056,38 @@ static void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
             break;
         }
 
-        /* String << (append) as statement → reassign */
+        /* String << (append) as statement */
         if (call->receiver && strcmp(method, "<<") == 0 &&
             call->arguments && call->arguments->arguments.size == 1) {
             vtype_t recv_t = infer_type(ctx, call->receiver);
-            if (recv_t.kind == SPINEL_TYPE_STRING &&
-                PM_NODE_TYPE(call->receiver) == PM_LOCAL_VARIABLE_READ_NODE) {
-                pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
-                char *vn = cstr(ctx, lv->name);
-                char *cn = make_cname(vn, false);
-                char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                emit(ctx, "%s = sp_str_concat(%s, %s);\n", cn, cn, arg);
-                free(vn); free(cn); free(arg); free(method);
-                break;
+            if (PM_NODE_TYPE(call->receiver) == PM_LOCAL_VARIABLE_READ_NODE) {
+                if (recv_t.kind == SPINEL_TYPE_SP_STRING) {
+                    /* Mutable string: sp_String_append(s, arg) */
+                    pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
+                    char *vn = cstr(ctx, lv->name);
+                    char *cn = make_cname(vn, false);
+                    pm_node_t *arg_node = call->arguments->arguments.nodes[0];
+                    vtype_t arg_t = infer_type(ctx, arg_node);
+                    char *arg = codegen_expr(ctx, arg_node);
+                    if (arg_t.kind == SPINEL_TYPE_SP_STRING)
+                        emit(ctx, "sp_String_append_str(%s, %s);\n", cn, arg);
+                    else if (arg_t.kind == SPINEL_TYPE_INTEGER)
+                        emit(ctx, "sp_String_append(%s, sp_int_to_s(%s));\n", cn, arg);
+                    else
+                        emit(ctx, "sp_String_append(%s, %s);\n", cn, arg);
+                    free(vn); free(cn); free(arg); free(method);
+                    break;
+                }
+                if (recv_t.kind == SPINEL_TYPE_STRING) {
+                    /* Immutable string: reassign with concat */
+                    pm_local_variable_read_node_t *lv = (pm_local_variable_read_node_t *)call->receiver;
+                    char *vn = cstr(ctx, lv->name);
+                    char *cn = make_cname(vn, false);
+                    char *arg = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
+                    emit(ctx, "%s = sp_str_concat(%s, %s);\n", cn, cn, arg);
+                    free(vn); free(cn); free(arg); free(method);
+                    break;
+                }
             }
         }
 
@@ -8051,6 +8136,37 @@ static void emit_header(codegen_ctx_t *ctx) {
     emit_raw(ctx, "    r[sl * n] = '\\0'; return r;\n}\n\n");
 
     /* sp_str_char_at already emitted above */
+
+    /* ---- Mutable string (sp_String) ---- */
+    if (ctx->needs_sp_string) {
+        emit_raw(ctx, "typedef struct { char *data; int64_t len; int64_t cap; } sp_String;\n");
+        emit_raw(ctx, "static sp_String *sp_String_new(const char *s) {\n");
+        emit_raw(ctx, "    sp_String *r = (sp_String *)malloc(sizeof(sp_String));\n");
+        emit_raw(ctx, "    r->len = (int64_t)strlen(s);\n");
+        emit_raw(ctx, "    r->cap = r->len < 16 ? 16 : r->len * 2;\n");
+        emit_raw(ctx, "    r->data = (char *)malloc(r->cap + 1);\n");
+        emit_raw(ctx, "    memcpy(r->data, s, r->len + 1);\n");
+        emit_raw(ctx, "    return r;\n}\n");
+        emit_raw(ctx, "static sp_String *sp_String_new_empty(void) { return sp_String_new(\"\"); }\n");
+        emit_raw(ctx, "static void sp_String_append(sp_String *s, const char *t) {\n");
+        emit_raw(ctx, "    int64_t tl = (int64_t)strlen(t);\n");
+        emit_raw(ctx, "    if (s->len + tl >= s->cap) {\n");
+        emit_raw(ctx, "        s->cap = (s->len + tl) * 2;\n");
+        emit_raw(ctx, "        s->data = (char *)realloc(s->data, s->cap + 1);\n");
+        emit_raw(ctx, "    }\n");
+        emit_raw(ctx, "    memcpy(s->data + s->len, t, tl + 1);\n");
+        emit_raw(ctx, "    s->len += tl;\n}\n");
+        emit_raw(ctx, "static void sp_String_append_str(sp_String *s, sp_String *t) {\n");
+        emit_raw(ctx, "    sp_String_append(s, t->data);\n}\n");
+        emit_raw(ctx, "static const char *sp_String_cstr(sp_String *s) { return s->data; }\n");
+        emit_raw(ctx, "static int64_t sp_String_length(sp_String *s) { return s->len; }\n");
+        emit_raw(ctx, "static const char *sp_String_upcase(sp_String *s) {\n");
+        emit_raw(ctx, "    return sp_str_upcase(s->data);\n}\n");
+        emit_raw(ctx, "static const char *sp_String_reverse(sp_String *s) {\n");
+        emit_raw(ctx, "    return sp_str_reverse(s->data);\n}\n");
+        emit_raw(ctx, "static mrb_bool sp_String_include(sp_String *s, const char *sub) {\n");
+        emit_raw(ctx, "    return strstr(s->data, sub) != NULL;\n}\n\n");
+    }
 
     /* ---- Float format (Ruby-style: always show decimal point) ---- */
     emit_raw(ctx, "static const char *sp_float_to_s(mrb_float f) {\n");
@@ -9619,6 +9735,14 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
     for (int i = 0; i < ctx->class_count; i++)
         ctx->classes[i].class_tag = 64 + i; /* SP_T_CLASS_BASE = 64 */
 
+    /* Detect needs_sp_string: any SP_STRING-typed variable triggers mutable string runtime */
+    for (int i = 0; i < ctx->var_count; i++) {
+        if (ctx->vars[i].type.kind == SPINEL_TYPE_SP_STRING) {
+            ctx->needs_sp_string = true;
+            break;
+        }
+    }
+
     /* Detect needs_hash: any HASH-typed variable triggers hash runtime */
     for (int i = 0; i < ctx->var_count; i++) {
         if (ctx->vars[i].type.kind == SPINEL_TYPE_HASH) {
@@ -9925,6 +10049,8 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
                 emit_raw(ctx, "    sp_Val *%s = NULL;\n", cn);
             } else if (v->type.kind == SPINEL_TYPE_ARRAY) {
                 emit_raw(ctx, "    sp_IntArray *%s = NULL;\n", cn);
+            } else if (v->type.kind == SPINEL_TYPE_SP_STRING) {
+                emit_raw(ctx, "    sp_String *%s = NULL;\n", cn);
             } else if (v->type.kind == SPINEL_TYPE_VALUE || v->type.kind == SPINEL_TYPE_UNKNOWN) {
                 /* In lambda mode, VALUE vars might hold sp_StrArray* or other pointers */
                 emit_raw(ctx, "    void *%s = NULL;\n", cn);
@@ -10090,6 +10216,11 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
             }
             else if (v->type.kind == SPINEL_TYPE_PROC && !ctx->lambda_mode) {
                 emit_raw(ctx, "    sp_Proc *%s = NULL;\n", cn);
+                free(ct); free(cn);
+                continue;
+            }
+            else if (v->type.kind == SPINEL_TYPE_SP_STRING) {
+                emit_raw(ctx, "    sp_String *%s = NULL;\n", cn);
                 free(ct); free(cn);
                 continue;
             }
