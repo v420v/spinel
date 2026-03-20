@@ -163,6 +163,12 @@ vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
         return t;
     }
 
+    case PM_IT_LOCAL_VARIABLE_READ_NODE: {
+        /* 'it' keyword → same as _1 */
+        var_entry_t *v = var_lookup(ctx, "_1");
+        return v ? v->type : vt_prim(SPINEL_TYPE_VALUE);
+    }
+
     case PM_CONSTANT_READ_NODE: {
         pm_constant_read_node_t *n = (pm_constant_read_node_t *)node;
         char *name = cstr(ctx, n->name);
@@ -1164,6 +1170,16 @@ void infer_pass(codegen_ctx_t *ctx, pm_node_t *node) {
                 if (recv_t.kind == SPINEL_TYPE_RB_HASH && strcmp(meth, "each") == 0)
                     is_rb_hash_each = true;
                 free(meth);
+            }
+            /* Handle numbered parameters (_1) and it-block */
+            if (blk->parameters && (PM_NODE_TYPE(blk->parameters) == PM_NUMBERED_PARAMETERS_NODE ||
+                                    PM_NODE_TYPE(blk->parameters) == PM_IT_PARAMETERS_NODE)) {
+                spinel_type_t bp_type = SPINEL_TYPE_INTEGER;
+                if (call->receiver) {
+                    vtype_t recv_t = infer_type(ctx, call->receiver);
+                    if (recv_t.kind == SPINEL_TYPE_STR_ARRAY) bp_type = SPINEL_TYPE_STRING;
+                }
+                var_declare(ctx, "_1", vt_prim(bp_type), false);
             }
             if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
                 pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;

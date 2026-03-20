@@ -8,6 +8,27 @@
 #include "codegen.h"
 
 /* ------------------------------------------------------------------ */
+/* Helper: extract block parameter name (same as in expr.c)           */
+/* ------------------------------------------------------------------ */
+static char *extract_block_param(codegen_ctx_t *ctx, pm_block_node_t *blk) {
+    if (blk->parameters) {
+        if (PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
+            pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
+            if (bp->parameters && bp->parameters->requireds.size > 0) {
+                pm_node_t *p = bp->parameters->requireds.nodes[0];
+                if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
+                    return cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
+            }
+        }
+        if (PM_NODE_TYPE(blk->parameters) == PM_NUMBERED_PARAMETERS_NODE)
+            return xstrdup("_1");
+        if (PM_NODE_TYPE(blk->parameters) == PM_IT_PARAMETERS_NODE)
+            return xstrdup("_1");
+    }
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /* Statement codegen                                                  */
 /* ------------------------------------------------------------------ */
 
@@ -849,15 +870,7 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 else
                     mode_arg = xstrdup("\"r\"");
                 /* Get block parameter name */
-                char *bpname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
+                char *bpname = extract_block_param(ctx, blk);
                 char *cn = bpname ? make_cname(bpname, false) : xstrdup("_fio");
                 emit(ctx, "{\n");
                 ctx->indent++;
@@ -886,15 +899,7 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
             if (recv_t.kind == SPINEL_TYPE_FILE) {
                 pm_block_node_t *blk = (pm_block_node_t *)call->block;
                 char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
+                char *bpname = extract_block_param(ctx, blk);
                 int tmp = ctx->temp_counter++;
                 emit(ctx, "{ char _buf_%d[4096];\n", tmp);
                 emit(ctx, "while (fgets(_buf_%d, sizeof(_buf_%d), %s->fp)) {\n", tmp, tmp, recv);
@@ -966,15 +971,7 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
             if (recv_t.kind == SPINEL_TYPE_STRING) {
                 pm_block_node_t *blk = (pm_block_node_t *)call->block;
                 char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
+                char *bpname = extract_block_param(ctx, blk);
                 ctx->needs_str_split = true;
                 int tmp = ctx->temp_counter++;
                 emit(ctx, "{ sp_StrArray *_lines_%d = sp_str_split(%s, \"\\n\");\n", tmp, recv);
@@ -1007,15 +1004,7 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
             if (recv_t.kind == SPINEL_TYPE_ARRAY) {
                 pm_block_node_t *blk = (pm_block_node_t *)call->block;
                 char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
+                char *bpname = extract_block_param(ctx, blk);
                 int tmp = ctx->temp_counter++;
                 emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < sp_IntArray_length(%s); _ei_%d++) {\n",
                      tmp, tmp, recv, tmp);
@@ -1041,15 +1030,7 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
             if (recv_t.kind == SPINEL_TYPE_RB_ARRAY) {
                 pm_block_node_t *blk = (pm_block_node_t *)call->block;
                 char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
+                char *bpname = extract_block_param(ctx, blk);
                 int tmp = ctx->temp_counter++;
                 emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < sp_RbArray_length(%s); _ei_%d++) {\n",
                      tmp, tmp, recv, tmp);
@@ -1097,15 +1078,7 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
             if (recv_t.kind == SPINEL_TYPE_RANGE) {
                 pm_block_node_t *blk = (pm_block_node_t *)call->block;
                 char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
+                char *bpname = extract_block_param(ctx, blk);
                 int tmp = ctx->temp_counter++;
                 emit(ctx, "{ sp_Range _rng_%d = %s;\n", tmp, recv);
                 if (bpname) {
@@ -1130,15 +1103,7 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
             if (recv_t.kind == SPINEL_TYPE_STR_ARRAY) {
                 pm_block_node_t *blk = (pm_block_node_t *)call->block;
                 char *recv = codegen_expr(ctx, call->receiver);
-                char *bpname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
+                char *bpname = extract_block_param(ctx, blk);
                 int tmp = ctx->temp_counter++;
                 emit(ctx, "for (mrb_int _ei_%d = 0; _ei_%d < sp_StrArray_length(%s); _ei_%d++) {\n",
                      tmp, tmp, recv, tmp);
@@ -1355,15 +1320,7 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 pm_block_node_t *blk = (pm_block_node_t *)call->block;
                 char *recv = codegen_expr(ctx, call->receiver);
                 char *pat = codegen_expr(ctx, call->arguments->arguments.nodes[0]);
-                char *bpname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
+                char *bpname = extract_block_param(ctx, blk);
                 int tmp = ctx->temp_counter++;
                 emit(ctx, "{ /* scan */\n");
                 ctx->indent++;
@@ -1408,15 +1365,7 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 int blk_id = ctx->block_counter++;
 
                 /* Get block parameter name */
-                char *bpname = NULL;
-                if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
-                    pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)blk->parameters;
-                    if (bp->parameters && bp->parameters->requireds.size > 0) {
-                        pm_node_t *p = bp->parameters->requireds.nodes[0];
-                        if (PM_NODE_TYPE(p) == PM_REQUIRED_PARAMETER_NODE)
-                            bpname = cstr(ctx, ((pm_required_parameter_node_t *)p)->name);
-                    }
-                }
+                char *bpname = extract_block_param(ctx, blk);
 
                 /* Scan block body for captured variables (variables from the caller's scope) */
                 capture_list_t local_defs = {.count = 0};
