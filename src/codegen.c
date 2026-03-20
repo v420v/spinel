@@ -806,14 +806,43 @@ static void analyze_module(codegen_ctx_t *ctx, pm_module_node_t *node) {
             module_const_t *mc = &mod->consts[mod->const_count++];
             snprintf(mc->name, sizeof(mc->name), "%s", cname);
             mc->value_node = cw->value;
-            /* Infer type: BNUM is integer (1 << 29), BNUMF is float (.to_f) */
-            mc->type = vt_prim(SPINEL_TYPE_INTEGER);
-            if (cw->value && PM_NODE_TYPE(cw->value) == PM_CALL_NODE) {
-                pm_call_node_t *vc = (pm_call_node_t *)cw->value;
-                char *mn = cstr(ctx, vc->name);
-                if (strcmp(mn, "to_f") == 0)
+            /* Infer type from value node */
+            if (cw->value) {
+                switch (PM_NODE_TYPE(cw->value)) {
+                case PM_STRING_NODE:
+                    mc->type = vt_prim(SPINEL_TYPE_STRING);
+                    break;
+                case PM_INTEGER_NODE:
+                    mc->type = vt_prim(SPINEL_TYPE_INTEGER);
+                    break;
+                case PM_FLOAT_NODE:
                     mc->type = vt_prim(SPINEL_TYPE_FLOAT);
-                free(mn);
+                    break;
+                case PM_TRUE_NODE: case PM_FALSE_NODE:
+                    mc->type = vt_prim(SPINEL_TYPE_BOOLEAN);
+                    break;
+                case PM_CALL_NODE: {
+                    pm_call_node_t *vc = (pm_call_node_t *)cw->value;
+                    char *mn = cstr(ctx, vc->name);
+                    if (strcmp(mn, "to_f") == 0)
+                        mc->type = vt_prim(SPINEL_TYPE_FLOAT);
+                    else if (strcmp(mn, "home") == 0 || strcmp(mn, "join") == 0 ||
+                             strcmp(mn, "expand_path") == 0)
+                        mc->type = vt_prim(SPINEL_TYPE_STRING);
+                    else
+                        mc->type = vt_prim(SPINEL_TYPE_INTEGER);
+                    free(mn);
+                    break;
+                }
+                case PM_HASH_NODE:
+                    mc->type = vt_prim(SPINEL_TYPE_HASH);
+                    break;
+                default:
+                    mc->type = vt_prim(SPINEL_TYPE_INTEGER);
+                    break;
+                }
+            } else {
+                mc->type = vt_prim(SPINEL_TYPE_INTEGER);
             }
             free(cname);
         }
@@ -1145,6 +1174,28 @@ static vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
         vtype_t t = v ? v->type : vt_prim(SPINEL_TYPE_VALUE);
         free(name);
         return t;
+    }
+
+    case PM_CONSTANT_PATH_NODE: {
+        /* Module::CONST — look up the constant in the module */
+        pm_constant_path_node_t *cp = (pm_constant_path_node_t *)node;
+        if (cp->parent && PM_NODE_TYPE(cp->parent) == PM_CONSTANT_READ_NODE) {
+            pm_constant_read_node_t *p = (pm_constant_read_node_t *)cp->parent;
+            char *mod_name = cstr(ctx, p->name);
+            char *child_name = cstr(ctx, cp->name);
+            module_info_t *mod = find_module(ctx, mod_name);
+            if (mod) {
+                for (int i = 0; i < mod->const_count; i++) {
+                    if (strcmp(mod->consts[i].name, child_name) == 0) {
+                        vtype_t t = mod->consts[i].type;
+                        free(mod_name); free(child_name);
+                        return t;
+                    }
+                }
+            }
+            free(mod_name); free(child_name);
+        }
+        return vt_prim(SPINEL_TYPE_VALUE);
     }
 
     /* Chained assignment: zr = zi = 0 — type is type of the value */
