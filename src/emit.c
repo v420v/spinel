@@ -328,11 +328,16 @@ void emit_method(codegen_ctx_t *ctx, class_info_t *cls, method_info_t *m) {
     ctx->current_method = m;
     int saved_indent = ctx->indent;
     int saved_var_count = ctx->var_count;
+    /* Clear stale entries from previous function scopes */
+    for (int i = saved_var_count; i < MAX_VARS; i++)
+        ctx->vars[i].name[0] = '\0';
     ctx->indent = 1;
 
     /* Register method parameters in the variable table so type inference works */
     for (int i = 0; i < m->param_count; i++)
         var_declare(ctx, m->params[i].name, m->params[i].type, false);
+
+    int var_count_after_params = ctx->var_count;
 
     /* Infer local variables from method body */
     if (m->body_node) infer_pass(ctx, m->body_node);
@@ -346,7 +351,7 @@ void emit_method(codegen_ctx_t *ctx, class_info_t *cls, method_info_t *m) {
         for (int i = 0; i < m->param_count && !method_has_gc_vars; i++)
             if (is_gc_type(ctx, m->params[i].type)) method_has_gc_vars = true;
         /* Check locals */
-        for (int i = saved_var_count + m->param_count; i < ctx->var_count && !method_has_gc_vars; i++)
+        for (int i = var_count_after_params; i < ctx->var_count && !method_has_gc_vars; i++)
             if (is_gc_type(ctx, ctx->vars[i].type)) method_has_gc_vars = true;
     }
 
@@ -365,7 +370,7 @@ void emit_method(codegen_ctx_t *ctx, class_info_t *cls, method_info_t *m) {
     }
 
     /* Emit local variable declarations (skip params — they're function args) */
-    for (int i = saved_var_count + m->param_count; i < ctx->var_count; i++) {
+    for (int i = var_count_after_params; i < ctx->var_count; i++) {
         var_entry_t *v = &ctx->vars[i];
         char *ct = vt_ctype(ctx, v->type, false);
         char *cn = make_cname(v->name, v->is_constant);
@@ -497,6 +502,9 @@ void emit_top_func(codegen_ctx_t *ctx, func_info_t *f) {
 
     int saved_indent = ctx->indent;
     int saved_var_count = ctx->var_count;
+    /* Clear stale entries from previous function scopes */
+    for (int i = saved_var_count; i < MAX_VARS; i++)
+        ctx->vars[i].name[0] = '\0';
     ctx->indent = 1;
 
     /* Register parameters in var table for type inference */
@@ -507,6 +515,8 @@ void emit_top_func(codegen_ctx_t *ctx, func_info_t *f) {
     if (f->has_block_param && !ctx->lambda_mode)
         var_declare(ctx, f->block_param_name, vt_prim(SPINEL_TYPE_PROC), false);
 
+    int var_count_after_params = ctx->var_count;
+
     if (f->body_node) infer_pass(ctx, f->body_node);
 
     /* Check if this function needs GC rooting */
@@ -516,7 +526,7 @@ void emit_top_func(codegen_ctx_t *ctx, func_info_t *f) {
         if (is_gc_type(ctx, f->return_type)) func_has_gc_vars = true;
         for (int i = 0; i < f->param_count && !func_has_gc_vars; i++)
             if (is_gc_type(ctx, f->params[i].type)) func_has_gc_vars = true;
-        for (int i = saved_var_count + f->param_count; i < ctx->var_count && !func_has_gc_vars; i++)
+        for (int i = var_count_after_params; i < ctx->var_count && !func_has_gc_vars; i++)
             if (is_gc_type(ctx, ctx->vars[i].type)) func_has_gc_vars = true;
     }
 
@@ -534,7 +544,7 @@ void emit_top_func(codegen_ctx_t *ctx, func_info_t *f) {
     /* Include both newly registered vars AND outer-scope vars that shadow */
     {
         /* First emit newly registered vars (the standard path) */
-        for (int i = saved_var_count + f->param_count; i < ctx->var_count; i++) {
+        for (int i = var_count_after_params; i < ctx->var_count; i++) {
             var_entry_t *v = &ctx->vars[i];
             char *ct = vt_ctype(ctx, v->type, false);
             char *cn = make_cname(v->name, v->is_constant);
@@ -626,7 +636,7 @@ void emit_top_func(codegen_ctx_t *ctx, func_info_t *f) {
                     for (int pi = 0; pi < f->param_count; pi++) \
                         if (strcmp(f->params[pi].name, (vname)) == 0) { is_param = true; break; } \
                     bool is_new_var = false; \
-                    for (int vi = saved_var_count + f->param_count; vi < ctx->var_count; vi++) \
+                    for (int vi = var_count_after_params; vi < ctx->var_count; vi++) \
                         if (strcmp(ctx->vars[vi].name, (vname)) == 0) { is_new_var = true; break; } \
                     bool already_emitted = false; \
                     for (int ei = 0; ei < emitted_shadow_count; ei++) \
@@ -799,6 +809,9 @@ void emit_module(codegen_ctx_t *ctx, module_info_t *mod) {
         /* Generate method body using the AST */
         int saved_indent = ctx->indent;
         int saved_var_count = ctx->var_count;
+        /* Clear stale entries from previous function scopes */
+        for (int i = saved_var_count; i < MAX_VARS; i++)
+            ctx->vars[i].name[0] = '\0';
         ctx->indent = 1;
         ctx->current_module = mod;
 

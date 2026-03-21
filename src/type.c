@@ -340,13 +340,8 @@ vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
             pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->receiver;
             char *cls_name = cstr(ctx, cr->name);
             if (strcmp(cls_name, "Array") == 0) {
-                int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
-                if (argc == 0) {
-                    free(cls_name); free(method);
-                    return vt_prim(SPINEL_TYPE_ARRAY);
-                }
                 free(cls_name); free(method);
-                return vt_prim(SPINEL_TYPE_VALUE);
+                return vt_prim(SPINEL_TYPE_ARRAY);
             }
             if (find_class(ctx, cls_name)) {
                 result = vt_obj(cls_name);
@@ -623,14 +618,8 @@ vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
                 pm_constant_read_node_t *cr = (pm_constant_read_node_t *)call->receiver;
                 char *cls_name = cstr(ctx, cr->name);
                 if (strcmp(cls_name, "Array") == 0) {
-                    int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
-                    if (argc == 0) {
-                        free(cls_name); free(method);
-                        return vt_prim(SPINEL_TYPE_ARRAY);
-                    }
-                    /* Array.new(N) — fixed-size C array, type depends on context */
                     free(cls_name); free(method);
-                    return vt_prim(SPINEL_TYPE_VALUE);
+                    return vt_prim(SPINEL_TYPE_ARRAY);
                 }
                 if (strcmp(cls_name, "Hash") == 0) {
                     free(cls_name); free(method);

@@ -240,7 +240,7 @@ int mega_dispatch_register(codegen_ctx_t *ctx, const char *method,
 
 var_entry_t *var_lookup(codegen_ctx_t *ctx, const char *name) {
     for (int i = 0; i < ctx->var_count; i++)
-        if (strcmp(ctx->vars[i].name, name) == 0) return &ctx->vars[i];
+        if (ctx->vars[i].name[0] && strcmp(ctx->vars[i].name, name) == 0) return &ctx->vars[i];
     return NULL;
 }
 
