@@ -1005,6 +1005,7 @@ vtype_t infer_type(codegen_ctx_t *ctx, pm_node_t *node) {
     }
 
     case PM_REGULAR_EXPRESSION_NODE:
+    case PM_INTERPOLATED_REGULAR_EXPRESSION_NODE:
         return vt_prim(SPINEL_TYPE_REGEXP);
 
     case PM_NUMBERED_REFERENCE_READ_NODE:

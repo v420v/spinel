@@ -4344,6 +4344,12 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
         return r;
     }
 
+    case PM_INTERPOLATED_REGULAR_EXPRESSION_NODE:
+        /* Interpolated regexp (/pattern #{expr}/) — not yet supported at
+         * compile time; return NULL placeholder so callers can handle
+         * gracefully. */
+        return sfmt("NULL /* interp regexp */");
+
     default:
         fprintf(stderr, "spinel: warning: unsupported expression node type %d\n", PM_NODE_TYPE(node));
         return sfmt("0 /* unsupported expr %d */", PM_NODE_TYPE(node));

@@ -505,13 +505,15 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
         if (is_require_relative(ctx, node) || is_require(ctx, node))
             break;
 
-        /* private/protected/public — access modifiers are no-ops in AOT */
+        /* private/protected/public/extend — access modifiers and runtime
+         * mixin operations are no-ops in AOT */
         {
             char *_mname = cstr(ctx, call->name);
             if (!call->receiver &&
                 (strcmp(_mname, "private") == 0 ||
                  strcmp(_mname, "protected") == 0 ||
-                 strcmp(_mname, "public") == 0)) {
+                 strcmp(_mname, "public") == 0 ||
+                 strcmp(_mname, "extend") == 0)) {
                 free(_mname);
                 break;
             }
