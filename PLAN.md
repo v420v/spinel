@@ -308,17 +308,30 @@ Regexp使用時のみ libonig をリンク。
 - type inference: ivar name → class heuristic
 - type inference: reopened class merging
 
-**現状: lrama 71ファイル → 4500行 C 生成成功、C コンパイルは 334 エラー残**
+**現状: lrama 71ファイル → 4500行 C 生成成功、395 warnings 残**
 
-#### 残課題
+lrama ソース: `/home/matz/work/lrama/` (Spinel 対応修正はここで行う)
 
-| カテゴリ | 件数 | 対処 |
-|---------|------|------|
-| 型推論不足 (`unknown#method`) | ~400 | Struct field 型推論、メソッドチェーン推論 |
-| StringScanner stub | ~35 | stubs/strscan.rb + strscan.c 実装 |
-| OptionParser stub | ~10 | stubs/optparse.rb 実装 |
-| parser.rb (Racc/eval) | 1ファイル | **AOT不可** — 手書き代替必要 |
-| ERB (output.rb) | 1ファイル | **AOT不可** — テンプレート事前展開必要 |
+#### 今後のロードマップ
+
+**Step 3: 型推論の改善** (~395 warnings → 目標 <100)
+- Struct keyword_init フィールドの型推論 (call site から)
+- メソッドチェーン `obj.field.method` の段階的型解決
+- Array/Hash 要素型追跡 (`@rules` が Array of Rule 等)
+- メソッド戻り値型の body 解析改善
+
+**Step 4: lrama ソースの Spinel 対応修正** (`/home/matz/work/lrama/`)
+- parser.rb: Racc 生成コードを静的メソッドに変換、または手書き再帰下降に置換
+- output.rb: ERB テンプレートを事前展開、または簡易テンプレートに置換
+- OptionParser 依存の除去 (手書き CLI パーサーに置換)
+- StringScanner 依存の最小化 (可能なら正規表現ベースに置換)
+- Racc 対応のドロップも検討
+
+**Step 5: StringScanner stub (C実装)**
+- stubs/strscan.rb (型定義) + stubs/strscan.c (oniguruma ベース)
+- scan, matched, eos?, getch, pos, check, peek, scan_until
+
+**Step 6: C コンパイル通過 → 実行形式生成**
 
 ---
 
