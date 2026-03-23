@@ -190,6 +190,11 @@ typedef struct {
     FILE *block_out;               /* secondary output for block function bodies */
     bool in_yield_func;            /* true when inside a function that uses yield */
 
+    /* Non-local return from blocks: when a block contains 'return', it should
+     * return from the enclosing method, not just from the block callback. */
+    bool in_block_nonlocal;        /* true when inside a block with non-local return */
+    int block_return_id;           /* block ID for non-local return env access */
+
     /* Exception handling: true when raise/rescue is used */
     bool needs_exc;
     int exc_counter;   /* unique ID for retry labels */
@@ -359,6 +364,7 @@ void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root);
 /* --- Class analysis (codegen.c) --- */
 void class_analysis_pass(codegen_ctx_t *ctx, pm_node_t *root);
 bool has_yield_nodes(pm_node_t *node);
+bool block_has_return(pm_node_t *node);
 
 /* --- Expression codegen (expr.c) --- */
 char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node);

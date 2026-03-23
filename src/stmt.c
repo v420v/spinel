@@ -514,7 +514,17 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
 
     case PM_RETURN_NODE: {
         pm_return_node_t *n = (pm_return_node_t *)node;
-        if (n->arguments && n->arguments->arguments.size > 0) {
+        if (ctx->in_block_nonlocal) {
+            /* Non-local return from block: store value and longjmp to caller */
+            if (n->arguments && n->arguments->arguments.size > 0) {
+                char *val = codegen_expr(ctx, n->arguments->arguments.nodes[0]);
+                emit(ctx, "*_e->_blk_ret_val = %s;\n", val);
+                free(val);
+            } else {
+                emit(ctx, "*_e->_blk_ret_val = 0;\n");
+            }
+            emit(ctx, "longjmp(sp_exc_stack[_e->_blk_ret_depth], 3);\n");
+        } else if (n->arguments && n->arguments->arguments.size > 0) {
             char *val = codegen_expr(ctx, n->arguments->arguments.nodes[0]);
             if (ctx->gc_scope_active)
                 emit(ctx, "{ SP_GC_RESTORE(); return %s; }\n", val);
@@ -1288,6 +1298,9 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                         pm_block_node_t *blk = (pm_block_node_t *)call->block;
                         char *recv = codegen_expr(ctx, call->receiver);
 
+                        /* Detect non-local return in block body */
+                        bool has_nonlocal_return = blk->body && block_has_return((pm_node_t *)blk->body);
+
                         /* Extract block parameter name */
                         char *bpname = NULL;
                         if (blk->parameters && PM_NODE_TYPE(blk->parameters) == PM_BLOCK_PARAMETERS_NODE) {
@@ -1319,7 +1332,10 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                             emit_raw(ctx, "mrb_int *%s; ", cn);
                             free(cn);
                         }
-                        if (captures.count == 0) emit_raw(ctx, "int _dummy; ");
+                        if (has_nonlocal_return) {
+                            emit_raw(ctx, "volatile mrb_int *_blk_ret_val; int _blk_ret_depth; ");
+                        }
+                        if (captures.count == 0 && !has_nonlocal_return) emit_raw(ctx, "int _dummy; ");
                         emit_raw(ctx, "} _blk_env_%d_t;\n", blk_id);
 
                         emit_raw(ctx, "static mrb_int _blk_%d(void *_e, mrb_int _arg) {\n", blk_id);
@@ -1341,11 +1357,28 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                             free(cn);
                         }
 
+                        /* For non-local return, alias _e for the return macros */
+                        if (has_nonlocal_return) {
+                            emit_raw(ctx, "    #define _e _env\n");
+                        }
+
                         /* Generate block body */
                         int saved_indent = ctx->indent;
                         ctx->indent = 1;
+                        bool saved_in_block_nonlocal = ctx->in_block_nonlocal;
+                        int saved_block_return_id = ctx->block_return_id;
+                        if (has_nonlocal_return) {
+                            ctx->in_block_nonlocal = true;
+                            ctx->block_return_id = blk_id;
+                        }
                         if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+                        ctx->in_block_nonlocal = saved_in_block_nonlocal;
+                        ctx->block_return_id = saved_block_return_id;
                         ctx->indent = saved_indent;
+
+                        if (has_nonlocal_return) {
+                            emit_raw(ctx, "    #undef _e\n");
+                        }
 
                         /* Undefine aliases */
                         for (int ci = 0; ci < captures.count; ci++) {
@@ -1361,22 +1394,55 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
 
                         ctx->out = saved_out;
 
-                        /* Set up the environment struct */
-                        emit(ctx, "{ _blk_env_%d_t _env_%d;\n", blk_id, blk_id);
-                        for (int ci = 0; ci < captures.count; ci++) {
-                            var_entry_t *v = var_lookup(ctx, captures.names[ci]);
-                            if (!v) continue;
-                            char *cn = make_cname(v->name, false);
-                            emit(ctx, "_env_%d.%s = &%s;\n", blk_id, cn, cn);
-                            free(cn);
-                        }
+                        if (has_nonlocal_return) {
+                            /* Non-local return: wrap call with setjmp/longjmp */
+                            emit(ctx, "{ volatile mrb_int _blk_ret_val_%d = 0;\n", blk_id);
+                            emit(ctx, "sp_exc_depth++;\n");
+                            emit(ctx, "_blk_env_%d_t _env_%d;\n", blk_id, blk_id);
+                            for (int ci = 0; ci < captures.count; ci++) {
+                                var_entry_t *v = var_lookup(ctx, captures.names[ci]);
+                                if (!v) continue;
+                                char *cn = make_cname(v->name, false);
+                                emit(ctx, "_env_%d.%s = &%s;\n", blk_id, cn, cn);
+                                free(cn);
+                            }
+                            emit(ctx, "_env_%d._blk_ret_val = &_blk_ret_val_%d;\n", blk_id, blk_id);
+                            emit(ctx, "_env_%d._blk_ret_depth = sp_exc_depth - 1;\n", blk_id);
 
-                        /* Call the method with block */
-                        const char *c_mname = sanitize_method(method);
-                        class_info_t *def_cls = owner ? owner : rcls;
-                        emit(ctx, "sp_%s_%s(%s, (sp_block_fn)_blk_%d, &_env_%d);\n",
-                             def_cls->name, c_mname, recv, blk_id, blk_id);
-                        emit(ctx, "}\n");
+                            const char *c_mname = sanitize_method(method);
+                            class_info_t *def_cls = owner ? owner : rcls;
+
+                            emit(ctx, "if (setjmp(sp_exc_stack[sp_exc_depth - 1]) == 0) {\n");
+                            ctx->indent++;
+                            emit(ctx, "sp_%s_%s(%s, (sp_block_fn)_blk_%d, &_env_%d);\n",
+                                 def_cls->name, c_mname, recv, blk_id, blk_id);
+                            emit(ctx, "sp_exc_depth--;\n");
+                            ctx->indent--;
+                            emit(ctx, "} else {\n");
+                            ctx->indent++;
+                            emit(ctx, "sp_exc_depth--;\n");
+                            emit(ctx, "return _blk_ret_val_%d;\n", blk_id);
+                            ctx->indent--;
+                            emit(ctx, "}\n");
+                            emit(ctx, "}\n");
+                        } else {
+                            /* Set up the environment struct */
+                            emit(ctx, "{ _blk_env_%d_t _env_%d;\n", blk_id, blk_id);
+                            for (int ci = 0; ci < captures.count; ci++) {
+                                var_entry_t *v = var_lookup(ctx, captures.names[ci]);
+                                if (!v) continue;
+                                char *cn = make_cname(v->name, false);
+                                emit(ctx, "_env_%d.%s = &%s;\n", blk_id, cn, cn);
+                                free(cn);
+                            }
+
+                            /* Call the method with block */
+                            const char *c_mname = sanitize_method(method);
+                            class_info_t *def_cls = owner ? owner : rcls;
+                            emit(ctx, "sp_%s_%s(%s, (sp_block_fn)_blk_%d, &_env_%d);\n",
+                                 def_cls->name, c_mname, recv, blk_id, blk_id);
+                            emit(ctx, "}\n");
+                        }
 
                         free(recv); free(bpname); free(method);
                         break;
@@ -1517,6 +1583,9 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 pm_block_node_t *blk = (pm_block_node_t *)call->block;
                 int blk_id = ctx->block_counter++;
 
+                /* Detect non-local return in block body */
+                bool has_nonlocal_return = blk->body && block_has_return((pm_node_t *)blk->body);
+
                 /* Get block parameter name */
                 char *bpname = extract_block_param(ctx, blk);
 
@@ -1545,7 +1614,18 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                     FILE *saved_out = ctx->out;
                     ctx->out = body_buf;
 
+                    /* Set non-local return context if block has return */
+                    bool saved_in_block_nonlocal = ctx->in_block_nonlocal;
+                    int saved_block_return_id = ctx->block_return_id;
+                    if (has_nonlocal_return) {
+                        ctx->in_block_nonlocal = true;
+                        ctx->block_return_id = blk_id;
+                    }
+
                     if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+
+                    ctx->in_block_nonlocal = saved_in_block_nonlocal;
+                    ctx->block_return_id = saved_block_return_id;
 
                     fclose(body_buf);
                     ctx->out = saved_out;
@@ -1587,7 +1667,10 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                     fprintf(ctx->block_out, "typedef struct { ");
                     for (int i = 0; i < captures.count; i++)
                         fprintf(ctx->block_out, "mrb_int *%s; ", captures.names[i]);
-                    if (captures.count == 0) fprintf(ctx->block_out, "int _dummy; ");
+                    if (has_nonlocal_return) {
+                        fprintf(ctx->block_out, "volatile mrb_int *_blk_ret_val; int _blk_ret_depth; ");
+                    }
+                    if (captures.count == 0 && !has_nonlocal_return) fprintf(ctx->block_out, "int _dummy; ");
                     fprintf(ctx->block_out, "} _blk_%d_env;\n", blk_id);
 
                     /* Callback function */
@@ -1607,27 +1690,67 @@ void codegen_stmt(codegen_ctx_t *ctx, pm_node_t *node) {
                 free(body_processed);
 
                 /* Generate the call site: env init + function call */
-                emit(ctx, "_blk_%d_env _env_%d = { ", blk_id, blk_id);
-                for (int i = 0; i < captures.count; i++) {
-                    char *cn = make_cname(captures.names[i], false);
-                    emit_raw(ctx, "%s&%s", i > 0 ? ", " : "", cn);
-                    free(cn);
-                }
-                if (captures.count == 0) emit_raw(ctx, "0");
-                emit_raw(ctx, " };\n");
+                if (has_nonlocal_return) {
+                    /* Non-local return: wrap call with setjmp/longjmp */
+                    emit(ctx, "{ volatile mrb_int _blk_ret_val_%d = 0;\n", blk_id);
+                    emit(ctx, "sp_exc_depth++;\n");
+                    emit(ctx, "_blk_%d_env _env_%d = { ", blk_id, blk_id);
+                    for (int i = 0; i < captures.count; i++) {
+                        char *cn = make_cname(captures.names[i], false);
+                        emit_raw(ctx, "&%s, ", cn);
+                        free(cn);
+                    }
+                    emit_raw(ctx, "&_blk_ret_val_%d, sp_exc_depth - 1 };\n", blk_id);
 
-                /* Build arguments */
-                int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
-                char *args = xstrdup("");
-                for (int i = 0; i < argc; i++) {
-                    char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
-                    char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", a);
-                    free(args); free(a);
-                    args = na;
+                    emit(ctx, "if (setjmp(sp_exc_stack[sp_exc_depth - 1]) == 0) {\n");
+                    ctx->indent++;
+
+                    /* Build arguments */
+                    int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
+                    char *args = xstrdup("");
+                    for (int i = 0; i < argc; i++) {
+                        char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                        char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", a);
+                        free(args); free(a);
+                        args = na;
+                    }
+                    emit(ctx, "sp_%s(%s%s(sp_block_fn)_blk_%d, &_env_%d);\n",
+                         fn->name, args, argc > 0 ? ", " : "", blk_id, blk_id);
+                    emit(ctx, "sp_exc_depth--;\n");
+                    free(args);
+
+                    ctx->indent--;
+                    emit(ctx, "} else {\n");
+                    ctx->indent++;
+                    emit(ctx, "sp_exc_depth--;\n");
+                    emit(ctx, "return _blk_ret_val_%d;\n", blk_id);
+                    ctx->indent--;
+                    emit(ctx, "}\n");
+                    emit(ctx, "}\n");
+                } else {
+                    emit(ctx, "_blk_%d_env _env_%d = { ", blk_id, blk_id);
+                    for (int i = 0; i < captures.count; i++) {
+                        char *cn = make_cname(captures.names[i], false);
+                        emit_raw(ctx, "%s&%s", i > 0 ? ", " : "", cn);
+                        free(cn);
+                    }
+                    if (captures.count == 0) emit_raw(ctx, "0");
+                    emit_raw(ctx, " };\n");
+
+                    /* Build arguments */
+                    int argc = call->arguments ? (int)call->arguments->arguments.size : 0;
+                    char *args = xstrdup("");
+                    for (int i = 0; i < argc; i++) {
+                        char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
+                        char *na = sfmt("%s%s%s", args, i > 0 ? ", " : "", a);
+                        free(args); free(a);
+                        args = na;
+                    }
+                    emit(ctx, "sp_%s(%s%s(sp_block_fn)_blk_%d, &_env_%d);\n",
+                         fn->name, args, argc > 0 ? ", " : "", blk_id, blk_id);
+                    free(args);
                 }
-                emit(ctx, "sp_%s(%s%s(sp_block_fn)_blk_%d, &_env_%d);\n",
-                     fn->name, args, argc > 0 ? ", " : "", blk_id, blk_id);
-                free(args); free(bpname); free(method);
+                free(bpname); free(method);
                 break;
             }
         }

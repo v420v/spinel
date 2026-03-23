@@ -1227,6 +1227,45 @@ bool has_yield_nodes(pm_node_t *node) {
     }
 }
 
+/* Detect if a block body contains PM_RETURN_NODE (non-local return) */
+bool block_has_return(pm_node_t *node) {
+    if (!node) return false;
+    if (PM_NODE_TYPE(node) == PM_RETURN_NODE) return true;
+    switch (PM_NODE_TYPE(node)) {
+    case PM_STATEMENTS_NODE: {
+        pm_statements_node_t *s = (pm_statements_node_t *)node;
+        for (size_t i = 0; i < s->body.size; i++)
+            if (block_has_return(s->body.nodes[i])) return true;
+        return false;
+    }
+    case PM_IF_NODE: {
+        pm_if_node_t *n = (pm_if_node_t *)node;
+        if (n->statements && block_has_return((pm_node_t *)n->statements)) return true;
+        if (n->subsequent && block_has_return((pm_node_t *)n->subsequent)) return true;
+        return false;
+    }
+    case PM_ELSE_NODE: {
+        pm_else_node_t *n = (pm_else_node_t *)node;
+        return n->statements ? block_has_return((pm_node_t *)n->statements) : false;
+    }
+    case PM_WHILE_NODE: {
+        pm_while_node_t *n = (pm_while_node_t *)node;
+        return n->statements ? block_has_return((pm_node_t *)n->statements) : false;
+    }
+    case PM_CALL_NODE: {
+        pm_call_node_t *c = (pm_call_node_t *)node;
+        if (c->arguments) {
+            for (size_t i = 0; i < c->arguments->arguments.size; i++)
+                if (block_has_return(c->arguments->arguments.nodes[i])) return true;
+        }
+        /* Don't recurse into nested blocks — their return is their own scope */
+        return false;
+    }
+    default:
+        return false;
+    }
+}
+
 static void analyze_top_func(codegen_ctx_t *ctx, pm_def_node_t *def) {
     func_info_t *f = &ctx->funcs[ctx->func_count++];
     memset(f, 0, sizeof(*f));
@@ -1762,6 +1801,76 @@ static bool has_exception_nodes(codegen_ctx_t *ctx, pm_node_t *node) {
     case PM_MODULE_NODE: {
         pm_module_node_t *mn = (pm_module_node_t *)node;
         return mn->body ? has_exception_nodes(ctx, (pm_node_t *)mn->body) : false;
+    }
+    default:
+        return false;
+    }
+}
+
+/* Check if AST contains any block with non-local return (return inside a block) */
+static bool has_block_return_nodes(pm_node_t *node) {
+    if (!node) return false;
+    switch (PM_NODE_TYPE(node)) {
+    case PM_PROGRAM_NODE: {
+        pm_program_node_t *p = (pm_program_node_t *)node;
+        return p->statements ? has_block_return_nodes((pm_node_t *)p->statements) : false;
+    }
+    case PM_STATEMENTS_NODE: {
+        pm_statements_node_t *s = (pm_statements_node_t *)node;
+        for (size_t i = 0; i < s->body.size; i++)
+            if (has_block_return_nodes(s->body.nodes[i])) return true;
+        return false;
+    }
+    case PM_CALL_NODE: {
+        pm_call_node_t *c = (pm_call_node_t *)node;
+        /* Check if this call has a block containing a return */
+        if (c->block && PM_NODE_TYPE(c->block) == PM_BLOCK_NODE) {
+            pm_block_node_t *b = (pm_block_node_t *)c->block;
+            if (b->body && block_has_return((pm_node_t *)b->body))
+                return true;
+        }
+        /* Recurse into receiver and arguments */
+        if (c->receiver && has_block_return_nodes(c->receiver)) return true;
+        if (c->arguments) {
+            for (size_t i = 0; i < c->arguments->arguments.size; i++)
+                if (has_block_return_nodes(c->arguments->arguments.nodes[i])) return true;
+        }
+        if (c->block && has_block_return_nodes(c->block)) return true;
+        return false;
+    }
+    case PM_BLOCK_NODE: {
+        pm_block_node_t *b = (pm_block_node_t *)node;
+        return b->body ? has_block_return_nodes((pm_node_t *)b->body) : false;
+    }
+    case PM_DEF_NODE: {
+        pm_def_node_t *d = (pm_def_node_t *)node;
+        return d->body ? has_block_return_nodes((pm_node_t *)d->body) : false;
+    }
+    case PM_IF_NODE: {
+        pm_if_node_t *n = (pm_if_node_t *)node;
+        if (n->statements && has_block_return_nodes((pm_node_t *)n->statements)) return true;
+        if (n->subsequent && has_block_return_nodes((pm_node_t *)n->subsequent)) return true;
+        return false;
+    }
+    case PM_ELSE_NODE: {
+        pm_else_node_t *n = (pm_else_node_t *)node;
+        return n->statements ? has_block_return_nodes((pm_node_t *)n->statements) : false;
+    }
+    case PM_WHILE_NODE: {
+        pm_while_node_t *n = (pm_while_node_t *)node;
+        return n->statements ? has_block_return_nodes((pm_node_t *)n->statements) : false;
+    }
+    case PM_CLASS_NODE: {
+        pm_class_node_t *cn = (pm_class_node_t *)node;
+        return cn->body ? has_block_return_nodes((pm_node_t *)cn->body) : false;
+    }
+    case PM_MODULE_NODE: {
+        pm_module_node_t *mn = (pm_module_node_t *)node;
+        return mn->body ? has_block_return_nodes((pm_node_t *)mn->body) : false;
+    }
+    case PM_LOCAL_VARIABLE_WRITE_NODE: {
+        pm_local_variable_write_node_t *n = (pm_local_variable_write_node_t *)node;
+        return has_block_return_nodes(n->value);
     }
     default:
         return false;
@@ -2338,6 +2447,9 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
     /* Detect exception handling mode */
     ctx->needs_exc = has_exception_nodes(ctx, root);
 
+    /* Detect non-local return from blocks (also needs setjmp/longjmp) */
+    if (!ctx->needs_exc) ctx->needs_exc = has_block_return_nodes(root);
+
     /* Detect string split usage */
     ctx->needs_str_split = has_split_calls(ctx, root);
 
@@ -2349,6 +2461,7 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
         pm_node_t *rroot = (pm_node_t *)ctx->required_files[ri].root;
         if (!rroot) continue;
         if (!ctx->needs_exc) ctx->needs_exc = has_exception_nodes(ctx, rroot);
+        if (!ctx->needs_exc) ctx->needs_exc = has_block_return_nodes(rroot);
         if (!ctx->needs_str_split) ctx->needs_str_split = has_split_calls(ctx, rroot);
         collect_regexp_patterns(ctx, rroot);
     }

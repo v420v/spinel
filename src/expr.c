@@ -3687,6 +3687,8 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                     return r;
                 }
 
+                bool _yield_has_nonlocal = false;
+                int _yield_blk_id = -1;
                 char *args = xstrdup("");
                 for (int i = 0; i < argc; i++) {
                     char *a = codegen_expr(ctx, call->arguments->arguments.nodes[i]);
@@ -3719,6 +3721,123 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                         /* Forward the block from the enclosing yield function */
                         char *na = sfmt("%s%s_block, _block_env", args, total > 0 ? ", " : "");
                         free(args); args = na;
+                    } else if (call->block && PM_NODE_TYPE(call->block) == PM_BLOCK_NODE) {
+                        /* Generate block callback for yield function call in expression context */
+                        pm_block_node_t *blk = (pm_block_node_t *)call->block;
+                        int blk_id = ctx->block_counter++;
+                        bool has_nonlocal_return = blk->body && block_has_return((pm_node_t *)blk->body);
+                        _yield_has_nonlocal = has_nonlocal_return;
+                        _yield_blk_id = blk_id;
+
+                        char *bpname = extract_block_param(ctx, blk);
+
+                        capture_list_t local_defs = {.count = 0};
+                        capture_list_t captures = {.count = 0};
+                        scan_captures(ctx, (pm_node_t *)blk->body,
+                                      bpname ? bpname : "", &local_defs, &captures);
+
+                        int saved_indent2 = ctx->indent;
+                        int saved_var_count2 = ctx->var_count;
+                        ctx->indent = 1;
+                        if (bpname)
+                            var_declare(ctx, bpname, vt_prim(SPINEL_TYPE_INTEGER), false);
+
+                        char *body_processed = NULL;
+                        {
+                            char *body_buf_data = NULL;
+                            size_t body_buf_size = 0;
+                            FILE *body_buf = open_memstream(&body_buf_data, &body_buf_size);
+                            FILE *saved_out2 = ctx->out;
+                            ctx->out = body_buf;
+
+                            bool saved_in_block_nonlocal = ctx->in_block_nonlocal;
+                            int saved_block_return_id = ctx->block_return_id;
+                            if (has_nonlocal_return) {
+                                ctx->in_block_nonlocal = true;
+                                ctx->block_return_id = blk_id;
+                            }
+
+                            if (blk->body) codegen_stmts(ctx, (pm_node_t *)blk->body);
+
+                            ctx->in_block_nonlocal = saved_in_block_nonlocal;
+                            ctx->block_return_id = saved_block_return_id;
+
+                            fclose(body_buf);
+                            ctx->out = saved_out2;
+
+                            if (body_buf_data) {
+                                body_processed = xstrdup(body_buf_data);
+                                for (int ci = 0; ci < captures.count; ci++) {
+                                    char *old_ref = sfmt("lv_%s", captures.names[ci]);
+                                    char *new_ref = sfmt("(*_e->%s)", captures.names[ci]);
+                                    while (1) {
+                                        char *pos = strstr(body_processed, old_ref);
+                                        if (!pos) break;
+                                        size_t prefix_len = pos - body_processed;
+                                        size_t old_len = strlen(old_ref);
+                                        size_t new_len = strlen(new_ref);
+                                        size_t rest_len = strlen(pos + old_len);
+                                        char *nr = malloc(prefix_len + new_len + rest_len + 1);
+                                        memcpy(nr, body_processed, prefix_len);
+                                        memcpy(nr + prefix_len, new_ref, new_len);
+                                        memcpy(nr + prefix_len + new_len, pos + old_len, rest_len + 1);
+                                        free(body_processed);
+                                        body_processed = nr;
+                                    }
+                                    free(old_ref); free(new_ref);
+                                }
+                                free(body_buf_data);
+                            }
+                        }
+                        ctx->indent = saved_indent2;
+                        ctx->var_count = saved_var_count2;
+
+                        if (ctx->block_out) {
+                            fprintf(ctx->block_out, "typedef struct { ");
+                            for (int ci = 0; ci < captures.count; ci++)
+                                fprintf(ctx->block_out, "mrb_int *%s; ", captures.names[ci]);
+                            if (has_nonlocal_return) {
+                                fprintf(ctx->block_out, "volatile mrb_int *_blk_ret_val; int _blk_ret_depth; ");
+                            }
+                            if (captures.count == 0 && !has_nonlocal_return) fprintf(ctx->block_out, "int _dummy; ");
+                            fprintf(ctx->block_out, "} _blk_%d_env;\n", blk_id);
+                            fprintf(ctx->block_out, "static mrb_int _blk_%d(void *_env, mrb_int _arg) {\n", blk_id);
+                            fprintf(ctx->block_out, "    _blk_%d_env *_e = (_blk_%d_env *)_env;\n", blk_id, blk_id);
+                            if (bpname) {
+                                char *cn = make_cname(bpname, false);
+                                fprintf(ctx->block_out, "    mrb_int %s = _arg;\n", cn);
+                                free(cn);
+                            }
+                            if (body_processed) fprintf(ctx->block_out, "%s", body_processed);
+                            fprintf(ctx->block_out, "    return 0;\n");
+                            fprintf(ctx->block_out, "}\n\n");
+                        }
+                        free(body_processed);
+
+                        if (has_nonlocal_return) {
+                            emit(ctx, "volatile mrb_int _blk_ret_val_%d = 0;\n", blk_id);
+                            emit(ctx, "sp_exc_depth++;\n");
+                            emit(ctx, "_blk_%d_env _env_%d = { ", blk_id, blk_id);
+                            for (int ci = 0; ci < captures.count; ci++) {
+                                char *cn = make_cname(captures.names[ci], false);
+                                emit_raw(ctx, "&%s, ", cn);
+                                free(cn);
+                            }
+                            emit_raw(ctx, "&_blk_ret_val_%d, sp_exc_depth - 1 };\n", blk_id);
+                        } else {
+                            emit(ctx, "_blk_%d_env _env_%d = { ", blk_id, blk_id);
+                            for (int ci = 0; ci < captures.count; ci++) {
+                                char *cn = make_cname(captures.names[ci], false);
+                                emit_raw(ctx, "%s&%s", ci > 0 ? ", " : "", cn);
+                                free(cn);
+                            }
+                            if (captures.count == 0) emit_raw(ctx, "0");
+                            emit_raw(ctx, " };\n");
+                        }
+
+                        char *na = sfmt("%s%s(sp_block_fn)_blk_%d, &_env_%d", args, total > 0 ? ", " : "", blk_id, blk_id);
+                        free(args); args = na;
+                        free(bpname);
                     } else {
                         /* No block or not in yield context → pass NULL */
                         char *na = sfmt("%s%sNULL, NULL", args, total > 0 ? ", " : "");
@@ -3854,6 +3973,25 @@ char *codegen_expr(codegen_ctx_t *ctx, pm_node_t *node) {
                         char *na = sfmt("%s%sNULL", args, total > 0 ? ", " : "");
                         free(args); args = na;
                     }
+                }
+                if (_yield_has_nonlocal) {
+                    /* Non-local return: wrap call with setjmp, use temp for result.
+                     * sp_exc_depth was already incremented before env init. */
+                    int tmp = ctx->temp_counter++;
+                    emit(ctx, "volatile mrb_int _nlr_%d = 0;\n", tmp);
+                    emit(ctx, "if (setjmp(sp_exc_stack[sp_exc_depth - 1]) == 0) {\n");
+                    ctx->indent++;
+                    emit(ctx, "_nlr_%d = sp_%s(%s);\n", tmp, fn->name, args);
+                    emit(ctx, "sp_exc_depth--;\n");
+                    ctx->indent--;
+                    emit(ctx, "} else {\n");
+                    ctx->indent++;
+                    emit(ctx, "sp_exc_depth--;\n");
+                    emit(ctx, "_nlr_%d = _blk_ret_val_%d;\n", tmp, _yield_blk_id);
+                    ctx->indent--;
+                    emit(ctx, "}\n");
+                    free(args); free(method);
+                    return sfmt("_nlr_%d", tmp);
                 }
                 char *r = sfmt("sp_%s(%s)", fn->name, args);
                 free(args); free(method);
