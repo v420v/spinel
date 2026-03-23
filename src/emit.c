@@ -285,7 +285,7 @@ void emit_method(codegen_ctx_t *ctx, class_info_t *cls, method_info_t *m) {
     }
 
     /* Determine return type C string */
-    char *ret_ct = vt_ctype(ctx, m->return_type, false);
+    char *ret_ct = vt_ctype(ctx, m->return_type, true);
     bool ret_void = (m->return_type.kind == SPINEL_TYPE_NIL);
 
     /* Function signature — sanitize operator method names for C identifiers */
@@ -297,7 +297,7 @@ void emit_method(codegen_ctx_t *ctx, class_info_t *cls, method_info_t *m) {
         /* Class method: no self parameter */
         for (int i = 0; i < m->param_count; i++) {
             if (i > 0) emit_raw(ctx, ", ");
-            char *pct = vt_ctype(ctx, m->params[i].type, false);
+            char *pct = vt_ctype(ctx, m->params[i].type, true);
             emit_raw(ctx, "%s lv_%s", pct, m->params[i].name);
             free(pct);
         }
@@ -479,13 +479,13 @@ void emit_method(codegen_ctx_t *ctx, class_info_t *cls, method_info_t *m) {
 void emit_top_func(codegen_ctx_t *ctx, func_info_t *f) {
     snprintf(ctx->current_func_name, sizeof(ctx->current_func_name), "%s", f->name);
     /* Determine return type */
-    char *ret_ct = vt_ctype(ctx, f->return_type, false);
+    char *ret_ct = vt_ctype(ctx, f->return_type, true);
     bool ret_void = (f->return_type.kind == SPINEL_TYPE_NIL);
 
     emit_raw(ctx, "static %s sp_%s(", ret_void ? "void" : ret_ct, f->name);
     for (int i = 0; i < f->param_count; i++) {
         if (i > 0) emit_raw(ctx, ", ");
-        char *pct = vt_ctype(ctx, f->params[i].type, false);
+        char *pct = vt_ctype(ctx, f->params[i].type, true);
         /* Use lv_ prefix to match how codegen references locals */
         if (f->params[i].is_array)
             emit_raw(ctx, "%s *lv_%s", pct, f->params[i].name);
@@ -816,7 +816,7 @@ void emit_module(codegen_ctx_t *ctx, module_info_t *mod) {
         method_info_t *m = &mod->methods[i];
         /* Skip mixin methods — they are emitted per-class via emit_method */
         if (!m->is_class_method) continue;
-        char *ret_ct = vt_ctype(ctx, m->return_type, false);
+        char *ret_ct = vt_ctype(ctx, m->return_type, true);
         emit_raw(ctx, "static %s sp_%s_%s(void) {\n", ret_ct, mod->name, m->name);
         free(ret_ct);
 

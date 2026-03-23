@@ -2868,12 +2868,12 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
     if (!ctx->lambda_mode) {
         for (int i = 0; i < ctx->func_count; i++) {
             func_info_t *f = &ctx->funcs[i];
-            char *ret_ct = vt_ctype(ctx, f->return_type, false);
+            char *ret_ct = vt_ctype(ctx, f->return_type, true);
             bool ret_void = (f->return_type.kind == SPINEL_TYPE_NIL);
             emit_raw(ctx, "static %s sp_%s(", ret_void ? "void" : ret_ct, f->name);
             for (int j = 0; j < f->param_count; j++) {
                 if (j > 0) emit_raw(ctx, ", ");
-                char *pct = vt_ctype(ctx, f->params[j].type, false);
+                char *pct = vt_ctype(ctx, f->params[j].type, true);
                 if (f->params[j].is_array)
                     emit_raw(ctx, "%s *", pct);
                 else
@@ -2903,14 +2903,14 @@ void codegen_program(codegen_ctx_t *ctx, pm_node_t *root) {
             if (strcmp(m->name, "initialize") == 0) continue;
             if (m->is_getter || m->is_setter) continue;
             const char *c_mname = sanitize_method(m->name);
-            char *ret_ct = vt_ctype(ctx, m->return_type, false);
+            char *ret_ct = vt_ctype(ctx, m->return_type, true);
             bool ret_void = (m->return_type.kind == SPINEL_TYPE_NIL);
             emit_raw(ctx, "static %s sp_%s_%s(",
                      ret_void ? "void" : ret_ct, cls->name, c_mname);
             if (m->is_class_method) {
                 for (int k = 0; k < m->param_count; k++) {
                     if (k > 0) emit_raw(ctx, ", ");
-                    char *pct = vt_ctype(ctx, m->params[k].type, false);
+                    char *pct = vt_ctype(ctx, m->params[k].type, true);
                     emit_raw(ctx, "%s", pct);
                     free(pct);
                 }

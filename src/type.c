@@ -1548,7 +1548,7 @@ void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root) {
                 char *ivname_full = cstr(ctx, iw->name);
                 const char *ivname = ivname_full + 1; /* skip @ */
                 ivar_info_t *iv = find_ivar(cls, ivname);
-                if (iv && iv->type.kind == SPINEL_TYPE_VALUE) {
+                if (iv && (iv->type.kind == SPINEL_TYPE_VALUE || iv->type.kind == SPINEL_TYPE_NIL)) {
                     vtype_t vt = infer_type(ctx, iw->value);
 
                     /* If assigned from a parameter, check if param type is known
@@ -1577,7 +1577,7 @@ void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root) {
              * Common Ruby convention: @grammar → Grammar, @context → Context, etc.
              * Also handles @rule_counter → Counter (try stripping underscored prefix). */
             for (int j = 0; j < cls->ivar_count; j++) {
-                if (cls->ivars[j].type.kind != SPINEL_TYPE_VALUE) continue;
+                if (cls->ivars[j].type.kind != SPINEL_TYPE_VALUE && cls->ivars[j].type.kind != SPINEL_TYPE_NIL) continue;
                 const char *ivn = cls->ivars[j].name;
                 /* Try capitalizing the ivar name: grammar → Grammar */
                 char capitalized[64];
@@ -1852,6 +1852,16 @@ void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root) {
                                                 vtype_t at = infer_type(ctx, call->arguments->arguments.nodes[pi]);
                                                 if (at.kind != SPINEL_TYPE_VALUE && at.kind != SPINEL_TYPE_UNKNOWN)
                                                     target->params[pi].type = at;
+                                            }
+                                        }
+                                        /* Setter calls: recv.ivar=(val) → update ivar type */
+                                        if (target->is_setter && target->accessor_ivar[0] &&
+                                            call->arguments->arguments.size == 1) {
+                                            ivar_info_t *iv = find_ivar(rcls, target->accessor_ivar);
+                                            if (iv && (iv->type.kind == SPINEL_TYPE_VALUE || iv->type.kind == SPINEL_TYPE_NIL)) {
+                                                vtype_t at = infer_type(ctx, call->arguments->arguments.nodes[0]);
+                                                if (at.kind != SPINEL_TYPE_VALUE && at.kind != SPINEL_TYPE_NIL && at.kind != SPINEL_TYPE_UNKNOWN)
+                                                    iv->type = at;
                                             }
                                         }
                                     }
@@ -2167,6 +2177,36 @@ void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root) {
                         }
                         free(cn2);
                     }
+                    /* Setter calls on typed receivers: recv.ivar=(val) → update ivar type */
+                    if (cc->receiver && cc->arguments && cc->arguments->arguments.size == 1) {
+                        int sv2 = ctx->var_count;
+                        for (int cp = 0; cp < caller->param_count; cp++)
+                            var_declare(ctx, caller->params[cp].name, caller->params[cp].type, false);
+                        infer_pass(ctx, caller->body_node);
+                        vtype_t recv_t = infer_type(ctx, cc->receiver);
+                        ctx->var_count = sv2;
+                        if (recv_t.kind == SPINEL_TYPE_OBJECT) {
+                            class_info_t *rcls = find_class(ctx, recv_t.klass);
+                            if (rcls) {
+                                char *smn = cstr(ctx, cc->name);
+                                method_info_t *sm = find_method(rcls, smn);
+                                if (sm && sm->is_setter && sm->accessor_ivar[0]) {
+                                    ivar_info_t *iv = find_ivar(rcls, sm->accessor_ivar);
+                                    if (iv && (iv->type.kind == SPINEL_TYPE_VALUE || iv->type.kind == SPINEL_TYPE_NIL)) {
+                                        int sv3 = ctx->var_count;
+                                        for (int cp = 0; cp < caller->param_count; cp++)
+                                            var_declare(ctx, caller->params[cp].name, caller->params[cp].type, false);
+                                        infer_pass(ctx, caller->body_node);
+                                        vtype_t at = infer_type(ctx, cc->arguments->arguments.nodes[0]);
+                                        ctx->var_count = sv3;
+                                        if (at.kind != SPINEL_TYPE_VALUE && at.kind != SPINEL_TYPE_NIL && at.kind != SPINEL_TYPE_UNKNOWN)
+                                            iv->type = at;
+                                    }
+                                }
+                                free(smn);
+                            }
+                        }
+                    }
                     /* Push receiver and arguments for further scanning */
                     if (cc->receiver && sp < 255) stack[sp++] = cc->receiver;
                     if (cc->arguments) {
@@ -2478,7 +2518,7 @@ void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root) {
                                                             if (init->params[pi].type.kind == SPINEL_TYPE_VALUE)
                                                                 init->params[pi].type = at;
                                                             ivar_info_t *iv = find_ivar(target_cls, init->params[pi].name);
-                                                            if (iv && iv->type.kind == SPINEL_TYPE_VALUE) iv->type = at;
+                                                            if (iv && (iv->type.kind == SPINEL_TYPE_VALUE || iv->type.kind == SPINEL_TYPE_NIL)) iv->type = at;
                                                         }
                                                         break;
                                                     }
@@ -2514,6 +2554,16 @@ void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root) {
                                                 vtype_t at = infer_type(ctx, call->arguments->arguments.nodes[pi]);
                                                 if (at.kind != SPINEL_TYPE_VALUE && at.kind != SPINEL_TYPE_UNKNOWN)
                                                     target->params[pi].type = at;
+                                            }
+                                        }
+                                        /* Setter calls: recv.ivar=(val) → update ivar type from arg */
+                                        if (target->is_setter && target->accessor_ivar[0] &&
+                                            call->arguments->arguments.size == 1) {
+                                            ivar_info_t *iv = find_ivar(rcls, target->accessor_ivar);
+                                            if (iv && (iv->type.kind == SPINEL_TYPE_VALUE || iv->type.kind == SPINEL_TYPE_NIL)) {
+                                                vtype_t at = infer_type(ctx, call->arguments->arguments.nodes[0]);
+                                                if (at.kind != SPINEL_TYPE_VALUE && at.kind != SPINEL_TYPE_NIL && at.kind != SPINEL_TYPE_UNKNOWN)
+                                                    iv->type = at;
                                             }
                                         }
                                     }
@@ -2579,6 +2629,20 @@ void resolve_class_types(codegen_ctx_t *ctx, pm_node_t *prog_root) {
                     if (PM_NODE_TYPE(cur) == PM_LOCAL_VARIABLE_OPERATOR_WRITE_NODE) {
                         pm_local_variable_operator_write_node_t *ow = (pm_local_variable_operator_write_node_t *)cur;
                         if (msp < 510) mstack[msp++] = ow->value;
+                    }
+                    /* Scan for @ivar = expr in method bodies to resolve NIL-initialized ivars */
+                    if (PM_NODE_TYPE(cur) == PM_INSTANCE_VARIABLE_WRITE_NODE) {
+                        pm_instance_variable_write_node_t *iw = (pm_instance_variable_write_node_t *)cur;
+                        char *ivname_full = cstr(ctx, iw->name);
+                        const char *ivname = ivname_full + 1; /* skip @ */
+                        ivar_info_t *iv = find_ivar(cls2, ivname);
+                        if (iv && (iv->type.kind == SPINEL_TYPE_VALUE || iv->type.kind == SPINEL_TYPE_NIL)) {
+                            vtype_t vt = infer_type(ctx, iw->value);
+                            if (vt.kind != SPINEL_TYPE_VALUE && vt.kind != SPINEL_TYPE_NIL && vt.kind != SPINEL_TYPE_UNKNOWN)
+                                iv->type = vt;
+                        }
+                        free(ivname_full);
+                        if (iw->value && msp < 510) mstack[msp++] = iw->value;
                     }
                 }
 
