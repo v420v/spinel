@@ -7158,14 +7158,18 @@ class Compiler
     end
     if has_gc_locals == 1
       if @needs_gc == 1
-        j = 0
-        while j < lnames.length
-          if type_is_pointer(ltypes[j]) == 1
-            emit("  SP_GC_ROOT(lv_" + lnames[j] + ");")
-          end
-          j = j + 1
-        end
+        emit_gc_roots(lnames, ltypes)
       end
+    end
+  end
+
+  def emit_gc_roots(lnames, ltypes)
+    j = 0
+    while j < lnames.length
+      if type_is_pointer(ltypes[j]) == 1
+        emit("  SP_GC_ROOT(lv_" + lnames[j] + ");")
+      end
+      j = j + 1
     end
   end
 
