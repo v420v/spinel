@@ -1372,6 +1372,9 @@ class Compiler
         if rt == "str_str_hash"
           return "string"
         end
+        if rt == "argv"
+          return "string"
+        end
       end
       return "int"
     end
@@ -3037,7 +3040,7 @@ class Compiler
                     all_params = @cls_meth_params[init_ci].split("|")
                     if init_idx < all_ptypes.length
                       ptypes = all_ptypes[init_idx].split(",")
-                      pnames = []
+                      pnames = "".split(",")
                       if init_idx < all_params.length
                         pnames = all_params[init_idx].split(",")
                       end
@@ -3200,8 +3203,9 @@ class Compiler
             # Synthetic struct - update ivar types from init param types
             all_params = @cls_meth_params[i].split("|")
             all_ptypes = @cls_meth_ptypes[i].split("|")
-            pnames = []
-            ptypes = []
+            pnames = "".split(",")
+            ptypes = "".split(",")
+
             if init_idx2 < all_params.length
               pnames = all_params[init_idx2].split(",")
             end
@@ -3232,8 +3236,9 @@ class Compiler
         init_idx = mi
         all_params = @cls_meth_params[i].split("|")
         all_ptypes = @cls_meth_ptypes[i].split("|")
-        pnames = []
-        ptypes = []
+        pnames = "".split(",")
+        ptypes = "".split(",")
+
         if init_idx < all_params.length
           pnames = all_params[init_idx].split(",")
         end
@@ -3307,8 +3312,9 @@ class Compiler
         j = 0
         while j < mnames.length
           if mnames[j] != "initialize"
-            pnames = []
-            ptypes = []
+            pnames = "".split(",")
+            ptypes = "".split(",")
+
             if j < all_params.length
               pnames = all_params[j].split(",")
             end
@@ -3455,8 +3461,9 @@ class Compiler
         j = j + 1
       end
       if @meth_body_ids[i] >= 0
-        ml = []
-        mt = []
+        ml = "".split(",")
+        mt = "".split(",")
+
         scan_locals(@meth_body_ids[i], ml, mt, pnames)
         lk = 0
         while lk < ml.length
@@ -3615,8 +3622,9 @@ class Compiler
       j = 0
       while j < mnames.length
         push_scope
-        pnames = []
-        ptypes = []
+        pnames = "".split(",")
+        ptypes = "".split(",")
+
         if j < all_params.length
           pnames = all_params[j].split(",")
         end
@@ -3656,6 +3664,28 @@ class Compiler
         bid = -1
         if j < bodies.length
           bid = bodies[j].to_i
+        end
+        # Declare locals for better return type inference
+        if bid >= 0
+          rlnames = "".split(",")
+          rltypes = "".split(",")
+          scan_locals_first_type(bid, rlnames, rltypes, pnames)
+          rlk = 0
+          while rlk < rlnames.length
+            declare_var(rlnames[rlk], rltypes[rlk])
+            rlk = rlk + 1
+          end
+          # Second pass with locals in scope
+          rlnames2 = "".split(",")
+          rltypes2 = "".split(",")
+          scan_locals_first_type(bid, rlnames2, rltypes2, pnames)
+          rlk2 = 0
+          while rlk2 < rlnames2.length
+            if rltypes2[rlk2] != "int"
+              set_var_type(rlnames2[rlk2], rltypes2[rlk2])
+            end
+            rlk2 = rlk2 + 1
+          end
         end
         rt = "int"
         if mnames[j] == "initialize"
@@ -4456,10 +4486,268 @@ class Compiler
     end
   end
 
+  def scan_locals_first_type(nid, names, types, params)
+    # Like scan_locals but never marks poly - just keeps first type seen
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "LocalVariableWriteNode"
+      lname = @nd_name[nid]
+      if not_in(lname, names) == 1
+        if not_in(lname, params) == 1
+          names.push(lname)
+          types.push(infer_type(@nd_expression[nid]))
+        end
+      end
+    end
+    if @nd_type[nid] == "LocalVariableOperatorWriteNode"
+      lname = @nd_name[nid]
+      if not_in(lname, names) == 1
+        if not_in(lname, params) == 1
+          names.push(lname)
+          types.push("int")
+        end
+      end
+    end
+    if @nd_type[nid] == "MultiWriteNode"
+      targets = parse_id_list(@nd_targets[nid])
+      k = 0
+      while k < targets.length
+        tid = targets[k]
+        if @nd_type[tid] == "LocalVariableTargetNode"
+          lname = @nd_name[tid]
+          if not_in(lname, names) == 1
+            if not_in(lname, params) == 1
+              names.push(lname)
+              types.push("int")
+            end
+          end
+        end
+        k = k + 1
+      end
+    end
+    # Recurse
+    if @nd_body[nid] >= 0
+      scan_locals_first_type(@nd_body[nid], names, types, params)
+    end
+    stmts = parse_id_list(@nd_stmts[nid])
+    k = 0
+    while k < stmts.length
+      scan_locals_first_type(stmts[k], names, types, params)
+      k = k + 1
+    end
+    if @nd_expression[nid] >= 0
+      scan_locals_first_type(@nd_expression[nid], names, types, params)
+    end
+    if @nd_predicate[nid] >= 0
+      scan_locals_first_type(@nd_predicate[nid], names, types, params)
+    end
+    if @nd_subsequent[nid] >= 0
+      scan_locals_first_type(@nd_subsequent[nid], names, types, params)
+    end
+    if @nd_else_clause[nid] >= 0
+      scan_locals_first_type(@nd_else_clause[nid], names, types, params)
+    end
+    if @nd_receiver[nid] >= 0
+      scan_locals_first_type(@nd_receiver[nid], names, types, params)
+    end
+    if @nd_arguments[nid] >= 0
+      scan_locals_first_type(@nd_arguments[nid], names, types, params)
+    end
+    args = parse_id_list(@nd_args[nid])
+    k = 0
+    while k < args.length
+      scan_locals_first_type(args[k], names, types, params)
+      k = k + 1
+    end
+    conds = parse_id_list(@nd_conditions[nid])
+    k = 0
+    while k < conds.length
+      scan_locals_first_type(conds[k], names, types, params)
+      k = k + 1
+    end
+    if @nd_left[nid] >= 0
+      scan_locals_first_type(@nd_left[nid], names, types, params)
+    end
+    if @nd_right[nid] >= 0
+      scan_locals_first_type(@nd_right[nid], names, types, params)
+    end
+    if @nd_block[nid] >= 0
+      scan_locals_first_type(@nd_block[nid], names, types, params)
+    end
+  end
+
+  def infer_class_body_call_types
+    # Scan class method bodies for calls to other methods in the same class.
+    # Update called method param types from argument types at call sites.
+    # Run multiple passes for propagation.
+    pass = 0
+    while pass < 3
+      ci = 0
+      while ci < @cls_names.length
+        mnames = @cls_meth_names[ci].split(";")
+        all_params = @cls_meth_params[ci].split("|")
+        all_ptypes = @cls_meth_ptypes[ci].split("|")
+        bodies = @cls_meth_bodies[ci].split(";")
+        mi = 0
+        while mi < mnames.length
+          bid = -1
+          if mi < bodies.length
+            bid = bodies[mi].to_i
+          end
+          if bid >= 0
+            @current_class_idx = ci
+            push_scope
+            # Declare params in scope with current types
+            pnames_arr = "".split(",")
+            if mi < all_params.length
+              pnames_arr = all_params[mi].split(",")
+            end
+            ptypes_arr = "".split(",")
+            if mi < all_ptypes.length
+              ptypes_arr = all_ptypes[mi].split(",")
+            end
+            pk = 0
+            while pk < pnames_arr.length
+              pt = "int"
+              if pk < ptypes_arr.length
+                pt = ptypes_arr[pk]
+              end
+              if pnames_arr[pk] != ""
+                declare_var(pnames_arr[pk], pt)
+              end
+              pk = pk + 1
+            end
+            # Scan locals using first-type-only (no poly marking)
+            lnames = "".split(",")
+            ltypes = "".split(",")
+            scan_locals_first_type(bid, lnames, ltypes, pnames_arr)
+            lk = 0
+            while lk < lnames.length
+              declare_var(lnames[lk], ltypes[lk])
+              lk = lk + 1
+            end
+            # Second pass: rescan with locals now in scope for better inference
+            lnames2 = "".split(",")
+            ltypes2 = "".split(",")
+            scan_locals_first_type(bid, lnames2, ltypes2, pnames_arr)
+            lk2 = 0
+            while lk2 < lnames2.length
+              if ltypes2[lk2] != "int"
+                set_var_type(lnames2[lk2], ltypes2[lk2])
+              end
+              lk2 = lk2 + 1
+            end
+            # Scan for calls to other methods in same class
+            scan_cls_method_calls(ci, bid)
+            pop_scope
+            @current_class_idx = -1
+          end
+          mi = mi + 1
+        end
+        ci = ci + 1
+      end
+      pass = pass + 1
+    end
+  end
+
+  def scan_cls_method_calls(ci, nid)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "CallNode"
+      mname = @nd_name[nid]
+      # Handle implicit self calls (no receiver) to same-class methods
+      if @nd_receiver[nid] < 0
+        midx = cls_find_method_direct(ci, mname)
+        if midx >= 0
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            arg_ids = get_args(args_id)
+            all_ptypes = @cls_meth_ptypes[ci].split("|")
+            if midx < all_ptypes.length
+              ptypes = all_ptypes[midx].split(",")
+              kk = 0
+              while kk < arg_ids.length
+                at = infer_type(arg_ids[kk])
+                if kk < ptypes.length
+                  if ptypes[kk] == "int"
+                    if at != "int"
+                      ptypes[kk] = at
+                    end
+                  end
+                end
+                kk = kk + 1
+              end
+              all_ptypes[midx] = join_sep(ptypes, ",")
+              @cls_meth_ptypes[ci] = join_sep(all_ptypes, "|")
+            end
+          end
+        end
+      end
+    end
+    # Recurse into children
+    if @nd_body[nid] >= 0
+      scan_cls_method_calls(ci, @nd_body[nid])
+    end
+    stmts = parse_id_list(@nd_stmts[nid])
+    k = 0
+    while k < stmts.length
+      scan_cls_method_calls(ci, stmts[k])
+      k = k + 1
+    end
+    if @nd_receiver[nid] >= 0
+      scan_cls_method_calls(ci, @nd_receiver[nid])
+    end
+    if @nd_arguments[nid] >= 0
+      scan_cls_method_calls(ci, @nd_arguments[nid])
+    end
+    args = parse_id_list(@nd_args[nid])
+    k = 0
+    while k < args.length
+      scan_cls_method_calls(ci, args[k])
+      k = k + 1
+    end
+    if @nd_expression[nid] >= 0
+      scan_cls_method_calls(ci, @nd_expression[nid])
+    end
+    if @nd_predicate[nid] >= 0
+      scan_cls_method_calls(ci, @nd_predicate[nid])
+    end
+    if @nd_subsequent[nid] >= 0
+      scan_cls_method_calls(ci, @nd_subsequent[nid])
+    end
+    if @nd_else_clause[nid] >= 0
+      scan_cls_method_calls(ci, @nd_else_clause[nid])
+    end
+    if @nd_left[nid] >= 0
+      scan_cls_method_calls(ci, @nd_left[nid])
+    end
+    if @nd_right[nid] >= 0
+      scan_cls_method_calls(ci, @nd_right[nid])
+    end
+    if @nd_block[nid] >= 0
+      scan_cls_method_calls(ci, @nd_block[nid])
+    end
+    elems = parse_id_list(@nd_elements[nid])
+    k = 0
+    while k < elems.length
+      scan_cls_method_calls(ci, elems[k])
+      k = k + 1
+    end
+    conds = parse_id_list(@nd_conditions[nid])
+    k = 0
+    while k < conds.length
+      scan_cls_method_calls(ci, conds[k])
+      k = k + 1
+    end
+  end
+
   def compile
     collect_all
     infer_main_call_types
     infer_function_body_call_types
+    infer_class_body_call_types
     detect_poly_params
     detect_poly_locals
     # Re-infer return types after main call type fixes
@@ -4589,8 +4877,8 @@ class Compiler
 
   def emit_gc_runtime
     emit_raw("typedef struct sp_gc_hdr { struct sp_gc_hdr *next; void (*finalize)(void *); void (*scan)(void *); unsigned marked : 1; } sp_gc_hdr;")
-    emit_raw("static sp_gc_hdr *sp_gc_heap = NULL; static size_t sp_gc_bytes = 0; static size_t sp_gc_threshold = 256*1024;")
-    emit_raw("#define SP_GC_STACK_MAX 8192")
+    emit_raw("static sp_gc_hdr *sp_gc_heap = NULL; static size_t sp_gc_bytes = 0; static size_t sp_gc_threshold = 4*1024*1024;")
+    emit_raw("#define SP_GC_STACK_MAX 65536")
     emit_raw("static void **sp_gc_roots[SP_GC_STACK_MAX]; static int sp_gc_nroots = 0;")
     emit_raw("#define SP_GC_SAVE() int _gc_saved = sp_gc_nroots")
     emit_raw("#define SP_GC_ROOT(v) do{if(sp_gc_nroots<SP_GC_STACK_MAX)sp_gc_roots[sp_gc_nroots++]=(void**)&(v);}while(0)")
@@ -4680,7 +4968,7 @@ class Compiler
     emit_raw("static mrb_bool sp_str_include(const char*s,const char*sub){return strstr(s,sub)!=NULL;}")
     emit_raw("static mrb_bool sp_str_start_with(const char*s,const char*p){return strncmp(s,p,strlen(p))==0;}")
     emit_raw("static mrb_bool sp_str_end_with(const char*s,const char*suf){size_t ls=strlen(s),lsuf=strlen(suf);if(lsuf>ls)return FALSE;return strcmp(s+ls-lsuf,suf)==0;}")
-    emit_raw("static sp_StrArray*sp_str_split(const char*s,const char*sep){sp_StrArray*a=sp_StrArray_new();size_t sl=strlen(sep);if(sl==0){for(size_t i=0;s[i];i++){char*c=(char*)malloc(2);c[0]=s[i];c[1]=0;sp_StrArray_push(a,c);}return a;}const char*p=s;while(1){const char*f=strstr(p,sep);if(!f){char*r=(char*)malloc(strlen(p)+1);strcpy(r,p);sp_StrArray_push(a,r);break;}size_t n=f-p;char*r=(char*)malloc(n+1);memcpy(r,p,n);r[n]=0;sp_StrArray_push(a,r);p=f+sl;}return a;}")
+    emit_raw("static sp_StrArray*sp_str_split(const char*s,const char*sep){sp_StrArray*a=sp_StrArray_new();if(*s==0)return a;size_t sl=strlen(sep);if(sl==0){for(size_t i=0;s[i];i++){char*c=(char*)malloc(2);c[0]=s[i];c[1]=0;sp_StrArray_push(a,c);}return a;}const char*p=s;while(1){const char*f=strstr(p,sep);if(!f){char*r=(char*)malloc(strlen(p)+1);strcpy(r,p);sp_StrArray_push(a,r);break;}size_t n=f-p;char*r=(char*)malloc(n+1);memcpy(r,p,n);r[n]=0;sp_StrArray_push(a,r);p=f+sl;}return a;}")
     emit_raw("static const char*sp_str_gsub(const char*s,const char*pat,const char*rep){size_t pl=strlen(pat),rl=strlen(rep),sl=strlen(s);if(pl==0)return s;size_t cap=sl*2+1;char*out=(char*)malloc(cap);size_t ol=0;const char*p=s;while(*p){const char*f=strstr(p,pat);if(!f){size_t n=strlen(p);if(ol+n>=cap){cap=(ol+n)*2+1;out=(char*)realloc(out,cap);}memcpy(out+ol,p,n);ol+=n;break;}size_t n=f-p;if(ol+n+rl>=cap){cap=(ol+n+rl)*2+1;out=(char*)realloc(out,cap);}memcpy(out+ol,p,n);ol+=n;memcpy(out+ol,rep,rl);ol+=rl;p=f+pl;}out[ol]=0;return out;}")
     emit_raw("static mrb_int sp_str_index(const char*s,const char*sub){const char*f=strstr(s,sub);if(!f)return -1;return(mrb_int)(f-s);}")
     emit_raw("static const char*sp_str_sub_range(const char*s,mrb_int start,mrb_int len){mrb_int sl=(mrb_int)strlen(s);if(start<0)start+=sl;if(start<0)start=0;if(start>=sl)return\"\";if(len<0)len=0;if(start+len>sl)len=sl-start;char*r=(char*)malloc(len+1);memcpy(r,s+start,len);r[len]=0;return r;}")
@@ -5099,8 +5387,9 @@ class Compiler
     init_idx = cls_find_method_direct(init_ci, "initialize")
     all_params = @cls_meth_params[init_ci].split("|")
     all_ptypes = @cls_meth_ptypes[init_ci].split("|")
-    pnames = []
-    ptypes = []
+    pnames = "".split(",")
+    ptypes = "".split(",")
+
     if init_idx < all_params.length
       pnames = all_params[init_idx].split(",")
     end
@@ -5137,8 +5426,9 @@ class Compiler
     end
     all_params = @cls_meth_params[init_ci].split("|")
     all_ptypes = @cls_meth_ptypes[init_ci].split("|")
-    pnames = []
-    ptypes = []
+    pnames = "".split(",")
+    ptypes = "".split(",")
+
     if init_idx < all_params.length
       pnames = all_params[init_idx].split(",")
     end
@@ -5159,8 +5449,9 @@ class Compiler
   end
 
   def method_with_self_params(midx, all_params, all_ptypes)
-    pnames = []
-    ptypes = []
+    pnames = "".split(",")
+    ptypes = "".split(",")
+
     if midx < all_params.length
       pnames = all_params[midx].split(",")
     end
@@ -5181,8 +5472,9 @@ class Compiler
   end
 
   def cls_method_params_decl(midx, all_params, all_ptypes)
-    pnames = []
-    ptypes = []
+    pnames = "".split(",")
+    ptypes = "".split(",")
+
     if midx < all_params.length
       pnames = all_params[midx].split(",")
     end
@@ -5229,8 +5521,8 @@ class Compiler
           if j < bodies.length
             bid = bodies[j].to_i
           end
-          pnames = []
-          ptypes = []
+          pnames = "".split(",")
+          ptypes = "".split(",")
           if j < all_params.length
             pnames = all_params[j].split(",")
           end
@@ -5257,8 +5549,9 @@ class Compiler
         if j < cm_bodies.length
           bid = cm_bodies[j].to_i
         end
-        pnames = []
-        ptypes = []
+        pnames = "".split(",")
+        ptypes = "".split(",")
+
         if j < cm_params.length
           pnames = cm_params[j].split(",")
         end
@@ -5295,7 +5588,7 @@ class Compiler
       if bid == -2
         # Synthetic struct constructor
         all_params = @cls_meth_params[ci].split("|")
-        pnames2 = []
+        pnames2 = "".split(",")
         if init_idx < all_params.length
           pnames2 = all_params[init_idx].split(",")
         end
@@ -5309,8 +5602,9 @@ class Compiler
         @current_class_idx = ci
         all_params = @cls_meth_params[ci].split("|")
         all_ptypes = @cls_meth_ptypes[ci].split("|")
-        pnames = []
-        ptypes = []
+        pnames = "".split(",")
+        ptypes = "".split(",")
+
         if init_idx < all_params.length
           pnames = all_params[init_idx].split(",")
         end
@@ -5370,7 +5664,7 @@ class Compiler
           # Build param forwarding: forward all constructor params to parent init
           pi_params = @cls_meth_params[init_ci].split("|")
           pi_idx = cls_find_method_direct(init_ci, "initialize")
-          pnames = []
+          pnames = "".split(",")
           if pi_idx >= 0
             if pi_idx < pi_params.length
               pnames = pi_params[pi_idx].split(",")
@@ -5407,8 +5701,9 @@ class Compiler
         @current_class_idx = ci
         all_params = @cls_meth_params[ci].split("|")
         all_ptypes = @cls_meth_ptypes[ci].split("|")
-        pnames = []
-        ptypes = []
+        pnames = "".split(",")
+        ptypes = "".split(",")
+
         if init_idx < all_params.length
           pnames = all_params[init_idx].split(",")
         end
@@ -5644,8 +5939,9 @@ class Compiler
   end
 
   def declare_method_locals(bid, params)
-    lnames = []
-    ltypes = []
+    lnames = "".split(",")
+    ltypes = "".split(",")
+
     scan_locals(bid, lnames, ltypes, params)
     # Declare all locals first so block param inference can see them
     j = 0
@@ -5654,8 +5950,9 @@ class Compiler
       j = j + 1
     end
     # Second pass: re-scan with types now in scope for better block param inference
-    lnames2 = []
-    ltypes2 = []
+    lnames2 = "".split(",")
+    ltypes2 = "".split(",")
+
     scan_locals(bid, lnames2, ltypes2, params)
     # Update types that may have improved
     j = 0
@@ -5674,11 +5971,35 @@ class Compiler
       end
       j = j + 1
     end
-    # Emit declarations
+    # Emit declarations and GC rooting for pointer locals
+    has_gc_locals = 0
+    j = 0
+    while j < lnames.length
+      if type_is_pointer(ltypes[j]) == 1
+        has_gc_locals = 1
+      end
+      j = j + 1
+    end
+    if has_gc_locals == 1
+      if @needs_gc == 1
+        emit("  SP_GC_SAVE();")
+      end
+    end
     j = 0
     while j < lnames.length
       emit("  " + c_type(ltypes[j]) + " lv_" + lnames[j] + " = " + c_default_val(ltypes[j]) + ";")
       j = j + 1
+    end
+    if has_gc_locals == 1
+      if @needs_gc == 1
+        j = 0
+        while j < lnames.length
+          if type_is_pointer(ltypes[j]) == 1
+            emit("  SP_GC_ROOT(lv_" + lnames[j] + ");")
+          end
+          j = j + 1
+        end
+      end
     end
   end
 
@@ -5723,8 +6044,15 @@ class Compiler
             if names[ki] == lname
               if types[ki] != at
                 if types[ki] != "poly"
-                  types[ki] = "poly"
-                  @needs_rb_value = 1
+                  # Don't mark poly if new type is fallback "int" and existing is richer
+                  if at != "int"
+                    if types[ki] == "int"
+                      types[ki] = at
+                    else
+                      types[ki] = "poly"
+                      @needs_rb_value = 1
+                    end
+                  end
                 end
               end
             end
@@ -5984,9 +6312,10 @@ class Compiler
     push_scope
 
     # Pre-declare main locals
-    lnames = []
-    ltypes = []
-    empty_params = []
+    lnames = "".split(",")
+    ltypes = "".split(",")
+
+    empty_params = "".split(",")
     i = 0
     while i < stmts.length
       sid = stmts[i]
@@ -6007,8 +6336,9 @@ class Compiler
       j = j + 1
     end
     # Second pass with vars in scope
-    lnames2 = []
-    ltypes2 = []
+    lnames2 = "".split(",")
+    ltypes2 = "".split(",")
+
     i = 0
     while i < stmts.length
       sid = stmts[i]
@@ -6437,7 +6767,7 @@ class Compiler
       return "\"\""
     end
     fmt = ""
-    arg_exprs = []
+    arg_exprs = "".split(",")
     i = 0
     while i < parts.length
       pid = parts[i]
@@ -8244,7 +8574,7 @@ class Compiler
       return compile_call_args(nid)
     end
     all_params = @cls_meth_params[init_ci].split("|")
-    pnames = []
+    pnames = "".split(",")
     if init_idx < all_params.length
       pnames = all_params[init_idx].split(",")
     end
