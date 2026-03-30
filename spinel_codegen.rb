@@ -1227,6 +1227,51 @@ class Compiler
       end
       return "int_array"
     end
+    if mname == "compact"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "int_array"
+    end
+    if mname == "flatten"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "int_array"
+    end
+    if mname == "sort_by"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "int_array"
+    end
+    if mname == "min_by"
+      return "int"
+    end
+    if mname == "max_by"
+      return "int"
+    end
+    if mname == "unshift"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "int_array"
+    end
+    if mname == "merge"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "str_int_hash"
+    end
+    if mname == "transform_values"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "str_int_hash"
+    end
+    if mname == "zip"
+      return "int_array"
+    end
     if mname == "reject"
       if recv >= 0
         return infer_type(recv)
@@ -3978,9 +4023,45 @@ class Compiler
     end
   end
 
+  def infer_function_body_call_types
+    # Scan each top-level method body for calls to other functions
+    # and infer param types from local variable types in those bodies
+    mi = 0
+    while mi < @meth_names.length
+      bid = @meth_body_ids[mi]
+      if bid >= 0
+        # Build local scope for this function
+        push_scope
+        pnames = @meth_param_names[mi].split(",")
+        ptypes = @meth_param_types[mi].split(",")
+        pk = 0
+        while pk < pnames.length
+          if pnames[pk] != ""
+            declare_var(pnames[pk], ptypes[pk])
+          end
+          pk = pk + 1
+        end
+        # Scan locals in the body
+        lnames = "".split(",")
+        ltypes = "".split(",")
+        scan_locals(bid, lnames, ltypes, pnames)
+        lk = 0
+        while lk < lnames.length
+          declare_var(lnames[lk], ltypes[lk])
+          lk = lk + 1
+        end
+        # Now scan for calls within this function body
+        scan_new_calls(bid)
+        pop_scope
+      end
+      mi = mi + 1
+    end
+  end
+
   def compile
     collect_all
     infer_main_call_types
+    infer_function_body_call_types
     detect_poly_params
     detect_poly_locals
     # Re-infer return types after main call type fixes
@@ -4137,6 +4218,7 @@ class Compiler
     emit_raw("static mrb_int sp_IntArray_sum(sp_IntArray*a){mrb_int s=0;for(mrb_int i=0;i<a->len;i++)s+=a->data[a->start+i];return s;}")
     emit_raw("static mrb_bool sp_IntArray_include(sp_IntArray*a,mrb_int v){for(mrb_int i=0;i<a->len;i++)if(a->data[a->start+i]==v)return TRUE;return FALSE;}")
     emit_raw("static sp_IntArray*sp_IntArray_uniq(sp_IntArray*a){sp_IntArray*b=sp_IntArray_new();for(mrb_int i=0;i<a->len;i++){int found=0;for(mrb_int j=0;j<b->len;j++){if(b->data[b->start+j]==a->data[a->start+i]){found=1;break;}}if(!found)sp_IntArray_push(b,a->data[a->start+i]);}return b;}")
+    emit_raw("static void sp_IntArray_unshift(sp_IntArray*a,mrb_int v){if(a->start>0){a->start--;a->data[a->start]=v;a->len++;}else{mrb_int e=a->len+1;if(e>a->cap){a->cap=a->cap*2+1;a->data=(mrb_int*)realloc(a->data,sizeof(mrb_int)*a->cap);}memmove(a->data+1,a->data,sizeof(mrb_int)*a->len);a->data[0]=v;a->len++;}}")
     emit_raw("static const char*sp_IntArray_join(sp_IntArray*a,const char*sep){size_t sl=strlen(sep),cap=256;char*buf=(char*)malloc(cap);size_t len=0;for(mrb_int i=0;i<a->len;i++){if(i>0){if(len+sl>=cap){cap*=2;buf=(char*)realloc(buf,cap);}memcpy(buf+len,sep,sl);len+=sl;}char tmp[32];int n=snprintf(tmp,32,\"%lld\",(long long)a->data[a->start+i]);if(len+n>=cap){cap*=2;buf=(char*)realloc(buf,cap);}memcpy(buf+len,tmp,n);len+=n;}buf[len]=0;return buf;}")
     emit_raw("")
   end
@@ -5140,10 +5222,30 @@ class Compiler
     end
     if @nd_type[nid] == "LocalVariableOperatorWriteNode"
       lname = @nd_name[nid]
+      rhs_type = infer_type(@nd_expression[nid])
+      vtype = "int"
+      if rhs_type == "float"
+        vtype = "float"
+      end
       if not_in(lname, names) == 1
         if not_in(lname, params) == 1
           names.push(lname)
-          types.push("int")
+          types.push(vtype)
+        end
+      else
+        if not_in(lname, params) == 1
+          # If RHS is float, promote to float
+          if rhs_type == "float"
+            ki = 0
+            while ki < names.length
+              if names[ki] == lname
+                if types[ki] == "int"
+                  types[ki] = "float"
+                end
+              end
+              ki = ki + 1
+            end
+          end
         end
       end
     end
@@ -5647,6 +5749,102 @@ class Compiler
       end
       return "0"
     end
+    if t == "CaseNode"
+      # Case as expression: use a temp var and compile each branch as assignment
+      rt = infer_type(nid)
+      tmp = new_temp
+      emit("  " + c_type(rt) + " " + tmp + " = " + c_default_val(rt) + ";")
+      pred = @nd_predicate[nid]
+      if pred >= 0
+        pred_type = infer_type(pred)
+        pred_val = compile_expr(pred)
+        ptmp = new_temp
+        if pred_type == "string"
+          emit("  const char *" + ptmp + " = " + pred_val + ";")
+        else
+          emit("  mrb_int " + ptmp + " = " + pred_val + ";")
+        end
+        conds = parse_id_list(@nd_conditions[nid])
+        k = 0
+        while k < conds.length
+          wid = conds[k]
+          if @nd_type[wid] == "WhenNode"
+            kw = "if"
+            if k > 0
+              kw = "} else if"
+            end
+            cond_str = compile_when_conds(wid, ptmp, pred_type)
+            emit("  " + kw + " (" + cond_str + ") {")
+            wbody = @nd_body[wid]
+            if wbody >= 0
+              ws = get_stmts(wbody)
+              if ws.length > 0
+                i = 0
+                while i < ws.length - 1
+                  compile_stmt(ws[i])
+                  i = i + 1
+                end
+                emit("    " + tmp + " = " + compile_expr(ws[ws.length - 1]) + ";")
+              end
+            end
+          end
+          k = k + 1
+        end
+      else
+        # Bare case (no predicate)
+        conds = parse_id_list(@nd_conditions[nid])
+        k = 0
+        while k < conds.length
+          wid = conds[k]
+          if @nd_type[wid] == "WhenNode"
+            kw = "if"
+            if k > 0
+              kw = "} else if"
+            end
+            wconds = parse_id_list(@nd_conditions[wid])
+            cexpr = "0"
+            if wconds.length > 0
+              cexpr = compile_expr(wconds[0])
+            end
+            emit("  " + kw + " (" + cexpr + ") {")
+            wbody = @nd_body[wid]
+            if wbody >= 0
+              ws = get_stmts(wbody)
+              if ws.length > 0
+                i = 0
+                while i < ws.length - 1
+                  compile_stmt(ws[i])
+                  i = i + 1
+                end
+                emit("    " + tmp + " = " + compile_expr(ws[ws.length - 1]) + ";")
+              end
+            end
+          end
+          k = k + 1
+        end
+      end
+      ec = @nd_else_clause[nid]
+      if ec >= 0
+        emit("  } else {")
+        ebody = @nd_body[ec]
+        if ebody >= 0
+          es = get_stmts(ebody)
+          if es.length > 0
+            i = 0
+            while i < es.length - 1
+              compile_stmt(es[i])
+              i = i + 1
+            end
+            emit("    " + tmp + " = " + compile_expr(es[es.length - 1]) + ";")
+          end
+        end
+      end
+      conds2 = parse_id_list(@nd_conditions[nid])
+      if conds2.length > 0
+        emit("  }")
+      end
+      return tmp
+    end
     "0"
   end
 
@@ -6053,6 +6251,13 @@ class Compiler
     if mname == "~"
       return "(~" + compile_expr(recv) + ")"
     end
+    if mname == "-@"
+      rt = infer_type(recv)
+      if rt == "float"
+        return "(-" + compile_expr(recv) + ")"
+      end
+      return "(-" + compile_expr(recv) + ")"
+    end
 
     # .new
     if mname == "new"
@@ -6061,11 +6266,38 @@ class Compiler
         if cname == "Array"
           @needs_int_array = 1
           @needs_gc = 1
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            aargs = get_args(args_id)
+            if aargs.length >= 2
+              # Array.new(n, val)
+              tmp = new_temp
+              emit("  sp_IntArray *" + tmp + " = sp_IntArray_new();")
+              emit("  { mrb_int _n = " + compile_expr(aargs[0]) + "; mrb_int _v = " + compile_expr(aargs[1]) + "; for (mrb_int _i = 0; _i < _n; _i++) sp_IntArray_push(" + tmp + ", _v); }")
+              return tmp
+            end
+          end
           return "sp_IntArray_new()"
         end
         if cname == "Hash"
           @needs_str_int_hash = 1
           @needs_gc = 1
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            aargs = get_args(args_id)
+            if aargs.length >= 1
+              # Hash.new(default_val) - check type
+              defval = compile_expr(aargs[0])
+              dt = infer_type(aargs[0])
+              if dt == "string"
+                @needs_str_str_hash = 1
+                return "sp_StrStrHash_new()"
+              end
+              # Default is int - for now just return normal hash
+              # Default value is handled by the get function
+              return "sp_StrIntHash_new()"
+            end
+          end
           return "sp_StrIntHash_new()"
         end
         ci = find_class_idx(cname)
@@ -6420,6 +6652,118 @@ class Compiler
       if mname == "reverse"
         return "({ sp_IntArray *_r = sp_IntArray_dup(" + rc + "); sp_IntArray_reverse_bang(_r); _r; })"
       end
+      if mname == "compact"
+        return "sp_IntArray_dup(" + rc + ")"
+      end
+      if mname == "flatten"
+        return "sp_IntArray_dup(" + rc + ")"
+      end
+      if mname == "unshift"
+        return "(sp_IntArray_unshift(" + rc + ", " + compile_arg0(nid) + "), 0)"
+      end
+      if mname == "dup"
+        return "sp_IntArray_dup(" + rc + ")"
+      end
+      if mname == "count"
+        if @nd_block[nid] >= 0
+          # count with block
+          blk = @nd_block[nid]
+          bp = get_block_param(nid, 0)
+          tmp = new_temp
+          itmp = new_temp
+          emit("  mrb_int " + tmp + " = 0;")
+          emit("  for (mrb_int " + itmp + " = 0; " + itmp + " < sp_IntArray_length(" + rc + "); " + itmp + "++) {")
+          emit("    mrb_int lv_" + bp + " = sp_IntArray_get(" + rc + ", " + itmp + ");")
+          bbody = @nd_body[blk]
+          bexpr = "0"
+          if bbody >= 0
+            bs = get_stmts(bbody)
+            if bs.length > 0
+              bexpr = compile_expr(bs[bs.length - 1])
+            end
+          end
+          emit("    if (" + bexpr + ") " + tmp + "++;")
+          emit("  }")
+          return tmp
+        end
+        return "sp_IntArray_length(" + rc + ")"
+      end
+      if mname == "min_by"
+        if @nd_block[nid] >= 0
+          blk = @nd_block[nid]
+          bp = get_block_param(nid, 0)
+          tmp = new_temp
+          itmp = new_temp
+          emit("  mrb_int " + tmp + " = sp_IntArray_get(" + rc + ", 0);")
+          emit("  { mrb_int _best = INT64_MAX;")
+          emit("  for (mrb_int " + itmp + " = 0; " + itmp + " < sp_IntArray_length(" + rc + "); " + itmp + "++) {")
+          emit("    mrb_int lv_" + bp + " = sp_IntArray_get(" + rc + ", " + itmp + ");")
+          bbody = @nd_body[blk]
+          bexpr = "0"
+          if bbody >= 0
+            bs = get_stmts(bbody)
+            if bs.length > 0
+              bexpr = compile_expr(bs[bs.length - 1])
+            end
+          end
+          emit("    mrb_int _v = " + bexpr + ";")
+          emit("    if (_v < _best) { _best = _v; " + tmp + " = lv_" + bp + "; }")
+          emit("  } }")
+          return tmp
+        end
+      end
+      if mname == "max_by"
+        if @nd_block[nid] >= 0
+          blk = @nd_block[nid]
+          bp = get_block_param(nid, 0)
+          tmp = new_temp
+          itmp = new_temp
+          emit("  mrb_int " + tmp + " = sp_IntArray_get(" + rc + ", 0);")
+          emit("  { mrb_int _best = INT64_MIN;")
+          emit("  for (mrb_int " + itmp + " = 0; " + itmp + " < sp_IntArray_length(" + rc + "); " + itmp + "++) {")
+          emit("    mrb_int lv_" + bp + " = sp_IntArray_get(" + rc + ", " + itmp + ");")
+          bbody = @nd_body[blk]
+          bexpr = "0"
+          if bbody >= 0
+            bs = get_stmts(bbody)
+            if bs.length > 0
+              bexpr = compile_expr(bs[bs.length - 1])
+            end
+          end
+          emit("    mrb_int _v = " + bexpr + ";")
+          emit("    if (_v > _best) { _best = _v; " + tmp + " = lv_" + bp + "; }")
+          emit("  } }")
+          return tmp
+        end
+      end
+      if mname == "sort_by"
+        if @nd_block[nid] >= 0
+          blk = @nd_block[nid]
+          bp = get_block_param(nid, 0)
+          tmp = new_temp
+          emit("  sp_IntArray *" + tmp + " = sp_IntArray_dup(" + rc + ");")
+          # Use bubble sort with block as key function
+          emit("  { mrb_int _n = " + tmp + "->len;")
+          emit("  for (mrb_int _i = 0; _i < _n - 1; _i++)")
+          emit("    for (mrb_int _j = 0; _j < _n - 1 - _i; _j++) {")
+          emit("      mrb_int lv_" + bp + " = " + tmp + "->data[" + tmp + "->start + _j];")
+          bbody = @nd_body[blk]
+          bexpr = "0"
+          if bbody >= 0
+            bs = get_stmts(bbody)
+            if bs.length > 0
+              bexpr = compile_expr(bs[bs.length - 1])
+            end
+          end
+          emit("      mrb_int _ka = " + bexpr + ";")
+          emit("      lv_" + bp + " = " + tmp + "->data[" + tmp + "->start + _j + 1];")
+          emit("      mrb_int _kb = " + bexpr + ";")
+          emit("      if (_ka > _kb) { mrb_int _t = " + tmp + "->data[" + tmp + "->start + _j]; " + tmp + "->data[" + tmp + "->start + _j] = " + tmp + "->data[" + tmp + "->start + _j + 1]; " + tmp + "->data[" + tmp + "->start + _j + 1] = _t; }")
+          emit("    }")
+          emit("  }")
+          return tmp
+        end
+      end
     end
     if recv_type == "str_array"
       if mname == "length"
@@ -6449,6 +6793,30 @@ class Compiler
       end
       if mname == "include?"
         return "sp_StrArray_include(" + rc + ", " + compile_arg0(nid) + ")"
+      end
+      if mname == "count"
+        if @nd_block[nid] >= 0
+          blk = @nd_block[nid]
+          bp = get_block_param(nid, 0)
+          declare_var(bp, "string")
+          tmp = new_temp
+          itmp = new_temp
+          emit("  mrb_int " + tmp + " = 0;")
+          emit("  for (mrb_int " + itmp + " = 0; " + itmp + " < sp_StrArray_length(" + rc + "); " + itmp + "++) {")
+          emit("    const char *lv_" + bp + " = sp_StrArray_get(" + rc + ", " + itmp + ");")
+          bbody = @nd_body[blk]
+          bexpr = "0"
+          if bbody >= 0
+            bs = get_stmts(bbody)
+            if bs.length > 0
+              bexpr = compile_expr(bs[bs.length - 1])
+            end
+          end
+          emit("    if (" + bexpr + ") " + tmp + "++;")
+          emit("  }")
+          return tmp
+        end
+        return "sp_StrArray_length(" + rc + ")"
       end
     end
 
@@ -7754,6 +8122,41 @@ class Compiler
           end
           if @nd_type[recv] == "InstanceVariableReadNode"
             emit("  self->" + sanitize_ivar(@nd_name[recv]) + " = sp_str_concat(self->" + sanitize_ivar(@nd_name[recv]) + ", " + val + ");")
+            return
+          end
+        end
+      end
+    end
+
+    # replace on string (mutating reassign)
+    if mname == "replace"
+      if recv >= 0
+        rt = infer_type(recv)
+        if rt == "string"
+          val = compile_arg0(nid)
+          if @nd_type[recv] == "LocalVariableReadNode"
+            emit("  lv_" + @nd_name[recv] + " = " + val + ";")
+            return
+          end
+          if @nd_type[recv] == "InstanceVariableReadNode"
+            emit("  self->" + sanitize_ivar(@nd_name[recv]) + " = " + val + ";")
+            return
+          end
+        end
+      end
+    end
+
+    # clear on string (set to empty)
+    if mname == "clear"
+      if recv >= 0
+        rt = infer_type(recv)
+        if rt == "string"
+          if @nd_type[recv] == "LocalVariableReadNode"
+            emit("  lv_" + @nd_name[recv] + " = \"\";")
+            return
+          end
+          if @nd_type[recv] == "InstanceVariableReadNode"
+            emit("  self->" + sanitize_ivar(@nd_name[recv]) + " = \"\";")
             return
           end
         end
