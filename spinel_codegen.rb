@@ -8945,9 +8945,9 @@ class Compiler
       if kw_found == 0
         if k < ptypes.length
           if ptypes[k] == "int_array"
-            # Only splat if there are more positional args than remaining params
+            # Only splat if there are more positional args than total params
             # (i.e., this is a rest/splat parameter, not a regular array param)
-            if positional_ids.length > (pnames.length - k)
+            if positional_ids.length > pnames.length
               @needs_int_array = 1
               @needs_gc = 1
               tmp = new_temp
