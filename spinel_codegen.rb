@@ -784,10 +784,15 @@ class Compiler
     end
     if t == "ConstantPathNode"
       if @nd_receiver[nid] >= 0
-        cpname = @nd_name[@nd_receiver[nid]] + "_" + @nd_name[nid]
+        rname = @nd_name[@nd_receiver[nid]]
+        nname = @nd_name[nid]
+        cpname = rname + "_" + nname
         ci = find_const_idx(cpname)
         if ci >= 0
           return @const_types[ci]
+        end
+        if rname == "Float"
+          return "float"
         end
       end
       return "int"
@@ -899,6 +904,9 @@ class Compiler
         if lt == "string"
           return "string"
         end
+        if lt == "poly"
+          return "poly"
+        end
         if lt == "float"
           return "float"
         end
@@ -922,6 +930,9 @@ class Compiler
         end
         if lt == "string"
           return "string"
+        end
+        if lt == "poly"
+          return "poly"
         end
       end
       return "int"
@@ -3126,6 +3137,22 @@ class Compiler
       if mname == "upcase"
         @needs_string_helpers = 1
       end
+      if mname == "<<"
+        if @nd_receiver[nid] >= 0
+          rt = infer_type(@nd_receiver[nid])
+          if rt == "string"
+            @needs_string_helpers = 1
+          end
+        end
+      end
+      if mname == "+"
+        if @nd_receiver[nid] >= 0
+          rt = infer_type(@nd_receiver[nid])
+          if rt == "string"
+            @needs_string_helpers = 1
+          end
+        end
+      end
       if mname == "downcase"
         @needs_string_helpers = 1
       end
@@ -3422,7 +3449,14 @@ class Compiler
                       ptypes[k] = at
                     else
                       if at == "int"
-                        # arg is int, param already has a type - keep it
+                        # Check if arg is a literal int (genuine int value)
+                        if k < arg_ids.length
+                          if @nd_type[arg_ids[k]] == "IntegerNode"
+                            ptypes[k] = "poly"
+                            @needs_rb_value = 1
+                          end
+                        end
+                        # otherwise arg is int variable, param already has a type - keep it
                       else
                         # Genuinely different types - mark poly
                         ptypes[k] = "poly"
@@ -3593,6 +3627,22 @@ class Compiler
       emit_string_helpers
     end
     if @needs_rb_value == 1
+      if @needs_string_helpers == 0
+        @needs_string_helpers = 1
+        if @needs_gc == 0
+          @needs_gc = 1
+          emit_gc_runtime
+        end
+        if @needs_int_array == 0
+          @needs_int_array = 1
+          emit_int_array_runtime
+        end
+        if @needs_str_array == 0
+          @needs_str_array = 1
+          emit_str_array_runtime
+        end
+        emit_string_helpers
+      end
       emit_rb_value_runtime
     end
     if @needs_setjmp == 1
@@ -3773,7 +3823,7 @@ class Compiler
     emit_raw("  switch (v.tag) {")
     emit_raw("    case SP_TAG_INT: printf(\"%lld\\n\", (long long)v.v.i); break;")
     emit_raw("    case SP_TAG_STR: if (v.v.s) { fputs(v.v.s, stdout); if (!*v.v.s || v.v.s[strlen(v.v.s)-1] != '\\n') putchar('\\n'); } else putchar('\\n'); break;")
-    emit_raw("    case SP_TAG_FLT: printf(\"%g\\n\", v.v.f); break;")
+    emit_raw("    case SP_TAG_FLT: { char _fb[64]; snprintf(_fb,64,\"%g\",v.v.f); if(!strchr(_fb,'.')&&!strchr(_fb,'e')&&!strchr(_fb,'i')&&!strchr(_fb,'n')){strcat(_fb,\".0\");} printf(\"%s\\n\",_fb); break; }")
     emit_raw("    case SP_TAG_BOOL: puts(v.v.b ? \"true\" : \"false\"); break;")
     emit_raw("    case SP_TAG_NIL: putchar('\\n'); break;")
     emit_raw("    default: printf(\"%lld\\n\", (long long)v.v.i); break;")
@@ -3781,6 +3831,10 @@ class Compiler
     emit_raw("}")
     emit_raw("static mrb_bool sp_poly_nil_p(sp_RbVal v) { return v.tag == SP_TAG_NIL; }")
     emit_raw("static const char *sp_poly_to_s(sp_RbVal v) { switch (v.tag) { case SP_TAG_INT: { char *b = (char*)malloc(32); snprintf(b, 32, \"%lld\", (long long)v.v.i); return b; } case SP_TAG_STR: return v.v.s ? v.v.s : \"\"; case SP_TAG_FLT: { char *b = (char*)malloc(64); snprintf(b, 64, \"%g\", v.v.f); return b; } case SP_TAG_BOOL: return v.v.b ? \"true\" : \"false\"; case SP_TAG_NIL: return \"\"; default: return \"\"; } }")
+    emit_raw("static sp_RbVal sp_poly_add(sp_RbVal a, sp_RbVal b) { if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return sp_box_int(a.v.i + b.v.i); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_FLT) return sp_box_float(a.v.f + b.v.f); if (a.tag == SP_TAG_INT && b.tag == SP_TAG_FLT) return sp_box_float((mrb_float)a.v.i + b.v.f); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_INT) return sp_box_float(a.v.f + (mrb_float)b.v.i); if (a.tag == SP_TAG_STR && b.tag == SP_TAG_STR) return sp_box_str(sp_str_concat(a.v.s, b.v.s)); return sp_box_int(0); }")
+    emit_raw("static sp_RbVal sp_poly_sub(sp_RbVal a, sp_RbVal b) { if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return sp_box_int(a.v.i - b.v.i); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_FLT) return sp_box_float(a.v.f - b.v.f); return sp_box_int(0); }")
+    emit_raw("static sp_RbVal sp_poly_mul(sp_RbVal a, sp_RbVal b) { if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return sp_box_int(a.v.i * b.v.i); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_FLT) return sp_box_float(a.v.f * b.v.f); if (a.tag == SP_TAG_INT && b.tag == SP_TAG_FLT) return sp_box_float((mrb_float)a.v.i * b.v.f); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_INT) return sp_box_float(a.v.f * (mrb_float)b.v.i); return sp_box_int(0); }")
+    emit_raw("static mrb_bool sp_poly_gt(sp_RbVal a, sp_RbVal b) { if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return a.v.i > b.v.i; if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_FLT) return a.v.f > b.v.f; return FALSE; }")
     emit_raw("")
   end
 
@@ -5007,10 +5061,26 @@ class Compiler
     end
     if t == "ConstantPathNode"
       if @nd_receiver[nid] >= 0
-        cpname = @nd_name[@nd_receiver[nid]] + "_" + @nd_name[nid]
+        rname = @nd_name[@nd_receiver[nid]]
+        nname = @nd_name[nid]
+        cpname = rname + "_" + nname
         ci = find_const_idx(cpname)
         if ci >= 0
           return "cst_" + cpname
+        end
+        # Built-in constants
+        if rname == "Float"
+          if nname == "INFINITY"
+            return "(1.0/0.0)"
+          end
+          if nname == "NAN"
+            return "(0.0/0.0)"
+          end
+        end
+        if rname == "Integer"
+          if nname == "MAX"
+            return "INT64_MAX"
+          end
         end
         return cpname
       end
@@ -5353,12 +5423,22 @@ class Compiler
         @needs_string_helpers = 1
         return "sp_str_concat(" + compile_expr(recv) + ", " + compile_arg0(nid) + ")"
       end
+      if lt == "poly"
+        @needs_rb_value = 1
+        @needs_string_helpers = 1
+        return "sp_poly_add(" + compile_expr(recv) + ", " + box_expr_to_poly(@nd_arguments[nid] >= 0 ? get_args(@nd_arguments[nid])[0] : -1) + ")"
+      end
       return "(" + compile_expr(recv) + " + " + compile_arg0(nid) + ")"
     end
     if mname == "-"
+      lt = infer_type(recv)
       args_id = @nd_arguments[nid]
       if args_id < 0
         return "(-" + compile_expr(recv) + ")"
+      end
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_sub(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(args_id)[0]) + ")"
       end
       return "(" + compile_expr(recv) + " - " + compile_arg0(nid) + ")"
     end
@@ -5368,8 +5448,9 @@ class Compiler
         @needs_string_helpers = 1
         return "sp_str_repeat(" + compile_expr(recv) + ", " + compile_arg0(nid) + ")"
       end
-      if lt == "float"
-        return "(" + compile_expr(recv) + " * " + compile_arg0(nid) + ")"
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_mul(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
       end
       return "(" + compile_expr(recv) + " * " + compile_arg0(nid) + ")"
     end
@@ -5391,6 +5472,11 @@ class Compiler
       return "(" + compile_expr(recv) + " < " + compile_arg0(nid) + ")"
     end
     if mname == ">"
+      lt = infer_type(recv)
+      if lt == "poly"
+        @needs_rb_value = 1
+        return "sp_poly_gt(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
+      end
       return "(" + compile_expr(recv) + " > " + compile_arg0(nid) + ")"
     end
     if mname == "<="
@@ -5896,6 +5982,9 @@ class Compiler
     if mname == "nil?"
       return "sp_poly_nil_p(" + rc + ")"
     end
+    if mname == "to_s"
+      return "sp_poly_to_s(" + rc + ")"
+    end
     # For object method calls, dispatch based on cls_id
     # Generate: switch on v.tag and cls_id
     tmp = new_temp
@@ -5966,6 +6055,9 @@ class Compiler
   def box_expr_to_poly(nid)
     at = infer_type(nid)
     val = compile_expr(nid)
+    if at == "poly"
+      return val
+    end
     if at == "int"
       return "sp_box_int(" + val + ")"
     end
@@ -6059,19 +6151,22 @@ class Compiler
       if kw_found == 0
         if k < ptypes.length
           if ptypes[k] == "int_array"
-            # This is a splat/rest param - collect remaining positional args into array
-            @needs_int_array = 1
-            @needs_gc = 1
-            tmp = new_temp
-            emit("  sp_IntArray *" + tmp + " = sp_IntArray_new();")
-            pi = 0
-            while pi < positional_ids.length
-              emit("  sp_IntArray_push(" + tmp + ", " + compile_expr(positional_ids[pi]) + ");")
-              pi = pi + 1
+            # Only splat if there are more positional args than remaining params
+            # (i.e., this is a rest/splat parameter, not a regular array param)
+            if positional_ids.length > (pnames.length - k)
+              @needs_int_array = 1
+              @needs_gc = 1
+              tmp = new_temp
+              emit("  sp_IntArray *" + tmp + " = sp_IntArray_new();")
+              pi = 0
+              while pi < positional_ids.length
+                emit("  sp_IntArray_push(" + tmp + ", " + compile_expr(positional_ids[pi]) + ");")
+                pi = pi + 1
+              end
+              result = result + tmp
+              k = k + 1
+              next
             end
-            result = result + tmp
-            k = k + 1
-            next
           end
         end
         if k < positional_ids.length
