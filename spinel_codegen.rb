@@ -129,6 +129,7 @@ class Compiler
     @needs_file_io = 0
     @needs_mutable_str = 0
     @needs_rb_value = 0
+    @needs_stringio = 0
     @needs_proc = 0
     @proc_counter = 0
     @proc_funcs = ""
@@ -901,7 +902,28 @@ class Compiler
     if elems.length > 0
       et = infer_type(elems[0])
       if et == "string"
-        return "str_array"
+        # Check if ALL elements are strings
+        all_str = 1
+        k = 1
+        while k < elems.length
+          if infer_type(elems[k]) != "string"
+            all_str = 0
+          end
+          k = k + 1
+        end
+        if all_str == 1
+          return "str_array"
+        end
+        return "poly_array"
+      end
+      # Check if elements have mixed types
+      k = 1
+      while k < elems.length
+        et2 = infer_type(elems[k])
+        if et2 != et
+          return "poly_array"
+        end
+        k = k + 1
       end
     end
     "int_array"
@@ -912,8 +934,26 @@ class Compiler
     if elems.length > 0
       eid = elems[0]
       if @nd_type[eid] == "AssocNode"
-        vt = infer_type(@nd_expression[eid])
-        if vt == "string"
+        first_vt = infer_type(@nd_expression[eid])
+        # Check if all values have the same type
+        all_same = 1
+        k = 1
+        while k < elems.length
+          eid2 = elems[k]
+          if @nd_type[eid2] == "AssocNode"
+            vt2 = infer_type(@nd_expression[eid2])
+            if vt2 != first_vt
+              all_same = 0
+            end
+          end
+          k = k + 1
+        end
+        if all_same == 1
+          if first_vt == "string"
+            return "str_str_hash"
+          end
+        else
+          # Mixed value types - store as str_str_hash with auto-conversion
           return "str_str_hash"
         end
       end
@@ -1354,6 +1394,9 @@ class Compiler
           if rn == "Proc"
             return "proc"
           end
+          if rn == "StringIO"
+            return "stringio"
+          end
           return "obj_" + rn
         end
       end
@@ -1385,6 +1428,24 @@ class Compiler
           if mname == "home"
             return "string"
           end
+        end
+      end
+    end
+    # StringIO methods
+    if recv >= 0
+      rt = infer_type(recv)
+      if rt == "stringio"
+        if mname == "string" || mname == "read" || mname == "gets" || mname == "getc"
+          return "string"
+        end
+        if mname == "pos" || mname == "tell" || mname == "size" || mname == "length" || mname == "write" || mname == "putc" || mname == "getbyte" || mname == "lineno"
+          return "int"
+        end
+        if mname == "eof?" || mname == "closed?" || mname == "sync" || mname == "isatty"
+          return "bool"
+        end
+        if mname == "flush"
+          return "stringio"
         end
       end
     end
@@ -1641,6 +1702,12 @@ class Compiler
     if t == "proc"
       return "sp_Proc"
     end
+    if t == "stringio"
+      return "sp_StringIO *"
+    end
+    if t == "poly_array"
+      return "sp_PolyArray *"
+    end
     if is_obj_type(t) == 1
       cname = t[4, t.length - 4]
       return "sp_" + cname + " *"
@@ -1672,6 +1739,9 @@ class Compiler
     end
     if t == "poly"
       return "sp_box_nil()"
+    end
+    if t == "stringio"
+      return "NULL"
     end
     if t == "proc"
       return "sp_proc_new(NULL)"
@@ -3845,7 +3915,11 @@ class Compiler
       if et == "str_array"
         @needs_str_array = 1
       else
-        @needs_int_array = 1
+        if et == "poly_array"
+          @needs_rb_value = 1
+        else
+          @needs_int_array = 1
+        end
       end
       @needs_gc = 1
     end
@@ -3972,6 +4046,9 @@ class Compiler
             end
             if rn == "Proc"
               @needs_proc = 1
+            end
+            if rn == "StringIO"
+              @needs_stringio = 1
             end
           end
         end
@@ -4458,6 +4535,9 @@ class Compiler
     if @needs_proc == 1
       emit_proc_runtime
     end
+    if @needs_stringio == 1
+      emit_stringio_runtime
+    end
     emit_class_structs
     emit_forward_decls
     emit_class_methods
@@ -4658,6 +4738,13 @@ class Compiler
     emit_raw("static sp_RbVal sp_poly_mul(sp_RbVal a, sp_RbVal b) { if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return sp_box_int(a.v.i * b.v.i); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_FLT) return sp_box_float(a.v.f * b.v.f); if (a.tag == SP_TAG_INT && b.tag == SP_TAG_FLT) return sp_box_float((mrb_float)a.v.i * b.v.f); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_INT) return sp_box_float(a.v.f * (mrb_float)b.v.i); return sp_box_int(0); }")
     emit_raw("static mrb_bool sp_poly_gt(sp_RbVal a, sp_RbVal b) { if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return a.v.i > b.v.i; if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_FLT) return a.v.f > b.v.f; return FALSE; }")
     emit_raw("")
+    emit_raw("/* PolyArray: array of sp_RbVal */")
+    emit_raw("typedef struct { sp_RbVal *data; mrb_int len; mrb_int cap; } sp_PolyArray;")
+    emit_raw("static sp_PolyArray *sp_PolyArray_new(void) { sp_PolyArray *a = (sp_PolyArray *)sp_gc_alloc(sizeof(sp_PolyArray), NULL, NULL); a->cap = 16; a->data = (sp_RbVal *)malloc(sizeof(sp_RbVal) * a->cap); a->len = 0; return a; }")
+    emit_raw("static void sp_PolyArray_push(sp_PolyArray *a, sp_RbVal v) { if (a->len >= a->cap) { a->cap = a->cap * 2 + 1; a->data = (sp_RbVal *)realloc(a->data, sizeof(sp_RbVal) * a->cap); } a->data[a->len++] = v; }")
+    emit_raw("static mrb_int sp_PolyArray_length(sp_PolyArray *a) { return a->len; }")
+    emit_raw("static sp_RbVal sp_PolyArray_get(sp_PolyArray *a, mrb_int i) { if (i < 0) i += a->len; return a->data[i]; }")
+    emit_raw("")
   end
 
   def emit_setjmp_runtime
@@ -4697,6 +4784,39 @@ class Compiler
     emit_raw("typedef struct { sp_proc_fn_t fn; } sp_Proc;")
     emit_raw("static sp_Proc sp_proc_new(sp_proc_fn_t fn) { sp_Proc p; p.fn = fn; return p; }")
     emit_raw("static mrb_int sp_proc_call(sp_Proc p, mrb_int arg) { return p.fn ? p.fn(arg) : 0; }")
+    emit_raw("")
+  end
+
+  def emit_stringio_runtime
+    emit_raw("/* ---- StringIO runtime ---- */")
+    emit_raw("typedef struct { char *buf; int64_t len; int64_t cap; int64_t pos; int64_t lineno; int closed; } sp_StringIO;")
+    emit_raw("static void sio_grow(sp_StringIO *sio, int64_t need) { int64_t req = sio->pos + need; if (req <= sio->cap) return; int64_t nc = sio->cap ? sio->cap : 64; while (nc < req) nc *= 2; sio->buf = (char *)realloc(sio->buf, nc + 1); sio->cap = nc; }")
+    emit_raw("static int64_t sio_write(sp_StringIO *sio, const char *d, int64_t dl) { sio_grow(sio, dl); if (sio->pos > sio->len) memset(sio->buf + sio->len, 0, sio->pos - sio->len); memcpy(sio->buf + sio->pos, d, dl); sio->pos += dl; if (sio->pos > sio->len) sio->len = sio->pos; sio->buf[sio->len] = '\\0'; return dl; }")
+    emit_raw("static sp_StringIO *sp_StringIO_new(void) { sp_StringIO *s = (sp_StringIO *)calloc(1, sizeof(sp_StringIO)); s->buf = (char *)calloc(1, 64); s->cap = 63; return s; }")
+    emit_raw("static sp_StringIO *sp_StringIO_new_s(const char *init) { sp_StringIO *s = (sp_StringIO *)calloc(1, sizeof(sp_StringIO)); int64_t l = (int64_t)strlen(init); int64_t c = l < 63 ? 63 : l; s->buf = (char *)malloc(c+1); memcpy(s->buf, init, l); s->buf[l]='\\0'; s->len = l; s->cap = c; return s; }")
+    emit_raw("static const char *sp_StringIO_string(sp_StringIO *s) { return s->buf ? s->buf : \"\"; }")
+    emit_raw("static int64_t sp_StringIO_pos(sp_StringIO *s) { return s->pos; }")
+    emit_raw("static int64_t sp_StringIO_size(sp_StringIO *s) { return s->len; }")
+    emit_raw("static int64_t sp_StringIO_write(sp_StringIO *s, const char *str) { return sio_write(s, str, (int64_t)strlen(str)); }")
+    emit_raw("static int64_t sp_StringIO_puts(sp_StringIO *s, const char *str) { int64_t l = (int64_t)strlen(str); sio_write(s, str, l); if (l == 0 || str[l-1] != '\\n') sio_write(s, \"\\n\", 1); return 0; }")
+    emit_raw("static int64_t sp_StringIO_puts_empty(sp_StringIO *s) { sio_write(s, \"\\n\", 1); return 0; }")
+    emit_raw("static int64_t sp_StringIO_print(sp_StringIO *s, const char *str) { return sio_write(s, str, (int64_t)strlen(str)); }")
+    emit_raw("static int64_t sp_StringIO_putc(sp_StringIO *s, int64_t ch) { char c = (char)(ch & 0xFF); sio_write(s, &c, 1); return ch; }")
+    emit_raw("static const char *sp_StringIO_read(sp_StringIO *s) { if (s->pos >= s->len) return \"\"; const char *r = s->buf + s->pos; s->pos = s->len; return r; }")
+    emit_raw("static const char *sp_StringIO_read_n(sp_StringIO *s, int64_t n) { if (s->pos >= s->len) return \"\"; int64_t rem = s->len - s->pos; if (n > rem) n = rem; char *r = (char *)malloc(n+1); memcpy(r, s->buf + s->pos, n); r[n] = '\\0'; s->pos += n; return r; }")
+    emit_raw("static const char *sp_StringIO_gets(sp_StringIO *s) { if (s->pos >= s->len) return NULL; const char *st = s->buf + s->pos; const char *nl = memchr(st, '\\n', s->len - s->pos); int64_t ll = nl ? (nl - st) + 1 : s->len - s->pos; char *r = (char *)malloc(ll+1); memcpy(r, st, ll); r[ll] = '\\0'; s->pos += ll; s->lineno++; return r; }")
+    emit_raw("static const char *sp_StringIO_getc(sp_StringIO *s) { if (s->pos >= s->len) return NULL; char *gc = (char *)malloc(2); gc[0] = s->buf[s->pos++]; gc[1] = '\\0'; return gc; }")
+    emit_raw("static int64_t sp_StringIO_getbyte(sp_StringIO *s) { if (s->pos >= s->len) return -1; return (int64_t)(unsigned char)s->buf[s->pos++]; }")
+    emit_raw("static int64_t sp_StringIO_rewind(sp_StringIO *s) { s->pos = 0; s->lineno = 0; return 0; }")
+    emit_raw("static int64_t sp_StringIO_seek(sp_StringIO *s, int64_t off) { if (off < 0) off = 0; s->pos = off; return 0; }")
+    emit_raw("static int64_t sp_StringIO_tell(sp_StringIO *s) { return s->pos; }")
+    emit_raw("static mrb_bool sp_StringIO_eof_p(sp_StringIO *s) { return s->pos >= s->len; }")
+    emit_raw("static int64_t sp_StringIO_truncate(sp_StringIO *s, int64_t l) { if (l < 0) l = 0; if (l < s->len) { s->len = l; s->buf[l] = '\\0'; } return 0; }")
+    emit_raw("static int64_t sp_StringIO_close(sp_StringIO *s) { s->closed = 1; return 0; }")
+    emit_raw("static mrb_bool sp_StringIO_closed_p(sp_StringIO *s) { return s->closed; }")
+    emit_raw("static sp_StringIO *sp_StringIO_flush(sp_StringIO *s) { return s; }")
+    emit_raw("static mrb_bool sp_StringIO_sync(sp_StringIO *s) { (void)s; return 1; }")
+    emit_raw("static mrb_bool sp_StringIO_isatty(sp_StringIO *s) { (void)s; return 0; }")
     emit_raw("")
   end
 
@@ -5724,7 +5844,12 @@ class Compiler
                           if recv_type == "str_str_hash"
                             types.push("string")
                           else
-                            types.push("int")
+                            if recv_type == "poly_array"
+                              types.push("poly")
+                              @needs_rb_value = 1
+                            else
+                              types.push("int")
+                            end
                           end
                         end
                       end
@@ -6865,6 +6990,17 @@ class Compiler
           end
           return "sp_StrIntHash_new()"
         end
+        if cname == "StringIO"
+          @needs_stringio = 1
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            aargs = get_args(args_id)
+            if aargs.length >= 1
+              return "sp_StringIO_new_s(" + compile_expr(aargs[0]) + ")"
+            end
+          end
+          return "sp_StringIO_new()"
+        end
         ci = find_class_idx(cname)
         if ci >= 0
           return "sp_" + cname + "_new(" + compile_constructor_args(ci, nid) + ")"
@@ -6874,6 +7010,91 @@ class Compiler
 
     recv_type = infer_type(recv)
     rc = compile_expr(recv)
+
+    # StringIO methods
+    if recv_type == "stringio"
+      if mname == "string"
+        return "sp_StringIO_string(" + rc + ")"
+      end
+      if mname == "pos" || mname == "tell"
+        return "sp_StringIO_pos(" + rc + ")"
+      end
+      if mname == "size" || mname == "length"
+        return "sp_StringIO_size(" + rc + ")"
+      end
+      if mname == "write"
+        return "sp_StringIO_write(" + rc + ", " + compile_arg0(nid) + ")"
+      end
+      if mname == "read"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          aargs = get_args(args_id)
+          if aargs.length >= 1
+            return "sp_StringIO_read_n(" + rc + ", " + compile_expr(aargs[0]) + ")"
+          end
+        end
+        return "sp_StringIO_read(" + rc + ")"
+      end
+      if mname == "gets"
+        return "sp_StringIO_gets(" + rc + ")"
+      end
+      if mname == "getc"
+        return "sp_StringIO_getc(" + rc + ")"
+      end
+      if mname == "getbyte"
+        return "sp_StringIO_getbyte(" + rc + ")"
+      end
+      if mname == "puts"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          aargs = get_args(args_id)
+          if aargs.length >= 1
+            emit("  sp_StringIO_puts(" + rc + ", " + compile_expr(aargs[0]) + ");")
+            return "0"
+          end
+        end
+        emit("  sp_StringIO_puts_empty(" + rc + ");")
+        return "0"
+      end
+      if mname == "print"
+        emit("  sp_StringIO_print(" + rc + ", " + compile_arg0(nid) + ");")
+        return "0"
+      end
+      if mname == "putc"
+        return "sp_StringIO_putc(" + rc + ", " + compile_arg0(nid) + ")"
+      end
+      if mname == "rewind"
+        emit("  sp_StringIO_rewind(" + rc + ");")
+        return "0"
+      end
+      if mname == "seek"
+        emit("  sp_StringIO_seek(" + rc + ", " + compile_arg0(nid) + ");")
+        return "0"
+      end
+      if mname == "truncate"
+        emit("  sp_StringIO_truncate(" + rc + ", " + compile_arg0(nid) + ");")
+        return "0"
+      end
+      if mname == "close"
+        emit("  sp_StringIO_close(" + rc + ");")
+        return "0"
+      end
+      if mname == "eof?"
+        return "sp_StringIO_eof_p(" + rc + ")"
+      end
+      if mname == "closed?"
+        return "sp_StringIO_closed_p(" + rc + ")"
+      end
+      if mname == "flush"
+        return "sp_StringIO_flush(" + rc + ")"
+      end
+      if mname == "sync"
+        return "sp_StringIO_sync(" + rc + ")"
+      end
+      if mname == "isatty"
+        return "sp_StringIO_isatty(" + rc + ")"
+      end
+    end
 
     # String methods
     if recv_type == "string"
@@ -7390,6 +7611,16 @@ class Compiler
           return tmp
         end
         return "sp_StrArray_length(" + rc + ")"
+      end
+    end
+
+    # PolyArray methods
+    if recv_type == "poly_array"
+      if mname == "length"
+        return "sp_PolyArray_length(" + rc + ")"
+      end
+      if mname == "[]"
+        return "sp_PolyArray_get(" + rc + ", " + compile_arg0(nid) + ")"
       end
     end
 
@@ -8128,14 +8359,43 @@ class Compiler
       @needs_int_array = 1
       return "sp_IntArray_new()"
     end
-    et = infer_type(elems[0])
-    if et == "string"
+    arr_type = infer_array_elem_type(nid)
+    if arr_type == "str_array"
       @needs_str_array = 1
       tmp = new_temp
       emit("  sp_StrArray *" + tmp + " = sp_StrArray_new();")
       k = 0
       while k < elems.length
         emit("  sp_StrArray_push(" + tmp + ", " + compile_expr(elems[k]) + ");")
+        k = k + 1
+      end
+      return tmp
+    end
+    if arr_type == "poly_array"
+      @needs_rb_value = 1
+      tmp = new_temp
+      emit("  sp_PolyArray *" + tmp + " = sp_PolyArray_new();")
+      k = 0
+      while k < elems.length
+        et = infer_type(elems[k])
+        val = compile_expr(elems[k])
+        if et == "string"
+          emit("  sp_PolyArray_push(" + tmp + ", sp_box_str(" + val + "));")
+        else
+          if et == "float"
+            emit("  sp_PolyArray_push(" + tmp + ", sp_box_float(" + val + "));")
+          else
+            if et == "bool"
+              emit("  sp_PolyArray_push(" + tmp + ", sp_box_bool(" + val + "));")
+            else
+              if et == "nil"
+                emit("  sp_PolyArray_push(" + tmp + ", sp_box_nil());")
+              else
+                emit("  sp_PolyArray_push(" + tmp + ", sp_box_int(" + val + "));")
+              end
+            end
+          end
+        end
         k = k + 1
       end
       return tmp
@@ -8158,20 +8418,30 @@ class Compiler
       @needs_str_int_hash = 1
       return "sp_StrIntHash_new()"
     end
-    vtype = "int"
-    eid = elems[0]
-    if @nd_type[eid] == "AssocNode"
-      vtype = infer_type(@nd_expression[eid])
-    end
-    if vtype == "string"
+    ht = infer_hash_val_type(nid)
+    if ht == "str_str_hash"
       @needs_str_str_hash = 1
+      @needs_string_helpers = 1
       tmp = new_temp
       emit("  sp_StrStrHash *" + tmp + " = sp_StrStrHash_new();")
       k = 0
       while k < elems.length
         el = elems[k]
         if @nd_type[el] == "AssocNode"
-          emit("  sp_StrStrHash_set(" + tmp + ", " + compile_expr(@nd_key[el]) + ", " + compile_expr(@nd_expression[el]) + ");")
+          vt = infer_type(@nd_expression[el])
+          val = compile_expr(@nd_expression[el])
+          if vt == "int"
+            val = "sp_int_to_s(" + val + ")"
+          else
+            if vt == "float"
+              val = "sp_float_to_s(" + val + ")"
+            else
+              if vt == "bool"
+                val = "(" + val + " ? \"true\" : \"false\")"
+              end
+            end
+          end
+          emit("  sp_StrStrHash_set(" + tmp + ", " + compile_expr(@nd_key[el]) + ", " + val + ");")
         end
         k = k + 1
       end
@@ -9523,6 +9793,15 @@ class Compiler
       tmp2 = new_temp
       emit("  sp_Range " + tmp2 + " = " + rc + ";")
       emit("  for (lv_" + bp1 + " = " + tmp2 + ".first; lv_" + bp1 + " <= " + tmp2 + ".last; lv_" + bp1 + "++) {")
+      @indent = @indent + 1
+      compile_stmts_body(@nd_body[@nd_block[nid]])
+      @indent = @indent - 1
+      emit("  }")
+    end
+    if rt == "poly_array"
+      tmp = new_temp
+      emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < sp_PolyArray_length(" + rc + "); " + tmp + "++) {")
+      emit("    lv_" + bp1 + " = sp_PolyArray_get(" + rc + ", " + tmp + ");")
       @indent = @indent + 1
       compile_stmts_body(@nd_body[@nd_block[nid]])
       @indent = @indent - 1
