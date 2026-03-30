@@ -1003,6 +1003,42 @@ class Compiler
     if mname == "end_with?"
       return "bool"
     end
+    if mname == "even?"
+      return "bool"
+    end
+    if mname == "odd?"
+      return "bool"
+    end
+    if mname == "zero?"
+      return "bool"
+    end
+    if mname == "frozen?"
+      return "bool"
+    end
+    if mname == "is_a?"
+      return "bool"
+    end
+    if mname == "respond_to?"
+      return "bool"
+    end
+    if mname == "chr"
+      return "string"
+    end
+    if mname == "gcd"
+      return "int"
+    end
+    if mname == "clamp"
+      return "int"
+    end
+    if mname == "__method__"
+      return "string"
+    end
+    if mname == "positive?"
+      return "bool"
+    end
+    if mname == "negative?"
+      return "bool"
+    end
     if mname == "empty?"
       return "bool"
     end
@@ -1295,6 +1331,19 @@ class Compiler
     end
 
     "int"
+  end
+
+  def is_class_or_ancestor(cname, target)
+    if cname == target
+      return 1
+    end
+    ci = find_class_idx(cname)
+    if ci >= 0
+      if @cls_parents[ci] != ""
+        return is_class_or_ancestor(@cls_parents[ci], target)
+      end
+    end
+    0
   end
 
   def is_operator_name(name)
@@ -3440,6 +3489,11 @@ class Compiler
               at = infer_type(arg_ids[k])
               if k < ptypes.length
                 ct = ptypes[k]
+                # Skip rest/splat params (int_array) - they handle multiple args
+                if ct == "int_array"
+                  k = k + 1
+                  next
+                end
                 if ct != at
                   if ct != "poly"
                     # Only mark as poly if both types are meaningful
@@ -3668,6 +3722,7 @@ class Compiler
     emit_raw("#include <stdint.h>")
     emit_raw("#include <ctype.h>")
     emit_raw("#include <stdarg.h>")
+    emit_raw("#include <time.h>")
     emit_raw("")
     emit_raw("typedef int64_t mrb_int;")
     emit_raw("typedef double mrb_float;")
@@ -3690,6 +3745,9 @@ class Compiler
     emit_raw("  return r;")
     emit_raw("}")
     emit_raw("")
+    emit_raw("static mrb_int sp_gcd(mrb_int a,mrb_int b){if(a<0)a=-a;if(b<0)b=-b;while(b){mrb_int t=b;b=a%b;a=t;}return a;}")
+    emit_raw("static mrb_int sp_clamp(mrb_int v,mrb_int lo,mrb_int hi){return v<lo?lo:v>hi?hi:v;}")
+    emit_raw("static const char*sp_int_chr(mrb_int n){char*s=(char*)malloc(2);s[0]=(char)n;s[1]=0;return s;}")
     emit_raw("typedef struct{mrb_int first;mrb_int last;}sp_Range;")
     emit_raw("static sp_Range sp_range_new(mrb_int f,mrb_int l){sp_Range r;r.first=f;r.last=l;return r;}")
     emit_raw("static int sp_last_status = 0;")
@@ -5363,6 +5421,9 @@ class Compiler
         end
         return "0"
       end
+      if mname == "__method__"
+        return "\"" + @current_method_name + "\""
+      end
       mi = find_method_idx(mname)
       if mi >= 0
         yargs = ""
@@ -5603,6 +5664,9 @@ class Compiler
       if mname == "freeze"
         return rc
       end
+      if mname == "frozen?"
+        return "TRUE"
+      end
       if mname == "sub"
         args_id = @nd_arguments[nid]
         arg1 = "\"\""
@@ -5715,11 +5779,42 @@ class Compiler
         @needs_string_helpers = 1
         return "sp_int_to_s(" + rc + ")"
       end
+      if mname == "to_i"
+        return rc
+      end
       if mname == "to_f"
         return "(mrb_float)(" + rc + ")"
       end
       if mname == "abs"
         return "((" + rc + ") < 0 ? -(" + rc + ") : (" + rc + "))"
+      end
+      if mname == "even?"
+        return "((" + rc + ") % 2 == 0)"
+      end
+      if mname == "odd?"
+        return "((" + rc + ") % 2 != 0)"
+      end
+      if mname == "zero?"
+        return "((" + rc + ") == 0)"
+      end
+      if mname == "gcd"
+        return "sp_gcd(" + rc + ", " + compile_arg0(nid) + ")"
+      end
+      if mname == "clamp"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          a = get_args(args_id)
+          if a.length >= 2
+            return "sp_clamp(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
+          end
+        end
+      end
+      if mname == "frozen?"
+        return "TRUE"
+      end
+      if mname == "chr"
+        @needs_string_helpers = 1
+        return "sp_int_chr(" + rc + ")"
       end
     end
 
@@ -5882,6 +5977,12 @@ class Compiler
           return "(sp_file_delete(" + compile_arg0(nid) + "), 0)"
         end
       end
+      # Time
+      if rcname == "Time"
+        if mname == "now"
+          return "((mrb_int)time(NULL))"
+        end
+      end
       # ENV
       if rcname == "ENV"
         if mname == "[]"
@@ -5923,6 +6024,87 @@ class Compiler
     # Poly method calls
     if recv_type == "poly"
       return compile_poly_method_call(nid, rc, mname)
+    end
+
+    # is_a? - check class hierarchy
+    if mname == "is_a?"
+      if is_obj_type(recv_type) == 1
+        cname = recv_type[4, recv_type.length - 4]
+        arg0 = ""
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          a = get_args(args_id)
+          if a.length > 0
+            arg0 = @nd_name[a[0]]
+          end
+        end
+        # Check if cname is or inherits from arg0
+        if is_class_or_ancestor(cname, arg0) == 1
+          return "TRUE"
+        else
+          return "FALSE"
+        end
+      end
+      return "FALSE"
+    end
+
+    # respond_to? - check if method exists
+    if mname == "respond_to?"
+      if is_obj_type(recv_type) == 1
+        cname = recv_type[4, recv_type.length - 4]
+        ci = find_class_idx(cname)
+        if ci >= 0
+          arg0 = ""
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            a = get_args(args_id)
+            if a.length > 0
+              arg0 = @nd_content[a[0]]
+            end
+          end
+          if cls_find_method(ci, arg0) >= 0
+            return "TRUE"
+          end
+          # Check attr_readers
+          readers = @cls_attr_readers[ci].split(";")
+          rk = 0
+          while rk < readers.length
+            if readers[rk] == arg0
+              return "TRUE"
+            end
+            rk = rk + 1
+          end
+          return "FALSE"
+        end
+      end
+      return "FALSE"
+    end
+
+    # nil?
+    if mname == "nil?"
+      if recv_type == "nil"
+        return "TRUE"
+      end
+      if recv_type == "poly"
+        return "sp_poly_nil_p(" + rc + ")"
+      end
+      if type_is_pointer(recv_type) == 1
+        return "(" + rc + " == NULL)"
+      end
+      return "FALSE"
+    end
+
+    # frozen? on any type
+    if mname == "frozen?"
+      return "TRUE"
+    end
+
+    # positive? / negative?
+    if mname == "positive?"
+      return "(" + rc + " > 0)"
+    end
+    if mname == "negative?"
+      return "(" + rc + " < 0)"
     end
 
     # Object method calls
@@ -7060,6 +7242,7 @@ class Compiler
     if mname == "system"
       if recv < 0
         @needs_file_io = 1
+        emit("  fflush(stdout);")
         emit("  sp_last_status = system(" + compile_arg0(nid) + ");")
         return
       end
