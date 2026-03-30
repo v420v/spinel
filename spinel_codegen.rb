@@ -1057,6 +1057,18 @@ class Compiler
     if mname == "to_sym"
       return "string"
     end
+    if mname == "lstrip"
+      return "string"
+    end
+    if mname == "rstrip"
+      return "string"
+    end
+    if mname == "dup"
+      if recv >= 0
+        return infer_type(recv)
+      end
+      return "string"
+    end
     if mname == "ord"
       return "int"
     end
@@ -4120,6 +4132,11 @@ class Compiler
     emit_raw("static const char*sp_str_ljust(const char*s,mrb_int w){size_t l=strlen(s);if((mrb_int)l>=w)return s;char*r=(char*)malloc(w+1);memcpy(r,s,l);memset(r+l,' ',w-l);r[w]=0;return r;}")
     emit_raw("static const char*sp_str_rjust(const char*s,mrb_int w){size_t l=strlen(s);if((mrb_int)l>=w)return s;char*r=(char*)malloc(w+1);memset(r,' ',w-l);memcpy(r+w-l,s,l+1);return r;}")
     emit_raw("static const char*sp_str_center(const char*s,mrb_int w){size_t l=strlen(s);if((mrb_int)l>=w)return s;mrb_int pad=w-l;mrb_int left=pad/2;mrb_int right=pad-left;char*r=(char*)malloc(w+1);memset(r,' ',left);memcpy(r+left,s,l);memset(r+left+l,' ',right);r[w]=0;return r;}")
+    emit_raw("static const char*sp_str_ljust2(const char*s,mrb_int w,const char*pad){size_t l=strlen(s);if((mrb_int)l>=w)return s;char*r=(char*)malloc(w+1);memcpy(r,s,l);char pc=pad[0];for(mrb_int i=l;i<w;i++)r[i]=pc;r[w]=0;return r;}")
+    emit_raw("static const char*sp_str_rjust2(const char*s,mrb_int w,const char*pad){size_t l=strlen(s);if((mrb_int)l>=w)return s;char*r=(char*)malloc(w+1);char pc=pad[0];for(mrb_int i=0;i<w-(mrb_int)l;i++)r[i]=pc;memcpy(r+w-l,s,l+1);return r;}")
+    emit_raw("static const char*sp_str_lstrip(const char*s){while(*s&&isspace((unsigned char)*s))s++;char*r=(char*)malloc(strlen(s)+1);strcpy(r,s);return r;}")
+    emit_raw("static const char*sp_str_rstrip(const char*s){size_t l=strlen(s);while(l>0&&isspace((unsigned char)s[l-1]))l--;char*r=(char*)malloc(l+1);memcpy(r,s,l);r[l]=0;return r;}")
+    emit_raw("static const char*sp_str_dup(const char*s){char*r=(char*)malloc(strlen(s)+1);strcpy(r,s);return r;}")
     emit_raw("")
   end
 
@@ -6035,6 +6052,22 @@ class Compiler
         return "sp_str_index(" + rc + ", " + compile_arg0(nid) + ")"
       end
       if mname == "[]"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          a = get_args(args_id)
+          if a.length >= 1
+            if @nd_type[a[0]] == "RangeNode"
+              # s[1..3]
+              left = compile_expr(@nd_left[a[0]])
+              right = compile_expr(@nd_right[a[0]])
+              return "sp_str_sub_range(" + rc + ", " + left + ", " + right + " - " + left + " + 1)"
+            end
+            if a.length >= 2
+              # s[0, 2]
+              return "sp_str_sub_range(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
+            end
+          end
+        end
         return "sp_str_sub_range(" + rc + ", " + compile_arg0(nid) + ", 1)"
       end
       if mname == "reverse"
@@ -6123,13 +6156,39 @@ class Compiler
         return "sp_str_sub_range(" + rc + ", " + compile_arg0(nid) + ", 1)"
       end
       if mname == "ljust"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          a = get_args(args_id)
+          if a.length >= 2
+            return "sp_str_ljust2(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
+          end
+        end
         return "sp_str_ljust(" + rc + ", " + compile_arg0(nid) + ")"
       end
       if mname == "rjust"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          a = get_args(args_id)
+          if a.length >= 2
+            return "sp_str_rjust2(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
+          end
+        end
         return "sp_str_rjust(" + rc + ", " + compile_arg0(nid) + ")"
       end
       if mname == "center"
         return "sp_str_center(" + rc + ", " + compile_arg0(nid) + ")"
+      end
+      if mname == "lstrip"
+        return "sp_str_lstrip(" + rc + ")"
+      end
+      if mname == "rstrip"
+        return "sp_str_rstrip(" + rc + ")"
+      end
+      if mname == "dup"
+        return "sp_str_dup(" + rc + ")"
+      end
+      if mname == "to_s"
+        return rc
       end
     end
 
