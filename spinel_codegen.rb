@@ -137,6 +137,9 @@ class Compiler
     # Method reference tracking: var_name -> method_name
     @method_ref_vars = "".split(",")
     @method_ref_names = "".split(",")
+
+    # Open class tracking for built-in types
+    @open_class_names = "".split(",")
   end
 
   def join_sep(arr, sep)
@@ -871,6 +874,10 @@ class Compiler
       if @current_class_idx >= 0
         return "obj_" + @cls_names[@current_class_idx]
       end
+      st = find_var_type("__self_type")
+      if st != ""
+        return st
+      end
       return "int"
     end
     "int"
@@ -1448,6 +1455,28 @@ class Compiler
       return mr
     end
 
+    # Check open class methods for receiver type
+    if recv >= 0
+      rt = infer_type(recv)
+      oc_prefix = ""
+      if rt == "int"
+        oc_prefix = "__oc_Integer_"
+      end
+      if rt == "string"
+        oc_prefix = "__oc_String_"
+      end
+      if rt == "float"
+        oc_prefix = "__oc_Float_"
+      end
+      if oc_prefix != ""
+        oc_name = oc_prefix + mname
+        oc_mi = find_method_idx(oc_name)
+        if oc_mi >= 0
+          return @meth_return_types[oc_mi]
+        end
+      end
+    end
+
     "int"
   end
 
@@ -1729,6 +1758,19 @@ class Compiler
     infer_all_returns
   end
 
+  def is_builtin_type_name(name)
+    if name == "Integer"
+      return 1
+    end
+    if name == "String"
+      return 1
+    end
+    if name == "Float"
+      return 1
+    end
+    0
+  end
+
   def collect_class(nid)
     ci = @cls_names.length
     cname = ""
@@ -1736,24 +1778,133 @@ class Compiler
     if cp >= 0
       cname = @nd_name[cp]
     end
-    parent = ""
-    sp = @nd_superclass[nid]
-    if sp >= 0
-      parent = @nd_name[sp]
+
+    # Check for open class on built-in type
+    if is_builtin_type_name(cname) == 1
+      @open_class_names.push(cname)
+      # Collect methods as top-level functions with special naming
+      body = @nd_body[nid]
+      if body >= 0
+        body_stmts = get_stmts(body)
+        j = 0
+        while j < body_stmts.length
+          sid = body_stmts[j]
+          if @nd_type[sid] == "DefNode"
+            # Add as top-level method with prefix
+            mname = @nd_name[sid]
+            # Store with special naming for lookup
+            mi = @meth_names.length
+            @meth_names.push("__oc_" + cname + "_" + mname)
+            params = collect_params_str(sid)
+            @meth_param_names.push(params)
+            @meth_param_types.push(collect_ptypes_str(sid, -1))
+            @meth_return_types.push("int")
+            @meth_body_ids.push(@nd_body[sid])
+            @meth_has_yield.push(0)
+            @meth_has_defaults.push("0")
+          end
+          j = j + 1
+        end
+      end
+      return
     end
 
+    parent = ""
+    sp = @nd_superclass[nid]
+    struct_fields = "".split(",")
+    struct_kw_init = 0
+    if sp >= 0
+      if @nd_type[sp] == "CallNode"
+        if @nd_name[sp] == "new"
+          sr = @nd_receiver[sp]
+          if sr >= 0
+            if @nd_type[sr] == "ConstantReadNode"
+              if @nd_name[sr] == "Struct"
+                # Struct.new(:x, :y, keyword_init: true)
+                sargs_id = @nd_arguments[sp]
+                if sargs_id >= 0
+                  sarg_ids = get_args(sargs_id)
+                  sk = 0
+                  while sk < sarg_ids.length
+                    if @nd_type[sarg_ids[sk]] == "SymbolNode"
+                      fname = @nd_content[sarg_ids[sk]]
+                      if fname == ""
+                        fname = @nd_name[sarg_ids[sk]]
+                      end
+                      struct_fields.push(fname)
+                    end
+                    if @nd_type[sarg_ids[sk]] == "KeywordHashNode"
+                      struct_kw_init = 1
+                    end
+                    sk = sk + 1
+                  end
+                end
+              end
+            end
+          end
+        end
+      else
+        parent = @nd_name[sp]
+      end
+    end
+
+    ci = @cls_names.length
     @cls_names.push(cname)
     @cls_parents.push(parent)
-    @cls_ivar_names.push("")
-    @cls_ivar_types.push("")
-    @cls_meth_names.push("")
-    @cls_meth_params.push("")
-    @cls_meth_ptypes.push("")
-    @cls_meth_returns.push("")
-    @cls_meth_bodies.push("")
-    @cls_meth_defaults.push("")
-    @cls_attr_readers.push("")
-    @cls_attr_writers.push("")
+    # Initialize struct fields as ivars
+    ivar_names = ""
+    ivar_types = ""
+    attr_readers = ""
+    attr_writers = ""
+    sk = 0
+    while sk < struct_fields.length
+      if sk > 0
+        ivar_names = ivar_names + ";"
+        ivar_types = ivar_types + ";"
+        attr_readers = attr_readers + ";"
+        attr_writers = attr_writers + ";"
+      end
+      ivar_names = ivar_names + "@" + struct_fields[sk]
+      ivar_types = ivar_types + "int"
+      attr_readers = attr_readers + struct_fields[sk]
+      attr_writers = attr_writers + struct_fields[sk]
+      sk = sk + 1
+    end
+    @cls_ivar_names.push(ivar_names)
+    @cls_ivar_types.push(ivar_types)
+    # Auto-generate initialize method for struct-derived classes
+    if struct_fields.length > 0
+      init_params = ""
+      init_ptypes = ""
+      init_defaults = ""
+      sk = 0
+      while sk < struct_fields.length
+        if sk > 0
+          init_params = init_params + ","
+          init_ptypes = init_ptypes + ","
+          init_defaults = init_defaults + ","
+        end
+        init_params = init_params + struct_fields[sk]
+        init_ptypes = init_ptypes + "int"
+        init_defaults = init_defaults + "-1"
+        sk = sk + 1
+      end
+      @cls_meth_names.push("initialize")
+      @cls_meth_params.push(init_params)
+      @cls_meth_ptypes.push(init_ptypes)
+      @cls_meth_returns.push("void")
+      @cls_meth_bodies.push("-2")
+      @cls_meth_defaults.push(init_defaults)
+    else
+      @cls_meth_names.push("")
+      @cls_meth_params.push("")
+      @cls_meth_ptypes.push("")
+      @cls_meth_returns.push("")
+      @cls_meth_bodies.push("")
+      @cls_meth_defaults.push("")
+    end
+    @cls_attr_readers.push(attr_readers)
+    @cls_attr_writers.push(attr_writers)
     @cls_cmeth_names.push("")
     @cls_cmeth_params.push("")
     @cls_cmeth_ptypes.push("")
@@ -3196,6 +3347,17 @@ class Compiler
     i = 0
     while i < @meth_names.length
       push_scope
+      # Open class self type
+      mfn = @meth_names[i]
+      if mfn.start_with?("__oc_Integer_")
+        declare_var("__self_type", "int")
+      end
+      if mfn.start_with?("__oc_String_")
+        declare_var("__self_type", "string")
+      end
+      if mfn.start_with?("__oc_Float_")
+        declare_var("__self_type", "float")
+      end
       pnames = @meth_param_names[i].split(",")
       ptypes = @meth_param_types[i].split(",")
       j = 0
@@ -4578,8 +4740,37 @@ class Compiler
   end
 
   def method_params_decl(mi)
+    mfullname = @meth_names[mi]
     pnames = @meth_param_names[mi].split(",")
     ptypes = @meth_param_types[mi].split(",")
+    # Check for open class method
+    oc_self = ""
+    if mfullname.start_with?("__oc_Integer_")
+      oc_self = "mrb_int self"
+    end
+    if mfullname.start_with?("__oc_String_")
+      oc_self = "const char * self"
+    end
+    if mfullname.start_with?("__oc_Float_")
+      oc_self = "mrb_float self"
+    end
+    if oc_self != ""
+      if pnames.length == 0
+        return oc_self
+      end
+      result = oc_self
+      j = 0
+      while j < pnames.length
+        result = result + ", "
+        pt = "int"
+        if j < ptypes.length
+          pt = ptypes[j]
+        end
+        result = result + c_type(pt) + " lv_" + pnames[j]
+        j = j + 1
+      end
+      return result
+    end
     if pnames.length == 0
       return "void"
     end
@@ -5091,10 +5282,24 @@ class Compiler
   end
 
   def emit_toplevel_method(mi)
-    @current_method_name = @meth_names[mi]
+    mfullname = @meth_names[mi]
+    @current_method_name = mfullname
     @current_method_return = @meth_return_types[mi]
     @indent = 1
     @in_main = 0
+
+    # Check if this is an open class method
+    oc_type = ""
+    if mfullname.start_with?("__oc_Integer_")
+      oc_type = "int"
+    end
+    if mfullname.start_with?("__oc_String_")
+      oc_type = "string"
+    end
+    if mfullname.start_with?("__oc_Float_")
+      oc_type = "float"
+    end
+
     if @meth_has_yield[mi] == 1
       @in_yield_method = 1
     else
@@ -5108,9 +5313,26 @@ class Compiler
     if @meth_has_yield[mi] == 1
       yp = yield_params_suffix(mi)
     end
-    emit_raw("static " + c_type(@meth_return_types[mi]) + " sp_" + sanitize_name(@meth_names[mi]) + "(" + method_params_decl(mi) + yp + ") {")
 
-    push_scope
+    if oc_type != ""
+      # Open class method: self is primitive type
+      rt = @meth_return_types[mi]
+      self_ctype = c_type(oc_type)
+      pdecl = ""
+      if pnames.length > 0
+        pdecl = build_params_decl(pnames, ptypes)
+        pdecl = self_ctype + " self, " + pdecl
+      else
+        pdecl = self_ctype + " self"
+      end
+      emit_raw("static " + c_type(rt) + " sp_" + sanitize_name(mfullname) + "(" + pdecl + ") {")
+      push_scope
+      declare_var("__self_type", oc_type)
+    else
+      emit_raw("static " + c_type(@meth_return_types[mi]) + " sp_" + sanitize_name(mfullname) + "(" + method_params_decl(mi) + yp + ") {")
+      push_scope
+    end
+
     j = 0
     while j < pnames.length
       pt = "int"
@@ -6121,6 +6343,73 @@ class Compiler
         end
         return "sp_" + sanitize_name(mname) + "(" + compile_call_args_with_defaults(nid, mi) + yargs + ")"
       end
+      # Check if we're inside an open class method: implicit self.method
+      st = find_var_type("__self_type")
+      if st != ""
+        # Redirect as self.mname - string methods
+        if st == "string"
+          @needs_string_helpers = 1
+          if mname == "upcase"
+            return "sp_str_upcase(self)"
+          end
+          if mname == "downcase"
+            return "sp_str_downcase(self)"
+          end
+          if mname == "length"
+            return "(mrb_int)strlen(self)"
+          end
+          if mname == "strip"
+            return "sp_str_strip(self)"
+          end
+          if mname == "chomp"
+            return "sp_str_chomp(self)"
+          end
+          if mname == "to_i"
+            return "((mrb_int)atoll(self))"
+          end
+          if mname == "split"
+            @needs_str_array = 1
+            return "sp_str_split(self, " + compile_arg0(nid) + ")"
+          end
+          if mname == "include?"
+            return "sp_str_include(self, " + compile_arg0(nid) + ")"
+          end
+          if mname == "gsub"
+            args_id = @nd_arguments[nid]
+            arg1 = "\"\""
+            if args_id >= 0
+              a = get_args(args_id)
+              if a.length >= 2
+                arg1 = compile_expr(a[1])
+              end
+            end
+            return "sp_str_gsub(self, " + compile_arg0(nid) + ", " + arg1 + ")"
+          end
+        end
+        # int methods
+        if st == "int"
+          if mname == "to_s"
+            @needs_string_helpers = 1
+            return "sp_int_to_s(self)"
+          end
+          if mname == "to_f"
+            return "(mrb_float)(self)"
+          end
+          if mname == "abs"
+            return "((self) < 0 ? -(self) : (self))"
+          end
+        end
+        # float methods
+        if st == "float"
+          if mname == "to_i"
+            return "(mrb_int)(self)"
+          end
+          if mname == "to_s"
+            @needs_string_helpers = 1
+            return "sp_float_to_s(self)"
+          end
+        end
+      end
       if @current_class_idx >= 0
         cidx = cls_find_method(@current_class_idx, mname)
         if cidx >= 0
@@ -6132,6 +6421,15 @@ class Compiler
           else
             return "sp_" + owner + "_" + sanitize_name(mname) + "(self)"
           end
+        end
+        # Check attr_readers (bare method call like `x` meaning self.x)
+        readers = @cls_attr_readers[@current_class_idx].split(";")
+        rk = 0
+        while rk < readers.length
+          if readers[rk] == mname
+            return "self->" + sanitize_ivar(mname)
+          end
+          rk = rk + 1
         end
       end
       return "0"
@@ -7076,6 +7374,30 @@ class Compiler
         @needs_int_array = 1
         @needs_gc = 1
         return "sp_IntArray_from_range(" + compile_expr(@nd_left[range_nid]) + ", " + compile_expr(@nd_right[range_nid]) + ")"
+      end
+    end
+
+    # Open class method dispatch on built-in types
+    oc_prefix = ""
+    if recv_type == "int"
+      oc_prefix = "__oc_Integer_"
+    end
+    if recv_type == "string"
+      oc_prefix = "__oc_String_"
+    end
+    if recv_type == "float"
+      oc_prefix = "__oc_Float_"
+    end
+    if oc_prefix != ""
+      oc_name = oc_prefix + mname
+      oc_mi = find_method_idx(oc_name)
+      if oc_mi >= 0
+        ca = compile_call_args(nid)
+        if ca != ""
+          return "sp_" + sanitize_name(oc_name) + "(" + rc + ", " + ca + ")"
+        else
+          return "sp_" + sanitize_name(oc_name) + "(" + rc + ")"
+        end
       end
     end
 
