@@ -1,18 +1,35 @@
 #!/usr/bin/env ruby
-# Spinel AOT Compiler - Ruby to C
+# Spinel AOT Compiler - Ruby to native binary
 #
-# Usage: spinel --source=input.rb --output=output.c
-#        spinel input.rb -o output.c
-#        spinel input.rb                  (output to stdout)
+# Usage:
+#   spinel app.rb                  → compiles to ./app
+#   spinel app.rb -o myapp         → compiles to ./myapp
+#   spinel app.rb -c               → generate C only (app.c)
+#   spinel app.rb -c -o app.c      → generate C to specific file
+#   spinel app.rb -S               → print C to stdout
+#
+# Options:
+#   -o FILE    Output file (binary or C depending on -c)
+#   -c         Generate C source only, don't compile
+#   -S         Print generated C to stdout
+#   -O LEVEL   Optimization level for cc (default: 2)
+#   --cc=CMD   C compiler command (default: cc)
+#   --lonig    Link with oniguruma (for regexp programs)
 
 require "tempfile"
 
 dir = File.dirname(File.realpath(__FILE__))
-parse = File.join(dir, "spinel_parse.rb")
-codegen = File.join(dir, "spinel_codegen.rb")
+parse_rb = File.join(dir, "spinel_parse.rb")
+codegen_rb = File.join(dir, "spinel_codegen.rb")
+codegen_bin = File.join(dir, "spinel_codegen")  # compiled binary
 
 source = nil
 output = nil
+c_only = false
+stdout_mode = false
+opt_level = "2"
+cc_cmd = "cc"
+extra_flags = []
 
 i = 0
 while i < ARGV.length
@@ -21,9 +38,20 @@ while i < ARGV.length
     source = arg.sub("--source=", "")
   elsif arg.start_with?("--output=")
     output = arg.sub("--output=", "")
+  elsif arg.start_with?("--cc=")
+    cc_cmd = arg.sub("--cc=", "")
   elsif arg == "-o" && i + 1 < ARGV.length
     i += 1
     output = ARGV[i]
+  elsif arg == "-O" && i + 1 < ARGV.length
+    i += 1
+    opt_level = ARGV[i]
+  elsif arg == "-c"
+    c_only = true
+  elsif arg == "-S"
+    stdout_mode = true
+  elsif arg == "--lonig"
+    extra_flags << "-lonig"
   elsif arg.end_with?(".rb") && source.nil?
     source = arg
   end
@@ -31,7 +59,20 @@ while i < ARGV.length
 end
 
 unless source
-  $stderr.puts "Usage: spinel [--source=]input.rb [--output=|-o output.c]"
+  $stderr.puts "Spinel AOT Compiler"
+  $stderr.puts ""
+  $stderr.puts "Usage: spinel app.rb              → compile to ./app"
+  $stderr.puts "       spinel app.rb -o myapp     → compile to ./myapp"
+  $stderr.puts "       spinel app.rb -c           → generate app.c only"
+  $stderr.puts "       spinel app.rb -S           → print C to stdout"
+  $stderr.puts ""
+  $stderr.puts "Options:"
+  $stderr.puts "  -o FILE     Output file"
+  $stderr.puts "  -c          C source only (don't compile)"
+  $stderr.puts "  -S          Print C to stdout"
+  $stderr.puts "  -O LEVEL    Optimization level (default: 2)"
+  $stderr.puts "  --cc=CMD    C compiler (default: cc)"
+  $stderr.puts "  --lonig     Link with oniguruma (regexp)"
   exit 1
 end
 
@@ -40,26 +81,56 @@ unless File.exist?(source)
   exit 1
 end
 
-# Parse → AST → Codegen in one pipeline
-tmp = Tempfile.new(["spinel_ast", ".txt"])
-begin
-  system("ruby", parse, source, out: tmp.path)
-  unless $?.success?
-    $stderr.puts "spinel: parse failed"
-    exit 1
-  end
+basename = File.basename(source, ".rb")
 
-  if output
-    system("ruby", codegen, tmp.path, output)
-    unless $?.success?
-      $stderr.puts "spinel: codegen failed"
-      exit 1
-    end
-    $stderr.puts "Wrote #{output}"
-  else
-    system("ruby", codegen, tmp.path)
-  end
-ensure
-  tmp.close
-  tmp.unlink
+# Step 1: Parse (always needs CRuby + Prism)
+ast_tmp = Tempfile.new(["spinel_ast", ".txt"])
+system("ruby", parse_rb, source, out: ast_tmp.path)
+unless $?.success?
+  $stderr.puts "spinel: parse failed"
+  ast_tmp.close; ast_tmp.unlink
+  exit 1
 end
+
+# Step 2: Codegen (use compiled binary if available, else CRuby)
+if stdout_mode
+  c_file = nil
+  if File.executable?(codegen_bin)
+    system(codegen_bin, ast_tmp.path)
+  else
+    system("ruby", codegen_rb, ast_tmp.path)
+  end
+  ast_tmp.close; ast_tmp.unlink
+  exit($?.success? ? 0 : 1)
+end
+
+c_file = c_only ? (output || "#{basename}.c") : Tempfile.new(["spinel_out", ".c"]).path
+if File.executable?(codegen_bin)
+  system(codegen_bin, ast_tmp.path, c_file)
+else
+  system("ruby", codegen_rb, ast_tmp.path, c_file)
+end
+ast_tmp.close; ast_tmp.unlink
+
+unless $?.success?
+  $stderr.puts "spinel: codegen failed"
+  exit 1
+end
+
+if c_only
+  $stderr.puts "Wrote #{c_file}"
+  exit 0
+end
+
+# Step 3: Compile C → binary
+bin_file = output || basename
+cc_args = [cc_cmd, "-O#{opt_level}", "-Wno-all", c_file, "-lm"] + extra_flags + ["-o", bin_file]
+system(*cc_args)
+File.delete(c_file) if $?.success? && !c_only
+
+unless $?.success?
+  $stderr.puts "spinel: C compilation failed"
+  exit 1
+end
+
+$stderr.puts "#{source} → #{bin_file}"
