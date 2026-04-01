@@ -37,16 +37,31 @@ Native binary           Standalone, no runtime dependencies
 # Build everything:
 make
 
-# Compile a Ruby program:
+# Write a Ruby program:
+cat > hello.rb <<'RUBY'
+def fib(n)
+  if n < 2
+    n
+  else
+    fib(n - 1) + fib(n - 2)
+  end
+end
+
+puts fib(34)
+RUBY
+
+# Compile and run:
+./spinel hello.rb
+./hello               # prints 5702887 (instantly)
+```
+
+### Options
+
+```bash
 ./spinel app.rb              # compiles to ./app
 ./spinel app.rb -o myapp     # compiles to ./myapp
 ./spinel app.rb -c           # generates app.c only
 ./spinel app.rb -S           # prints C to stdout
-
-# Or step by step with CRuby:
-ruby spinel_parse.rb app.rb > app.ast
-ruby spinel_codegen.rb app.ast app.c
-cc -O2 app.c -lm -o app
 ```
 
 ## Self-Hosting
