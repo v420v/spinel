@@ -23,7 +23,7 @@ PRISM_SRC    = $(wildcard $(PRISM_DIR)/src/*.c) $(wildcard $(PRISM_DIR)/src/util
 PRISM_OBJ    = $(patsubst $(PRISM_DIR)/src/%.c,build/prism/%.o,$(PRISM_SRC))
 PRISM_LIB    = build/libprism.a
 
-.PHONY: all parse bootstrap test bench clean
+.PHONY: all parse bootstrap test bench clean install uninstall
 
 all: parse regexp bootstrap
 
@@ -122,6 +122,26 @@ bench: spinel_parse_bin spinel_codegen
 	done; \
 	rm -f /tmp/_sp_b.ast /tmp/_sp_b.c /tmp/_sp_b_bin; \
 	echo "Benchmarks: $$pass pass, $$fail fail"
+
+# ---- Install ----
+
+PREFIX   ?= /usr/local
+SPNLDIR   = $(PREFIX)/lib/spinel
+
+install: all
+	install -d $(SPNLDIR)/lib/regexp
+	install -m 755 spinel           $(SPNLDIR)/
+	install -m 755 spinel_parse_bin $(SPNLDIR)/
+	install -m 755 spinel_codegen   $(SPNLDIR)/
+	install -m 644 spinel_parse.rb  $(SPNLDIR)/
+	install -m 644 spinel_codegen.rb $(SPNLDIR)/
+	install -m 644 lib/regexp/libspre.a $(SPNLDIR)/lib/regexp/
+	install -d $(PREFIX)/bin
+	ln -sf $(SPNLDIR)/spinel $(PREFIX)/bin/spinel
+
+uninstall:
+	rm -f $(PREFIX)/bin/spinel
+	rm -rf $(SPNLDIR)
 
 # ---- Clean ----
 

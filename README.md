@@ -171,8 +171,11 @@ C binary if available.
 make              # build parser + regexp library + bootstrap compiler
 make test         # run 60 tests
 make bench        # run 39 benchmarks
+sudo make install # install to /usr/local (spinel in PATH)
 make clean        # remove build artifacts
 ```
+
+Override install prefix: `make install PREFIX=$HOME/.local`
 
 Requires [Prism](https://github.com/ruby/prism) gem installed (for
 libprism source). Override with `PRISM_DIR=/path/to/prism`.
