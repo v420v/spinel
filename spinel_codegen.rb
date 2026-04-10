@@ -14579,6 +14579,20 @@ class Compiler
       end
     end
 
+    # prepend on mutable_str (mutating prepend)
+    if mname == "prepend"
+      if recv >= 0
+        rt = infer_type(recv)
+        if rt == "mutable_str"
+          @needs_mutable_str = 1
+          rc = compile_expr(recv)
+          val = compile_arg0(nid)
+          emit("  sp_String_prepend(" + rc + ", " + val + ");")
+          return 1
+        end
+      end
+    end
+
     # clear on string (set to empty)
     if mname == "clear"
       if recv >= 0
@@ -17480,7 +17494,7 @@ class Compiler
     lt = @nd_type[last]
     if lt == "CallNode"
       lm = @nd_name[last]
-      if lm == "[]=" || lm == "push" || lm == "pop" || lm == "emit" || lm == "emit_raw" || lm == "puts" || lm == "print" || lm == "p" || lm == "printf" || lm == "warn" || lm == "raise" || lm == "exit" || lm == "sleep" || lm == "delete" || lm == "clear" || lm == "concat" || lm == "reverse!" || lm == "sort!" || lm == "each" || lm == "times" || lm == "upto" || lm == "downto"
+      if lm == "[]=" || lm == "push" || lm == "pop" || lm == "emit" || lm == "emit_raw" || lm == "puts" || lm == "print" || lm == "p" || lm == "printf" || lm == "warn" || lm == "raise" || lm == "exit" || lm == "sleep" || lm == "delete" || lm == "clear" || lm == "concat" || lm == "prepend" || lm == "reverse!" || lm == "sort!" || lm == "each" || lm == "times" || lm == "upto" || lm == "downto"
         compile_stmt(last)
         if return_type != "void"
           emit("  return " + c_return_default(return_type) + ";")
