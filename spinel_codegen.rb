@@ -1724,6 +1724,9 @@ class Compiler
       end
       return "int_array"
     end
+    if mname == "invert"
+      return "str_str_hash"
+    end
     if mname == "push"
       if recv >= 0
         return infer_type(recv)
@@ -12413,6 +12416,9 @@ class Compiler
       end
       if mname == "values"
         return "sp_StrStrHash_values(" + rc + ")"
+      end
+      if mname == "invert"
+        return "sp_StrStrHash_invert(" + rc + ")"
       end
       if mname == "fetch"
         args_id = @nd_arguments[nid]
