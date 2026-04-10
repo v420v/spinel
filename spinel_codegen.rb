@@ -1641,6 +1641,9 @@ class Compiler
     if mname == "lines"
       return "str_array"
     end
+    if mname == "gets"
+      return "string"
+    end
     if mname == "gsub"
       return "string"
     end
@@ -10894,6 +10897,9 @@ class Compiler
         emit("  sleep((unsigned)" + compile_arg0(nid) + ");")
       end
       return "0"
+    end
+    if mname == "gets"
+      return "sp_gets()"
     end
     if mname == "rand"
       args_id = @nd_arguments[nid]
