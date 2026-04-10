@@ -9356,6 +9356,13 @@ class Compiler
                       # Index
                       types.push("int")
                     end
+                  elsif mname == "each_slice" || mname == "each_cons"
+                    # Block param is a sub-array of the same type
+                    if recv_type == "str_array" || recv_type == "float_array" || recv_type == "int_array"
+                      types.push(recv_type)
+                    else
+                      types.push("int_array")
+                    end
                   elsif mname == "reduce" || mname == "inject"
                     if bk == 0
                       # Accumulator: infer from initial value argument
@@ -14725,6 +14732,20 @@ class Compiler
       end
     end
 
+    if mname == "each_slice"
+      if @nd_block[nid] >= 0
+        compile_each_slice_block(nid)
+        return 1
+      end
+    end
+
+    if mname == "each_cons"
+      if @nd_block[nid] >= 0
+        compile_each_cons_block(nid)
+        return 1
+      end
+    end
+
     # scan with block: str.scan(/re/) { |m| ... }
     if mname == "scan"
       if @nd_block[nid] >= 0
@@ -16134,6 +16155,62 @@ class Compiler
       return @nd_name[reqs[idx]]
     end
     ""
+  end
+
+  def compile_each_slice_block(nid)
+    old = @in_loop
+    @in_loop = 1
+    rt = infer_type(@nd_receiver[nid])
+    rc = compile_expr(@nd_receiver[nid])
+    n = compile_arg0(nid)
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_slice"
+    end
+    tmp_i = new_temp
+    tmp_j = new_temp
+    tmp_len = new_temp
+    pfx = array_c_prefix(rt)
+    declare_var(bp1, rt)
+    @needs_gc = 1
+    emit("  mrb_int " + tmp_len + " = sp_" + pfx + "_length(" + rc + ");")
+    emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < " + tmp_len + "; " + tmp_i + " += " + n + ") {")
+    emit("    lv_" + bp1 + " = sp_" + pfx + "_new();")
+    emit("    for (mrb_int " + tmp_j + " = 0; " + tmp_j + " < " + n + " && " + tmp_i + " + " + tmp_j + " < " + tmp_len + "; " + tmp_j + "++)")
+    emit("      sp_" + pfx + "_push(lv_" + bp1 + ", sp_" + pfx + "_get(" + rc + ", " + tmp_i + " + " + tmp_j + "));")
+    @indent = @indent + 1
+    compile_stmts_body(@nd_body[@nd_block[nid]])
+    @indent = @indent - 1
+    emit("  }")
+    @in_loop = old
+  end
+
+  def compile_each_cons_block(nid)
+    old = @in_loop
+    @in_loop = 1
+    rt = infer_type(@nd_receiver[nid])
+    rc = compile_expr(@nd_receiver[nid])
+    n = compile_arg0(nid)
+    bp1 = get_block_param(nid, 0)
+    if bp1 == ""
+      bp1 = "_cons"
+    end
+    tmp_i = new_temp
+    tmp_j = new_temp
+    tmp_len = new_temp
+    pfx = array_c_prefix(rt)
+    declare_var(bp1, rt)
+    @needs_gc = 1
+    emit("  mrb_int " + tmp_len + " = sp_" + pfx + "_length(" + rc + ");")
+    emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " + " + n + " <= " + tmp_len + "; " + tmp_i + "++) {")
+    emit("    lv_" + bp1 + " = sp_" + pfx + "_new();")
+    emit("    for (mrb_int " + tmp_j + " = 0; " + tmp_j + " < " + n + "; " + tmp_j + "++)")
+    emit("      sp_" + pfx + "_push(lv_" + bp1 + ", sp_" + pfx + "_get(" + rc + ", " + tmp_i + " + " + tmp_j + "));")
+    @indent = @indent + 1
+    compile_stmts_body(@nd_body[@nd_block[nid]])
+    @indent = @indent - 1
+    emit("  }")
+    @in_loop = old
   end
 
   def compile_each_with_index_block(nid)
