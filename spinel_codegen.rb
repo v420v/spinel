@@ -1644,7 +1644,7 @@ class Compiler
     if mname == "scan"
       return "str_array"
     end
-    if mname == "gets"
+    if mname == "gets" || mname == "readline"
       return "string"
     end
     if mname == "gsub"
@@ -10987,7 +10987,7 @@ class Compiler
       end
       return "0"
     end
-    if mname == "gets"
+    if mname == "gets" || mname == "readline"
       return "sp_gets()"
     end
     if mname == "rand"
