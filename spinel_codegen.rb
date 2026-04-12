@@ -1565,7 +1565,13 @@ class Compiler
       end
       return "int"
     end
-    if mname == "succ"
+    if mname == "succ" || mname == "next"
+      if recv >= 0
+        rt = infer_type(recv)
+        if rt == "string"
+          return "string"
+        end
+      end
       return "int"
     end
     if mname == "getbyte"
@@ -11780,6 +11786,9 @@ class Compiler
     if mname == "delete_suffix"
       return "sp_str_delete_suffix(" + rc + ", " + compile_arg0(nid) + ")"
     end
+    if mname == "succ" || mname == "next"
+      return "sp_str_succ(" + rc + ")"
+    end
     if mname == "eql?"
       return "(strcmp(" + rc + ", " + compile_arg0(nid) + ") == 0)"
     end
@@ -12166,7 +12175,7 @@ class Compiler
       @needs_string_helpers = 1
       return "sp_int_chr(" + rc + ")"
     end
-    if mname == "succ"
+    if mname == "succ" || mname == "next"
       return "((" + rc + ") + 1)"
     end
     if mname == "itself"
