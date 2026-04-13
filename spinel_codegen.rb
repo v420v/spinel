@@ -1997,7 +1997,16 @@ class Compiler
       return "str_int_hash"
     end
     if mname == "zip"
-      return "int_array"
+      if recv >= 0
+        rt = infer_type(recv)
+        if rt == "str_array"
+          return "str_array_ptr_array"
+        end
+        if rt == "float_array"
+          return "float_array_ptr_array"
+        end
+      end
+      return "int_array_ptr_array"
     end
     if mname == "reject"
       if recv >= 0
@@ -9735,6 +9744,10 @@ class Compiler
             ltypes[k] = ltypes2[j]
             set_var_type(lnames[k], ltypes2[j])
           end
+          if ltypes[k] == "int_array_ptr_array" && ltypes2[j] != "int_array_ptr_array" && is_ptr_array_type(ltypes2[j]) == 1
+            ltypes[k] = ltypes2[j]
+            set_var_type(lnames[k], ltypes2[j])
+          end
           if ltypes[k] == "str_int_hash" && ltypes2[j] == "str_str_hash"
             ltypes[k] = ltypes2[j]
             set_var_type(lnames[k], ltypes2[j])
@@ -9745,7 +9758,40 @@ class Compiler
       j = j + 1
     end
 
-    # Third pass: upgrade locals passed to lambda-param functions
+    # Third pass: re-scan to resolve dependent types (e.g., block params of array-of-array)
+    lnames3 = "".split(",")
+    ltypes3 = "".split(",")
+    stmts.each { |sid|
+      if @nd_type[sid] != "DefNode"
+        if @nd_type[sid] != "ClassNode"
+          if @nd_type[sid] != "ConstantWriteNode"
+            if @nd_type[sid] != "ModuleNode"
+              scan_locals(sid, lnames3, ltypes3, empty_params)
+            end
+          end
+        end
+      end
+    }
+    j = 0
+    while j < lnames3.length
+      k = 0
+      while k < lnames.length
+        if lnames[k] == lnames3[j]
+          if ltypes[k] == "int_array" && ltypes3[j] != "int_array" && ltypes3[j] != "int"
+            ltypes[k] = ltypes3[j]
+            set_var_type(lnames[k], ltypes3[j])
+          end
+          if ltypes[k] == "int" && ltypes3[j] != "int" && ltypes3[j] != "nil"
+            ltypes[k] = ltypes3[j]
+            set_var_type(lnames[k], ltypes3[j])
+          end
+        end
+        k = k + 1
+      end
+      j = j + 1
+    end
+
+    # Fourth pass: upgrade locals passed to lambda-param functions
     j = 0
     while j < lnames.length
       if ltypes[j] == "int"
@@ -12308,6 +12354,24 @@ class Compiler
     if recv_type == "str_int_hash" || recv_type == "str_str_hash"
       return ""
     end
+    # zip without block: return array of pairs
+    if mname == "zip" && @nd_block[nid] < 0
+      @needs_ptr_array = 1
+      @needs_gc = 1
+      pfx = array_c_prefix(recv_type)
+      arg = compile_arg0(nid)
+      tmp = new_temp
+      itmp = new_temp
+      pair_tmp = new_temp
+      emit("  sp_PtrArray *" + tmp + " = sp_PtrArray_new();")
+      emit("  for (mrb_int " + itmp + " = 0; " + itmp + " < sp_" + pfx + "_length(" + rc + "); " + itmp + "++) {")
+      emit("    " + c_type(recv_type) + " " + pair_tmp + " = sp_" + pfx + "_new();")
+      emit("    sp_" + pfx + "_push(" + pair_tmp + ", sp_" + pfx + "_get(" + rc + ", " + itmp + "));")
+      emit("    sp_" + pfx + "_push(" + pair_tmp + ", sp_" + pfx + "_get(" + arg + ", " + itmp + "));")
+      emit("    sp_PtrArray_push(" + tmp + ", " + pair_tmp + ");")
+      emit("  }")
+      return tmp
+    end
     # first(n) / last(n) with argument: return new array
     if mname == "first" && @nd_arguments[nid] >= 0
       aargs = get_args(@nd_arguments[nid])
@@ -12516,13 +12580,6 @@ class Compiler
       end
       if mname == "dup"
         return "sp_IntArray_dup(" + rc + ")"
-      end
-      if mname == "zip"
-        # zip returns array of pairs; for length-only usage, return array with same length
-        tmp = new_temp
-        emit("  sp_IntArray *" + tmp + " = sp_IntArray_new();")
-        emit("  for (mrb_int _i = 0; _i < sp_IntArray_length(" + rc + "); _i++) sp_IntArray_push(" + tmp + ", sp_IntArray_get(" + rc + ", _i));")
-        return tmp
       end
       if mname == "count"
         if @nd_block[nid] >= 0
@@ -16981,11 +17038,13 @@ class Compiler
       emit("  }")
     end
     if is_ptr_array_type(rt) == 1
+      elem_type = ptr_array_elem_type(rt)
       tmp = new_temp
+      bp_tmp = new_temp
       emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < sp_PtrArray_length(" + rc + "); " + tmp + "++) {")
       if has_bp == 1
-        elem_type = ptr_array_elem_type(rt)
-        emit("    lv_" + bp1 + " = (" + c_type(elem_type) + ")sp_PtrArray_get(" + rc + ", " + tmp + ");")
+        emit("    " + c_type(elem_type) + " " + bp_tmp + " = (" + c_type(elem_type) + ")sp_PtrArray_get(" + rc + ", " + tmp + ");")
+        emit("    lv_" + bp1 + " = " + bp_tmp + ";")
       end
       @indent = @indent + 1
       compile_stmts_body(@nd_body[@nd_block[nid]])
