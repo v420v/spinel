@@ -1512,6 +1512,14 @@ class Compiler
     if mname == "eql?"
       return "bool"
     end
+    if mname == "partition" || mname == "rpartition"
+      if recv >= 0
+        rt = infer_type(recv)
+        if rt == "string"
+          return "tuple:string,string,string"
+        end
+      end
+    end
     if mname == "hash"
       return "int"
     end
@@ -12138,6 +12146,33 @@ class Compiler
     end
     if mname == "eql?"
       return "(strcmp(" + rc + ", " + compile_arg0(nid) + ") == 0)"
+    end
+    if mname == "partition"
+      tt = "tuple:string,string,string"
+      register_tuple_type(tt)
+      @needs_gc = 1
+      tname = tuple_c_name(tt)
+      sep = compile_arg0(nid)
+      tmp = new_temp
+      emit("  " + tname + " *" + tmp + " = (" + tname + " *)sp_gc_alloc(sizeof(" + tname + "), NULL, NULL);")
+      emit("  { const char *_p = strstr(" + rc + ", " + sep + ");")
+      emit("    if (_p) { " + tmp + "->_0 = sp_str_substr(" + rc + ", 0, _p - " + rc + "); " + tmp + "->_1 = " + sep + "; " + tmp + "->_2 = sp_str_substr(" + rc + ", _p - " + rc + " + strlen(" + sep + "), strlen(_p) - strlen(" + sep + ")); }")
+      emit("    else { " + tmp + "->_0 = " + rc + "; " + tmp + "->_1 = \"\"; " + tmp + "->_2 = \"\"; } }")
+      return tmp
+    end
+    if mname == "rpartition"
+      tt = "tuple:string,string,string"
+      register_tuple_type(tt)
+      @needs_gc = 1
+      tname = tuple_c_name(tt)
+      sep = compile_arg0(nid)
+      tmp = new_temp
+      emit("  " + tname + " *" + tmp + " = (" + tname + " *)sp_gc_alloc(sizeof(" + tname + "), NULL, NULL);")
+      emit("  { size_t _sl = strlen(" + rc + "), _pl = strlen(" + sep + "); const char *_last = NULL;")
+      emit("    for (const char *_p = " + rc + "; (_p = strstr(_p, " + sep + ")); _p += _pl) _last = _p;")
+      emit("    if (_last) { " + tmp + "->_0 = sp_str_substr(" + rc + ", 0, _last - " + rc + "); " + tmp + "->_1 = " + sep + "; " + tmp + "->_2 = sp_str_substr(" + rc + ", _last - " + rc + " + _pl, _sl - (_last - " + rc + ") - _pl); }")
+      emit("    else { " + tmp + "->_0 = \"\"; " + tmp + "->_1 = \"\"; " + tmp + "->_2 = " + rc + "; } }")
+      return tmp
     end
     if mname == "hash"
       return "(mrb_int)sp_str_hash(" + rc + ")"
