@@ -10539,7 +10539,9 @@ class Compiler
         i = i + 1
       end
     end
-    result + "\""
+    # Prepend 0xff marker byte so GC can identify static literals.
+    # Return form: ("\xff" "content" + 1) — C concatenates adjacent literals.
+    "(\"\\xff\" " + result + "\" + 1)"
   end
 
   def compile_interpolated(nid)
