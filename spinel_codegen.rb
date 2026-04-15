@@ -11659,8 +11659,9 @@ class Compiler
       return "0"
     end
     if mname == "p"
-      # p(val) -> puts(val.inspect) - for simplicity, same as puts
-      compile_puts(nid)
+      # p(val) -> puts(val.inspect). For most types the output matches
+      # puts, but symbols need ":name" and strings need quoting.
+      compile_p(nid)
       return "0"
     end
     if mname == "srand"
@@ -12796,6 +12797,22 @@ class Compiler
     end
     if mname == "hash"
       return "((mrb_int)" + rc + ")"
+    end
+    if mname == "<=>"
+      args_id = @nd_arguments[nid]
+      if args_id >= 0
+        aargs = get_args(args_id)
+        if aargs.length >= 1
+          at = infer_type(aargs[0])
+          if at == "symbol"
+            other = compile_expr(aargs[0])
+            # Lexical compare on symbol names (Ruby semantics)
+            cmp = "strcmp(sp_sym_to_s(" + rc + "), sp_sym_to_s(" + other + "))"
+            return "((" + cmp + ") < 0 ? (mrb_int)-1 : ((" + cmp + ") > 0 ? (mrb_int)1 : (mrb_int)0))"
+          end
+        end
+      end
+      return "0"
     end
     if mname == "==" || mname == "eql?"
       args_id = @nd_arguments[nid]
@@ -17662,6 +17679,67 @@ class Compiler
       emit("  sp_StrStrHash_set(" + rc + ", " + idx + ", " + val + ");")
       return
     end
+  end
+
+  # Kernel#p: like puts, but symbols print as ":name" and strings get
+  # quotes. Falls back to compile_puts for types where inspect and
+  # to_s produce identical output (ints, floats, bools, nil).
+  def compile_p(nid)
+    args_id = @nd_arguments[nid]
+    if args_id < 0
+      return
+    end
+    arg_ids = get_args(args_id)
+    if arg_ids.length == 0
+      return
+    end
+    k = 0
+    while k < arg_ids.length
+      aid = arg_ids[k]
+      at = infer_type(aid)
+      val = compile_expr(aid)
+      if at == "symbol"
+        emit("  { putchar(':'); fputs(sp_sym_to_s(" + val + "), stdout); putchar('" + bsl_n + "'); }")
+      elsif at == "string" || at == "string?"
+        emit("  { const char *_ps = " + val + "; if (_ps) { putchar('\"'); fputs(_ps, stdout); putchar('\"'); putchar('" + bsl_n + "'); } else { fputs(\"nil\", stdout); putchar('" + bsl_n + "'); } }")
+      elsif at == "nil"
+        emit("  fputs(\"nil\\n\", stdout);")
+      else
+        # Fall back to puts-style output for this one argument
+        compile_puts_single(aid, at, val)
+      end
+      k = k + 1
+    end
+  end
+
+  # Emit the puts-equivalent for a single arg (extracted for reuse from p).
+  def compile_puts_single(aid, at, val)
+    if at == "poly"
+      @needs_rb_value = 1
+      emit("  sp_poly_puts(" + val + ");")
+      return
+    end
+    if at == "mutable_str"
+      emit("  { const char *_ps = " + val + "->data; if (_ps) { fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '" + bsl_n + "') putchar('" + bsl_n + "'); } else putchar('" + bsl_n + "'); }")
+      return
+    end
+    if at == "int"
+      emit("  printf(\"%lld" + bsl_n + "\", (long long)" + val + ");")
+      return
+    end
+    if at == "float"
+      emit("  printf(\"%g" + bsl_n + "\", " + val + ");")
+      return
+    end
+    if at == "bool"
+      emit("  puts(" + val + " ? \"true\" : \"false\");")
+      return
+    end
+    if at == "string" || at == "string?"
+      emit("  { const char *_ps = " + val + "; if (_ps) { fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '" + bsl_n + "') putchar('" + bsl_n + "'); } else putchar('" + bsl_n + "'); }")
+      return
+    end
+    emit("  printf(\"%lld" + bsl_n + "\", (long long)" + val + ");")
   end
 
   def compile_puts(nid)
