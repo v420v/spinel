@@ -12118,7 +12118,7 @@ class Compiler
   end
 
   def collect_concat_parts(nid, parts)
-    if parts.length >= 4
+    if parts.length >= 12
       parts.push(compile_expr(nid))
       return
     end
@@ -12227,6 +12227,20 @@ class Compiler
         end
         if parts.length == 4
           return "sp_str_concat4(" + parts[0] + ", " + parts[1] + ", " + parts[2] + ", " + parts[3] + ")"
+        end
+        if parts.length >= 5
+          # Variable-length: single malloc for N parts via sp_str_concat_arr
+          arr = "(const char *const[]){"
+          k = 0
+          while k < parts.length
+            if k > 0
+              arr = arr + ", "
+            end
+            arr = arr + parts[k]
+            k = k + 1
+          end
+          arr = arr + "}"
+          return "sp_str_concat_arr(" + arr + ", " + parts.length.to_s + ")"
         end
         return "sp_str_concat(" + compile_expr(recv) + ", " + compile_arg0(nid) + ")"
       end
