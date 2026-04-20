@@ -79,50 +79,54 @@ gen2.c == gen3.c   (bootstrap loop closed)
 ## Benchmarks
 
 74 tests pass. 55 benchmarks pass.
-Geometric mean: **~49x faster** than CRuby across 50 benchmarks.
+Geometric mean: **~11.6x faster** than miniruby (Ruby 4.1.0dev) across
+the 28 benchmarks below. Baseline is the latest CRuby `miniruby` build
+(without bundled gems), which is considerably faster than the system
+`ruby` (3.2.3); Spinel's advantage is correspondingly smaller but still
+substantial on computation-heavy workloads.
 
 ### Computation
 
-| Benchmark | Spinel | CRuby | Speedup |
+| Benchmark | Spinel | miniruby | Speedup |
 |---|---|---|---|
-| ackermann | 5 ms | 394 ms | 78.8x |
-| life (Conway's GoL) | 22 ms | 1,525 ms | 69.3x |
-| fib (recursive) | 11 ms | 560 ms | 50.9x |
-| mandelbrot | 24 ms | 1,187 ms | 49.5x |
-| matmul | 9 ms | 329 ms | 36.6x |
-| fasta (DNA seq gen) | 2 ms | 72 ms | 36.0x |
-| fannkuch | 2 ms | 71 ms | 35.5x |
-| nqueens | 777 ms | 24,912 ms | 32.1x |
-| tarai | 16 ms | 423 ms | 26.4x |
-| tak | 20 ms | 499 ms | 24.9x |
-| sudoku | 6 ms | 148 ms | 24.7x |
-| partial_sums | 81 ms | 1,282 ms | 15.8x |
-| sieve | 38 ms | 435 ms | 11.4x |
+| life (Conway's GoL) | 20 ms | 1,733 ms | 86.7x |
+| ackermann | 5 ms | 374 ms | 74.8x |
+| mandelbrot | 25 ms | 1,453 ms | 58.1x |
+| fib (recursive) | 17 ms | 581 ms | 34.2x |
+| nqueens | 10 ms | 304 ms | 30.4x |
+| tarai | 16 ms | 461 ms | 28.8x |
+| tak | 22 ms | 532 ms | 24.2x |
+| matmul | 13 ms | 313 ms | 24.1x |
+| sudoku | 6 ms | 102 ms | 17.0x |
+| partial_sums | 93 ms | 1,498 ms | 16.1x |
+| fannkuch | 2 ms | 19 ms | 9.5x |
+| sieve | 39 ms | 332 ms | 8.5x |
+| fasta (DNA seq gen) | 3 ms | 21 ms | 7.0x |
 
 ### Data Structures & GC
 
-| Benchmark | Spinel | CRuby | Speedup |
+| Benchmark | Spinel | miniruby | Speedup |
 |---|---|---|---|
-| rbtree (red-black tree) | 23 ms | 571 ms | 24.8x |
-| huffman (encoding) | 10 ms | 200 ms | 20.0x |
-| splay tree | 14 ms | 241 ms | 17.2x |
-| binary_trees | 11 ms | 105 ms | 9.5x |
-| so_lists | 74 ms | 510 ms | 6.9x |
-| linked_list | 101 ms | 455 ms | 4.5x |
-| gcbench | 1,634 ms | 4,247 ms | 2.6x |
+| rbtree (red-black tree) | 24 ms | 543 ms | 22.6x |
+| splay tree | 14 ms | 195 ms | 13.9x |
+| huffman (encoding) | 6 ms | 59 ms | 9.8x |
+| so_lists | 76 ms | 410 ms | 5.4x |
+| binary_trees | 11 ms | 40 ms | 3.6x |
+| linked_list | 136 ms | 388 ms | 2.9x |
+| gcbench | 1,845 ms | 3,641 ms | 2.0x |
 
 ### Real-World Programs
 
-| Benchmark | Spinel | CRuby | Speedup |
+| Benchmark | Spinel | miniruby | Speedup |
 |---|---|---|---|
-| bigint_fib (1000 digits) | 2 ms | 66 ms | 33.0x |
-| pidigits (bigint) | 2 ms | 65 ms | 32.5x |
-| str_concat | 2 ms | 67 ms | 33.5x |
-| json_parse | 38 ms | 436 ms | 11.5x |
-| ao_render (ray tracer) | 409 ms | 3,674 ms | 9.0x |
-| template engine | 137 ms | 961 ms | 7.0x |
-| io_wordcount | 26 ms | 153 ms | 5.9x |
-| csv_process | 229 ms | 936 ms | 4.1x |
+| json_parse | 39 ms | 394 ms | 10.1x |
+| bigint_fib (1000 digits) | 2 ms | 16 ms | 8.0x |
+| ao_render (ray tracer) | 417 ms | 3,334 ms | 8.0x |
+| pidigits (bigint) | 2 ms | 13 ms | 6.5x |
+| str_concat | 2 ms | 13 ms | 6.5x |
+| template engine | 152 ms | 936 ms | 6.2x |
+| csv_process | 234 ms | 860 ms | 3.7x |
+| io_wordcount | 33 ms | 97 ms | 2.9x |
 
 ## Supported Ruby Features
 
