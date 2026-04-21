@@ -11678,10 +11678,10 @@ class Compiler
         if args_id >= 0
           arg_ids = get_args(args_id)
           if arg_ids.length > 0
-            return "sp_Fiber_resume(" + rc + ", " + box_expr_to_poly(arg_ids[0]) + ")"
+            return "sp_Fiber_resume((sp_Fiber *)(" + rc + "), " + box_expr_to_poly(arg_ids[0]) + ")"
           end
         end
-        return "sp_Fiber_resume(" + rc + ", sp_box_nil())"
+        return "sp_Fiber_resume((sp_Fiber *)(" + rc + "), sp_box_nil())"
       end
     end
     # Fiber.yield(val)
@@ -11704,7 +11704,7 @@ class Compiler
       rt2 = base_type(infer_type(recv))
       if rt2 == "fiber"
         rc = compile_expr(recv)
-        return "sp_Fiber_alive(" + rc + ")"
+        return "sp_Fiber_alive((sp_Fiber *)(" + rc + "))"
       end
     end
     # fiber.transfer(val)
@@ -11716,10 +11716,10 @@ class Compiler
         if args_id >= 0
           arg_ids = get_args(args_id)
           if arg_ids.length > 0
-            return "sp_Fiber_transfer(" + rc + ", " + box_expr_to_poly(arg_ids[0]) + ")"
+            return "sp_Fiber_transfer((sp_Fiber *)(" + rc + "), " + box_expr_to_poly(arg_ids[0]) + ")"
           end
         end
-        return "sp_Fiber_transfer(" + rc + ", sp_box_nil())"
+        return "sp_Fiber_transfer((sp_Fiber *)(" + rc + "), sp_box_nil())"
       end
     end
     # Fiber.current
@@ -14037,7 +14037,7 @@ class Compiler
             return "((mrb_int)0)"
           end
         end
-        return "sp_SymIntHash_get(" + rc + ", " + compile_arg0(nid) + ")"
+        return "sp_SymIntHash_get((sp_SymIntHash *)(" + rc + "), " + compile_arg0(nid) + ")"
       end
       if mname == "has_key?" || mname == "key?" || mname == "include?" || mname == "member?"
         args_id1 = @nd_arguments[nid]
@@ -14047,13 +14047,13 @@ class Compiler
             return "FALSE"
           end
         end
-        return "sp_SymIntHash_has_key(" + rc + ", " + compile_arg0(nid) + ")"
+        return "sp_SymIntHash_has_key((sp_SymIntHash *)(" + rc + "), " + compile_arg0(nid) + ")"
       end
       if mname == "length" || mname == "size" || (mname == "count" && @nd_block[nid] < 0 && @nd_arguments[nid] < 0)
         if @hoisted_strlen_var != "" && @hoisted_strlen_recv == rc
           return @hoisted_strlen_var
         end
-        return "sp_SymIntHash_length(" + rc + ")"
+        return "sp_SymIntHash_length((sp_SymIntHash *)(" + rc + "))"
       end
       if mname == "empty?"
         return "(sp_SymIntHash_length(" + rc + ") == 0)"
@@ -14070,7 +14070,7 @@ class Compiler
             defval = compile_expr(aargs[1])
             return "(sp_SymIntHash_has_key(" + rc + ", " + key + ") ? sp_SymIntHash_get(" + rc + ", " + key + ") : " + defval + ")"
           end
-          return "sp_SymIntHash_get(" + rc + ", " + key + ")"
+          return "sp_SymIntHash_get((sp_SymIntHash *)(" + rc + "), " + key + ")"
         end
       end
     end
@@ -14083,7 +14083,7 @@ class Compiler
             return "(\"\\xff\" + 1)"
           end
         end
-        return "sp_SymStrHash_get(" + rc + ", " + compile_arg0(nid) + ")"
+        return "sp_SymStrHash_get((sp_SymStrHash *)(" + rc + "), " + compile_arg0(nid) + ")"
       end
       if mname == "has_key?" || mname == "key?" || mname == "include?" || mname == "member?"
         args_id1s = @nd_arguments[nid]
@@ -14093,13 +14093,13 @@ class Compiler
             return "FALSE"
           end
         end
-        return "sp_SymStrHash_has_key(" + rc + ", " + compile_arg0(nid) + ")"
+        return "sp_SymStrHash_has_key((sp_SymStrHash *)(" + rc + "), " + compile_arg0(nid) + ")"
       end
       if mname == "length" || mname == "size" || (mname == "count" && @nd_block[nid] < 0 && @nd_arguments[nid] < 0)
         if @hoisted_strlen_var != "" && @hoisted_strlen_recv == rc
           return @hoisted_strlen_var
         end
-        return "sp_SymStrHash_length(" + rc + ")"
+        return "sp_SymStrHash_length((sp_SymStrHash *)(" + rc + "))"
       end
       if mname == "empty?"
         return "(sp_SymStrHash_length(" + rc + ") == 0)"
@@ -14116,7 +14116,7 @@ class Compiler
             defval = compile_expr(aargs[1])
             return "(sp_SymStrHash_has_key(" + rc + ", " + key + ") ? sp_SymStrHash_get(" + rc + ", " + key + ") : " + defval + ")"
           end
-          return "sp_SymStrHash_get(" + rc + ", " + key + ")"
+          return "sp_SymStrHash_get((sp_SymStrHash *)(" + rc + "), " + key + ")"
         end
       end
     end
@@ -15909,10 +15909,10 @@ class Compiler
       return "sp_StrStrHash_length(" + rc + ")"
     end
     if rt == "sym_int_hash"
-      return "sp_SymIntHash_length(" + rc + ")"
+      return "sp_SymIntHash_length((sp_SymIntHash *)(" + rc + "))"
     end
     if rt == "sym_str_hash"
-      return "sp_SymStrHash_length(" + rc + ")"
+      return "sp_SymStrHash_length((sp_SymStrHash *)(" + rc + "))"
     end
     ""
   end
