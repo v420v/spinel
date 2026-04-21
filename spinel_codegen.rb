@@ -5677,6 +5677,17 @@ class Compiler
   end
 
   def infer_init_param_type(ci, pname)
+    # Synthetic Struct.new(...) constructors (body id -2) have no AST
+    # body to scan — the implicit rule is "param pname → @pname = pname",
+    # so the param type must match the ivar type. update_ivar_types_from_params
+    # has already propagated call-site-inferred types into ivars by this point.
+    init_idx0 = cls_find_method_direct(ci, "initialize")
+    if init_idx0 >= 0
+      bodies0 = @cls_meth_bodies[ci].split(";")
+      if init_idx0 < bodies0.length && bodies0[init_idx0].to_i == -2
+        return cls_ivar_type(ci, "@" + pname)
+      end
+    end
     # Check if param is assigned to an ivar in initialize
     mnames = @cls_meth_names[ci].split(";")
     bodies = @cls_meth_bodies[ci].split(";")
