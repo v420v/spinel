@@ -11431,6 +11431,67 @@ class Compiler
     result
   end
 
+  # True if `t` is a GC-allocated pointer that could be swept by
+  # sp_gc_collect if held only as a C-stack temp when the collector
+  # runs mid-expression.
+  def type_needs_transient_root(t)
+    if t == ""
+      return 0
+    end
+    if is_nullable_type(t) == 1
+      t = base_type(t)
+    end
+    if t == "string" || t == "mutable_str"
+      return 1
+    end
+    if t == "int_array" || t == "str_array" || t == "float_array" || t == "sym_array"
+      return 1
+    end
+    if t == "str_int_hash" || t == "str_str_hash" || t == "sym_int_hash" || t == "sym_str_hash"
+      return 1
+    end
+    if t == "str_poly_hash" || t == "sym_poly_hash"
+      return 1
+    end
+    if is_ptr_array_type(t) == 1
+      return 1
+    end
+    if is_obj_type(t) == 1
+      return 1
+    end
+    if is_tuple_type(t) == 1
+      return 1
+    end
+    if t == "stringio" || t == "fiber" || t == "bigint" || t == "lambda" || t == "poly_array"
+      return 1
+    end
+    0
+  end
+
+  # Compile `nid`, and if it's a call expression whose result is a
+  # GC-allocated pointer, bind that result to a rooted temp variable
+  # so a subsequent mid-expression sp_gc_collect cannot sweep it.
+  # For non-call expressions (locals, ivars, literals) rooting is
+  # either already in place or unnecessary.
+  def compile_expr_gc_rooted(nid)
+    val = compile_expr(nid)
+    if nid < 0
+      return val
+    end
+    if @nd_type[nid] != "CallNode"
+      return val
+    end
+    t = infer_type(nid)
+    if type_needs_transient_root(t) == 0
+      return val
+    end
+    @needs_gc = 1
+    tmp = new_temp
+    emit("  " + c_type(t) + " " + tmp + " = " + val + ";")
+    emit("  SP_GC_ROOT(" + tmp + ");")
+    tmp
+  end
+
   def compile_arg0(nid)
     args_id = @nd_arguments[nid]
     if args_id >= 0
@@ -11847,7 +11908,7 @@ class Compiler
     if mname == "resume" && recv >= 0
       rt2 = base_type(infer_type(recv))
       if rt2 == "fiber"
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         args_id = @nd_arguments[nid]
         if args_id >= 0
           arg_ids = get_args(args_id)
@@ -11877,7 +11938,7 @@ class Compiler
     if mname == "alive?" && recv >= 0
       rt2 = base_type(infer_type(recv))
       if rt2 == "fiber"
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         return "sp_Fiber_alive((sp_Fiber *)(" + rc + "))"
       end
     end
@@ -11885,7 +11946,7 @@ class Compiler
     if mname == "transfer" && recv >= 0
       rt2 = base_type(infer_type(recv))
       if rt2 == "fiber"
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         args_id = @nd_arguments[nid]
         if args_id >= 0
           arg_ids = get_args(args_id)
@@ -11950,7 +12011,7 @@ class Compiler
     end
 
     recv_type = infer_type(recv)
-    rc = compile_expr(recv)
+    rc = compile_expr_gc_rooted(recv)
     # Root receiver if it may be collected during argument evaluation
     if expr_may_gc(recv) == 1 && type_is_pointer(recv_type) == 1
       args_id = @nd_arguments[nid]
@@ -12425,7 +12486,7 @@ class Compiler
   end
 
   def compile_lambda_call_expr(nid, mname, recv)
-    rc = compile_expr(recv)
+    rc = compile_expr_gc_rooted(recv)
     # Determine return type unboxing
     ret_type = ""
     if @nd_type[recv] == "LocalVariableReadNode"
@@ -12458,7 +12519,7 @@ class Compiler
         owner = find_method_owner(ci, mname)
         if owner != ""
           ca = compile_call_args(nid)
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           if owner == cname
             if ca != ""
               return "sp_" + owner + "_" + sanitize_name(mname) + "(" + rc + ", " + ca + ")"
@@ -12477,7 +12538,7 @@ class Compiler
           cmp_owner = find_method_owner(ci, "<=>")
           if cmp_owner != ""
             ca = compile_call_args(nid)
-            rc = compile_expr(recv)
+            rc = compile_expr_gc_rooted(recv)
             cmp_call = "sp_" + cmp_owner + "__cmp(" + rc + ", " + ca + ")"
             if mname == "<"
               return "(" + cmp_call + " < 0)"
@@ -12684,7 +12745,7 @@ class Compiler
         return "sp_poly_add(" + compile_expr(recv) + ", " + box_expr_to_poly(@nd_arguments[nid] >= 0 ? get_args(@nd_arguments[nid])[0] : -1) + ")"
       end
       if lt == "int_array" || lt == "str_array" || lt == "float_array" || lt == "sym_array"
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         arg = compile_arg0(nid)
         pfx = array_c_prefix(lt)
         tmp = new_temp
@@ -12791,7 +12852,7 @@ class Compiler
     end
     if mname == "=~"
       # str =~ /pattern/ → sp_re_match(pat, str)
-      rc = compile_expr(recv)
+      rc = compile_expr_gc_rooted(recv)
       re_args_id = @nd_arguments[nid]
       if re_args_id >= 0
         argl = get_args(re_args_id)
@@ -12818,7 +12879,7 @@ class Compiler
       if args_id >= 0
         aargs = get_args(args_id)
         if aargs.length >= 2
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           lo = compile_expr(aargs[0])
           hi = compile_expr(aargs[1])
           lt = infer_type(recv)
@@ -12833,7 +12894,7 @@ class Compiler
       lt = infer_type(recv)
       if lt == "mutable_str"
         @needs_mutable_str = 1
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         val = compile_arg0(nid)
         return "(sp_String_append(" + rc + ", " + val + "), " + rc + ")"
       end
@@ -16355,7 +16416,7 @@ class Compiler
         return ""
       end
       tmp = new_temp
-      rc = compile_expr(recv)
+      rc = compile_expr_gc_rooted(recv)
       emit("  mrb_int " + tmp + " = (mrb_int)strlen(" + rc + ");")
       @hoisted_strlen_recv = rc
       return tmp
@@ -16369,7 +16430,7 @@ class Compiler
     # (The pred_nid is the while predicate; body scan happens below via caller
     #  passing @while_body_nid.  Here we only check if type is hoistable.)
     tmp = new_temp
-    rc = compile_expr(recv)
+    rc = compile_expr_gc_rooted(recv)
     emit("  mrb_int " + tmp + " = " + length_c_expr(rt, rc) + ";")
     @hoisted_strlen_recv = rc
     tmp
@@ -16868,7 +16929,7 @@ class Compiler
         if args_id >= 0
           aargs = get_args(args_id)
           if aargs.length >= 2
-            rc = compile_expr(recv)
+            rc = compile_expr_gc_rooted(recv)
             val = compile_expr(aargs[1])
             if rt == "sym_int_hash"
               emit("  sp_SymIntHash_set(" + rc + ", " + compile_expr(aargs[0]) + ", " + val + ");")
@@ -16896,7 +16957,7 @@ class Compiler
     if mname == "delete"
       if recv >= 0
         rt = infer_type(recv)
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         if rt == "sym_int_hash"
           emit("  sp_SymIntHash_delete(" + rc + ", " + compile_arg0(nid) + ");")
           return 1
@@ -16930,7 +16991,7 @@ class Compiler
         rt = infer_type(recv)
         if rt == "mutable_str"
           @needs_mutable_str = 1
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           arg_id = @nd_arguments[nid]
           if arg_id >= 0
             argl = parse_id_list(@nd_args[arg_id])
@@ -16952,7 +17013,7 @@ class Compiler
         end
         if rt == "string"
           @needs_string_helpers = 1
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           val = compile_arg0(nid)
           # If receiver is a local variable, reassign
           if @nd_type[recv] == "LocalVariableReadNode"
@@ -16972,22 +17033,22 @@ class Compiler
       if recv >= 0
         rt = infer_type(recv)
         if rt == "int_array"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           emit("  sp_IntArray_push(" + rc + ", " + compile_arg0(nid) + ");")
           return 1
         end
         if rt == "str_array"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           emit("  sp_StrArray_push(" + rc + ", " + compile_arg0(nid) + ");")
           return 1
         end
         if rt == "float_array"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           emit("  sp_FloatArray_push(" + rc + ", " + compile_arg0(nid) + ");")
           return 1
         end
         if is_ptr_array_type(rt) == 1
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           emit("  sp_PtrArray_push(" + rc + ", " + compile_arg0(nid) + ");")
           return 1
         end
@@ -16999,12 +17060,12 @@ class Compiler
       if recv >= 0
         rt = infer_type(recv)
         if rt == "str_int_hash"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           emit("  sp_StrIntHash_update(" + rc + ", " + compile_arg0(nid) + ");")
           return 1
         end
         if rt == "str_str_hash"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           emit("  sp_StrStrHash_update(" + rc + ", " + compile_arg0(nid) + ");")
           return 1
         end
@@ -17016,7 +17077,7 @@ class Compiler
       if recv >= 0
         rt = infer_type(recv)
         if rt == "int_array" || rt == "str_array" || rt == "float_array" || rt == "sym_array"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           arg = compile_arg0(nid)
           pfx = array_c_prefix(rt)
           tmp = new_temp
@@ -17026,7 +17087,7 @@ class Compiler
         end
         if rt == "mutable_str"
           @needs_mutable_str = 1
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           args_id = @nd_arguments[nid]
           if args_id >= 0
             aargs = get_args(args_id)
@@ -17046,7 +17107,7 @@ class Compiler
       if recv >= 0
         rt = infer_type(recv)
         if rt == "mutable_str"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           val = compile_arg0(nid)
           emit("  " + rc + "->len = 0; " + rc + "->data[0] = 0; sp_String_append(" + rc + ", " + val + ");")
           return 1
@@ -17071,7 +17132,7 @@ class Compiler
         rt = infer_type(recv)
         if rt == "mutable_str"
           @needs_mutable_str = 1
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           val = compile_arg0(nid)
           emit("  sp_String_prepend(" + rc + ", " + val + ");")
           return 1
@@ -17084,7 +17145,7 @@ class Compiler
       if recv >= 0
         rt = infer_type(recv)
         if rt == "mutable_str"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           emit("  " + rc + "->len = 0; " + rc + "->data[0] = 0;")
           return 1
         end
@@ -17105,7 +17166,7 @@ class Compiler
     if mname == "push"
       if recv >= 0
         rt = infer_type(recv)
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         if rt == "int_array"
           av = compile_arg0(nid)
           # If pushing a lambda value, cast to mrb_int
@@ -17136,7 +17197,7 @@ class Compiler
     if mname == "reverse!"
       if recv >= 0
         rt = infer_type(recv)
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         if rt == "int_array"
           emit("  sp_IntArray_reverse_bang(" + rc + ");")
           return 1
@@ -17146,7 +17207,7 @@ class Compiler
     if mname == "sort!"
       if recv >= 0
         rt = infer_type(recv)
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         if rt == "sym_array"
           emit("  sp_sym_array_sort(" + rc + ");")
           return 1
@@ -17198,7 +17259,7 @@ class Compiler
       if @nd_block[nid] >= 0 && recv >= 0
         rt = infer_type(recv)
         if rt == "string" || rt == "mutable_str"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           bp = get_block_param(nid, 0)
           if bp == ""
             bp = "_c"
@@ -17227,7 +17288,7 @@ class Compiler
       if @nd_block[nid] >= 0 && recv >= 0
         rt = infer_type(recv)
         if rt == "string" || rt == "mutable_str"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           bp = get_block_param(nid, 0)
           if bp == ""
             bp = "_b"
@@ -17255,7 +17316,7 @@ class Compiler
       if @nd_block[nid] >= 0 && recv >= 0
         rt = infer_type(recv)
         if rt == "string" || rt == "mutable_str"
-          rc = compile_expr(recv)
+          rc = compile_expr_gc_rooted(recv)
           bp = get_block_param(nid, 0)
           if bp == ""
             bp = "_l"
@@ -17299,7 +17360,7 @@ class Compiler
         old = @in_loop
         @in_loop = 1
         rt = infer_type(recv)
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         arg = compile_arg0(nid)
         bp1 = get_block_param(nid, 0)
         bp2 = get_block_param(nid, 1)
@@ -17327,7 +17388,7 @@ class Compiler
       if @nd_block[nid] >= 0 && recv >= 0
         old = @in_loop
         @in_loop = 1
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         args_id = @nd_arguments[nid]
         limit_val = "0"
         step_val = "1"
@@ -17359,7 +17420,7 @@ class Compiler
         old = @in_loop
         @in_loop = 1
         rt = infer_type(recv)
-        rc = compile_expr(recv)
+        rc = compile_expr_gc_rooted(recv)
         n = compile_arg0(nid)
         bp1 = get_block_param(nid, 0)
         if bp1 == ""
@@ -17392,7 +17453,7 @@ class Compiler
               ridx = find_regexp_index(argl[0])
               if ridx >= 0
                 @needs_str_array = 1
-                rc = compile_expr(recv)
+                rc = compile_expr_gc_rooted(recv)
                 bp = get_block_param(nid, 0)
                 if bp == ""
                   bp = "_m"
@@ -17609,7 +17670,7 @@ class Compiler
           bname = mname[0, mname.length - 1]
           rt = infer_type(recv)
           if is_obj_type(rt) == 1
-            rc = compile_expr(recv)
+            rc = compile_expr_gc_rooted(recv)
             arrow2 = "->"
             if is_value_type_obj(rt) == 1
               arrow2 = "."
@@ -18610,7 +18671,7 @@ class Compiler
   def compile_bracket_assign(nid)
     recv = @nd_receiver[nid]
     rt = infer_type(recv)
-    rc = compile_expr(recv)
+    rc = compile_expr_gc_rooted(recv)
     args_id = @nd_arguments[nid]
     arg_ids = []
     if args_id >= 0
@@ -18923,7 +18984,7 @@ class Compiler
     old = @in_loop
     @in_loop = 1
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     n = compile_arg0(nid)
     bp1 = get_block_param(nid, 0)
     if bp1 == ""
@@ -18951,7 +19012,7 @@ class Compiler
     old = @in_loop
     @in_loop = 1
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     n = compile_arg0(nid)
     bp1 = get_block_param(nid, 0)
     if bp1 == ""
@@ -18979,7 +19040,7 @@ class Compiler
     old = @in_loop
     @in_loop = 1
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     obj_arg = compile_arg0(nid)
     bp1 = get_block_param(nid, 0)
     bp2 = get_block_param(nid, 1)
@@ -19007,7 +19068,7 @@ class Compiler
     old = @in_loop
     @in_loop = 1
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp1 = get_block_param(nid, 0)
     bp2 = get_block_param(nid, 1)
     if bp1 == ""
@@ -19032,7 +19093,7 @@ class Compiler
     old = @in_loop
     @in_loop = 1
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp1 = get_block_param(nid, 0)
     bp2 = get_block_param(nid, 1)
     has_bp = 1
@@ -19175,7 +19236,7 @@ class Compiler
   def compile_times_block(nid)
     old = @in_loop
     @in_loop = 1
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp1 = get_block_param(nid, 0)
     tmp = new_temp
     emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < " + rc + "; " + tmp + "++) {")
@@ -19192,7 +19253,7 @@ class Compiler
   def compile_upto_block(nid)
     old = @in_loop
     @in_loop = 1
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     lim = compile_arg0(nid)
     bp1 = get_block_param(nid, 0)
     tmp = new_temp
@@ -19210,7 +19271,7 @@ class Compiler
   def compile_downto_block(nid)
     old = @in_loop
     @in_loop = 1
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     lim = compile_arg0(nid)
     bp1 = get_block_param(nid, 0)
     tmp = new_temp
@@ -19228,7 +19289,7 @@ class Compiler
   def compile_tap_expr(nid)
     # Execute block with receiver bound to block param, return receiver
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp = get_block_param(nid, 0)
     if bp == ""
       bp = "_x"
@@ -19253,7 +19314,7 @@ class Compiler
   def compile_then_expr(nid)
     # Execute block with receiver bound to block param, return block result
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp = get_block_param(nid, 0)
     if bp == ""
       bp = "_x"
@@ -19715,7 +19776,7 @@ class Compiler
   def compile_flat_map_expr(nid)
     # flat_map: for each element, block returns an array; concat all results
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp1 = get_block_param(nid, 0)
     if bp1 == ""
       bp1 = "_x"
@@ -19949,7 +20010,7 @@ class Compiler
 
   def compile_select_expr(nid)
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp1 = get_block_param(nid, 0)
     if bp1 == ""
       bp1 = "_x"
@@ -19993,7 +20054,7 @@ class Compiler
   end
 
   def compile_reduce_block(nid)
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     init_val = compile_arg0(nid)
     bp1 = get_block_param(nid, 0)
     bp2 = get_block_param(nid, 1)
@@ -20027,7 +20088,7 @@ class Compiler
   end
 
   def compile_reject_expr(nid)
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp1 = get_block_param(nid, 0)
     if bp1 == ""
       bp1 = "_x"
@@ -20061,7 +20122,7 @@ class Compiler
   end
 
   def compile_reject_block(nid)
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp1 = get_block_param(nid, 0)
     if bp1 == ""
       bp1 = "_x"
@@ -20698,7 +20759,7 @@ class Compiler
     end
 
     recv = @nd_receiver[nid]
-    rc = compile_expr(recv)
+    rc = compile_expr_gc_rooted(recv)
 
     bodies = @cls_meth_bodies[cci].split(";")
     bid = -1
@@ -20921,7 +20982,7 @@ class Compiler
       return
     end
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp1 = get_block_param(nid, 0)
     if bp1 == ""
       bp1 = "_x"
@@ -20978,7 +21039,7 @@ class Compiler
     old = @in_loop
     @in_loop = 1
     rt = infer_type(@nd_receiver[nid])
-    rc = compile_expr(@nd_receiver[nid])
+    rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp1 = get_block_param(nid, 0)
     if bp1 == ""
       bp1 = "_x"
