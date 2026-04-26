@@ -11112,6 +11112,19 @@ class Compiler
     0
   end
 
+  # Compile a node for use as a C scalar condition. Value-type objects
+  # are passed by value (a struct), and C rejects them as scalars in
+  # `if (...)` etc. In Ruby every non-nil/non-false object is truthy,
+  # so wrap the expression in a comma operator that evaluates it for
+  # side effects then yields 1.
+  def compile_cond_expr(nid)
+    expr = compile_expr(nid)
+    if nid >= 0 && is_value_type_obj(infer_type(nid)) == 1
+      return "((" + expr + "), 1)"
+    end
+    expr
+  end
+
   # ---- Expression compiler ----
   def compile_expr(nid)
     if nid < 0
@@ -15896,7 +15909,7 @@ class Compiler
   end
 
   def compile_if_expr(nid)
-    cond = compile_expr(@nd_predicate[nid])
+    cond = compile_cond_expr(@nd_predicate[nid])
     then_val = "0"
     body = @nd_body[nid]
     if body >= 0
@@ -15924,7 +15937,7 @@ class Compiler
   end
 
   def compile_unless_expr(nid)
-    cond = compile_expr(@nd_predicate[nid])
+    cond = compile_cond_expr(@nd_predicate[nid])
     then_val = "0"
     body = @nd_body[nid]
     if body >= 0
@@ -16513,7 +16526,7 @@ class Compiler
   end
 
   def compile_if_stmt(nid)
-    cond = compile_expr(@nd_predicate[nid])
+    cond = compile_cond_expr(@nd_predicate[nid])
     emit("  if (" + cond + ") {")
     @indent = @indent + 1
     compile_stmts_body(@nd_body[nid])
@@ -16535,7 +16548,7 @@ class Compiler
   end
 
   def compile_unless_stmt(nid)
-    cond = compile_expr(@nd_predicate[nid])
+    cond = compile_cond_expr(@nd_predicate[nid])
     emit("  if (!(" + cond + ")) {")
     @indent = @indent + 1
     compile_stmts_body(@nd_body[nid])
@@ -16772,7 +16785,7 @@ class Compiler
         @hoisted_strlen_var = len_tmp
       end
     end
-    cond = compile_expr(@nd_predicate[nid])
+    cond = compile_cond_expr(@nd_predicate[nid])
     emit("  while (" + cond + ") {")
     @indent = @indent + 1
     compile_stmts_body(@nd_body[nid])
@@ -16786,7 +16799,7 @@ class Compiler
   def compile_until_stmt(nid)
     old = @in_loop
     @in_loop = 1
-    cond = compile_expr(@nd_predicate[nid])
+    cond = compile_cond_expr(@nd_predicate[nid])
     emit("  while (!(" + cond + ")) {")
     @indent = @indent + 1
     compile_stmts_body(@nd_body[nid])
@@ -21761,7 +21774,7 @@ class Compiler
   end
 
   def compile_if_return(nid, rt)
-    cond = compile_expr(@nd_predicate[nid])
+    cond = compile_cond_expr(@nd_predicate[nid])
     emit("  if (" + cond + ") {")
     @indent = @indent + 1
     body = @nd_body[nid]
