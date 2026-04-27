@@ -15707,18 +15707,13 @@ class Compiler
         rt = cls_method_return(ci, mname)
         if common == ""
           common = rt
-        else
-          if common != rt
-            return "poly"
-          end
+        elsif common != rt
+          return "poly"
         end
       end
       ci = ci + 1
     end
-    if common == ""
-      return "int"
-    end
-    common
+    common == "" ? "int" : common
   end
 
   def compile_poly_method_call(nid, rc, mname)
@@ -15734,10 +15729,7 @@ class Compiler
     # disagree on that type, the result is sp_RbVal and each branch
     # boxes its concrete return value.
     ret_type = poly_dispatch_return_type(mname)
-    is_poly_ret = 0
-    if ret_type == "poly"
-      is_poly_ret = 1
-    end
+    is_poly_ret = ret_type == "poly" ? 1 : 0
     ret_ct = c_type(ret_type)
     ret_def = c_default_val(ret_type)
     # Stash the receiver in a temp so we don't re-evaluate the
