@@ -8345,43 +8345,6 @@ class Compiler
     1
   end
 
-  def emit_string_helpers
-    emit_raw("static const char*sp_str_concat(const char*a,const char*b){size_t la=strlen(a),lb=strlen(b);char*r=(char*)malloc(la+lb+1);memcpy(r,a,la);memcpy(r+la,b,lb+1);return r;}")
-    emit_raw("static const char*sp_int_to_s(mrb_int n){char*b=(char*)malloc(32);snprintf(b,32,\"%lld\",(long long)n);return b;}")
-    emit_raw("static const char*sp_float_to_s(mrb_float f){char*b=(char*)malloc(64);snprintf(b,64,\"%g\",f);return b;}")
-    emit_raw("static const char*sp_str_upcase(const char*s){size_t l=strlen(s);char*r=(char*)malloc(l+1);for(size_t i=0;i<=l;i++)r[i]=toupper((unsigned char)s[i]);return r;}")
-    emit_raw("static const char*sp_str_downcase(const char*s){size_t l=strlen(s);char*r=(char*)malloc(l+1);for(size_t i=0;i<=l;i++)r[i]=tolower((unsigned char)s[i]);return r;}")
-    emit_raw("static const char*sp_str_strip(const char*s){while(*s&&isspace((unsigned char)*s))s++;size_t l=strlen(s);while(l>0&&isspace((unsigned char)s[l-1]))l--;char*r=(char*)malloc(l+1);memcpy(r,s,l);r[l]=0;return r;}")
-    emit_raw("static const char*sp_str_chomp(const char*s){size_t l=strlen(s);while(l>0&&(s[l-1]=='" + bsl_n + "'||s[l-1]=='" + bsl + "r'))l--;char*r=(char*)malloc(l+1);memcpy(r,s,l);r[l]=0;return r;}")
-    emit_raw("static mrb_bool sp_str_include(const char*s,const char*sub){return strstr(s,sub)!=NULL;}")
-    emit_raw("static mrb_bool sp_str_start_with(const char*s,const char*p){return strncmp(s,p,strlen(p))==0;}")
-    emit_raw("static mrb_bool sp_str_end_with(const char*s,const char*suf){size_t ls=strlen(s),lsuf=strlen(suf);if(lsuf>ls)return FALSE;return strcmp(s+ls-lsuf,suf)==0;}")
-    emit_raw("static sp_StrArray*sp_str_split(const char*s,const char*sep){sp_StrArray*a=sp_StrArray_new();if(*s==0)return a;size_t sl=strlen(sep);if(sl==0){for(size_t i=0;s[i];i++){char*c=(char*)malloc(2);c[0]=s[i];c[1]=0;sp_StrArray_push(a,c);}return a;}const char*p=s;while(1){const char*f=strstr(p,sep);if(!f){char*r=(char*)malloc(strlen(p)+1);strcpy(r,p);sp_StrArray_push(a,r);break;}size_t n=f-p;char*r=(char*)malloc(n+1);memcpy(r,p,n);r[n]=0;sp_StrArray_push(a,r);p=f+sl;}return a;}")
-    emit_raw("static const char*sp_str_gsub(const char*s,const char*pat,const char*rep){size_t pl=strlen(pat),rl=strlen(rep),sl=strlen(s);if(pl==0)return s;size_t cap=sl*2+1;char*out=(char*)malloc(cap);size_t ol=0;const char*p=s;while(*p){const char*f=strstr(p,pat);if(!f){size_t n=strlen(p);if(ol+n>=cap){cap=(ol+n)*2+1;out=(char*)realloc(out,cap);}memcpy(out+ol,p,n);ol+=n;break;}size_t n=f-p;if(ol+n+rl>=cap){cap=(ol+n+rl)*2+1;out=(char*)realloc(out,cap);}memcpy(out+ol,p,n);ol+=n;memcpy(out+ol,rep,rl);ol+=rl;p=f+pl;}out[ol]=0;return out;}")
-    emit_raw("static mrb_int sp_str_index(const char*s,const char*sub){const char*f=strstr(s,sub);if(!f)return -1;return(mrb_int)(f-s);}")
-    emit_raw("static const char*sp_str_sub_range(const char*s,mrb_int start,mrb_int len){mrb_int sl=(mrb_int)strlen(s);if(start<0)start+=sl;if(start<0)start=0;if(start>=sl)return\"\";if(len<0)len=0;if(start+len>sl)len=sl-start;char*r=(char*)malloc(len+1);memcpy(r,s+start,len);r[len]=0;return r;}")
-    emit_raw("static const char*sp_sprintf(const char*fmt,...){char*b=(char*)malloc(4096);va_list ap;va_start(ap,fmt);vsnprintf(b,4096,fmt,ap);va_end(ap);return b;}")
-    emit_raw("static const char*sp_str_reverse(const char*s){size_t l=strlen(s);char*r=(char*)malloc(l+1);for(size_t i=0;i<l;i++)r[i]=s[l-1-i];r[l]=0;return r;}")
-    emit_raw("static const char*sp_str_sub(const char*s,const char*pat,const char*rep){const char*f=strstr(s,pat);if(!f)return s;size_t pl=strlen(pat),rl=strlen(rep),sl=strlen(s);char*r=(char*)malloc(sl-pl+rl+1);size_t n=f-s;memcpy(r,s,n);memcpy(r+n,rep,rl);memcpy(r+n+rl,f+pl,sl-n-pl+1);return r;}")
-    emit_raw("static const char*sp_str_capitalize(const char*s){size_t l=strlen(s);char*r=(char*)malloc(l+1);for(size_t i=0;i<=l;i++)r[i]=tolower((unsigned char)s[i]);if(l>0)r[0]=toupper((unsigned char)r[0]);return r;}")
-    emit_raw("static mrb_int sp_str_count(const char*s,const char*chars){mrb_int c=0;for(size_t i=0;s[i];i++){for(size_t j=0;chars[j];j++){if(s[i]==chars[j]){c++;break;}}}return c;}")
-    emit_raw("static const char*sp_str_repeat(const char*s,mrb_int n){if(n<=0)return\"\";size_t l=strlen(s);char*r=(char*)malloc(l*n+1);for(mrb_int i=0;i<n;i++)memcpy(r+l*i,s,l);r[l*n]=0;return r;}")
-    emit_raw("static sp_IntArray*sp_str_bytes(const char*s){sp_IntArray*a=sp_IntArray_new();for(size_t i=0;s[i];i++)sp_IntArray_push(a,(mrb_int)(unsigned char)s[i]);return a;}")
-    emit_raw("static const char*sp_str_tr(const char*s,const char*from,const char*to){size_t l=strlen(s),fl=strlen(from),tl=strlen(to);char*r=(char*)malloc(l+1);for(size_t i=0;i<l;i++){r[i]=s[i];for(size_t j=0;j<fl;j++){if(s[i]==from[j]){if(j<tl)r[i]=to[j];else if(tl>0)r[i]=to[tl-1];break;}}}r[l]=0;return r;}")
-    emit_raw("static const char*sp_str_delete(const char*s,const char*chars){size_t l=strlen(s);char*r=(char*)malloc(l+1);size_t n=0;for(size_t i=0;i<l;i++){int found=0;for(size_t j=0;chars[j];j++){if(s[i]==chars[j]){found=1;break;}}if(!found)r[n++]=s[i];}r[n]=0;return r;}")
-    emit_raw("static const char*sp_str_squeeze(const char*s){size_t l=strlen(s);char*r=(char*)malloc(l+1);size_t n=0;for(size_t i=0;i<l;i++){if(i==0||s[i]!=s[i-1])r[n++]=s[i];}r[n]=0;return r;}")
-    emit_raw("static const char*sp_str_ljust(const char*s,mrb_int w){size_t l=strlen(s);if((mrb_int)l>=w)return s;char*r=(char*)malloc(w+1);memcpy(r,s,l);memset(r+l,' ',w-l);r[w]=0;return r;}")
-    emit_raw("static const char*sp_str_rjust(const char*s,mrb_int w){size_t l=strlen(s);if((mrb_int)l>=w)return s;char*r=(char*)malloc(w+1);memset(r,' ',w-l);memcpy(r+w-l,s,l+1);return r;}")
-    emit_raw("static const char*sp_str_center(const char*s,mrb_int w){size_t l=strlen(s);if((mrb_int)l>=w)return s;mrb_int pad=w-l;mrb_int left=pad/2;mrb_int right=pad-left;char*r=(char*)malloc(w+1);memset(r,' ',left);memcpy(r+left,s,l);memset(r+left+l,' ',right);r[w]=0;return r;}")
-    emit_raw("static const char*sp_str_ljust2(const char*s,mrb_int w,const char*pad){size_t l=strlen(s);if((mrb_int)l>=w)return s;size_t pl=strlen(pad);if(pl==0)return s;char*r=(char*)malloc(w+1);memcpy(r,s,l);for(mrb_int i=l;i<w;i++)r[i]=pad[(i-l)%pl];r[w]=0;return r;}")
-    emit_raw("static const char*sp_str_rjust2(const char*s,mrb_int w,const char*pad){size_t l=strlen(s);if((mrb_int)l>=w)return s;size_t pl=strlen(pad);if(pl==0)return s;mrb_int np=w-(mrb_int)l;char*r=(char*)malloc(w+1);for(mrb_int i=0;i<np;i++)r[i]=pad[i%pl];memcpy(r+np,s,l+1);return r;}")
-    emit_raw("static const char*sp_str_center2(const char*s,mrb_int w,const char*pad){size_t l=strlen(s);if((mrb_int)l>=w)return s;size_t pl=strlen(pad);if(pl==0)return s;mrb_int pd=w-(mrb_int)l;mrb_int left=pd/2;mrb_int right=pd-left;char*r=(char*)malloc(w+1);for(mrb_int i=0;i<left;i++)r[i]=pad[i%pl];memcpy(r+left,s,l);for(mrb_int i=0;i<right;i++)r[left+l+i]=pad[i%pl];r[w]=0;return r;}")
-    emit_raw("static const char*sp_str_lstrip(const char*s){while(*s&&isspace((unsigned char)*s))s++;char*r=(char*)malloc(strlen(s)+1);strcpy(r,s);return r;}")
-    emit_raw("static const char*sp_str_rstrip(const char*s){size_t l=strlen(s);while(l>0&&isspace((unsigned char)s[l-1]))l--;char*r=(char*)malloc(l+1);memcpy(r,s,l);r[l]=0;return r;}")
-    emit_raw("static const char*sp_str_dup(const char*s){char*r=(char*)malloc(strlen(s)+1);strcpy(r,s);return r;}")
-    emit_raw("")
-  end
-
   def emit_mutable_str_runtime
     emit_raw("typedef struct{char*data;int64_t len;int64_t cap;}sp_String;")
     emit_raw("static void sp_String_fin(void*p){free(((sp_String*)p)->data);}")
