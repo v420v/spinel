@@ -2407,6 +2407,18 @@ class Compiler
           return "string"
         end
         if rt == "int_array"
+          # a[range] / a[start, len] returns a slice (still int_array);
+          # bare a[i] returns the element.
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            a = get_args(args_id)
+            if a.length >= 1 && @nd_type[a[0]] == "RangeNode"
+              return "int_array"
+            end
+            if a.length >= 2
+              return "int_array"
+            end
+          end
           return "int"
         end
         if rt == "sym_array"
@@ -14399,6 +14411,20 @@ class Compiler
         return "sp_IntArray_length(" + rc + ")"
       end
       if mname == "[]"
+        # a[range] and a[start, len] return slices; bare a[i] stays a get.
+        # Mirrors compile_string_method_expr's slicing dispatch.
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          a = get_args(args_id)
+          if a.length >= 1 && @nd_type[a[0]] == "RangeNode"
+            left = compile_expr(@nd_left[a[0]])
+            right = compile_expr(@nd_right[a[0]])
+            return "sp_IntArray_slice(" + rc + ", " + left + ", " + right + " - " + left + " + 1)"
+          end
+          if a.length >= 2
+            return "sp_IntArray_slice(" + rc + ", " + compile_expr(a[0]) + ", " + compile_expr(a[1]) + ")"
+          end
+        end
         return "sp_IntArray_get(" + rc + ", " + compile_arg0(nid) + ")"
       end
       if mname == "push"
