@@ -17541,10 +17541,8 @@ class Compiler
         val = compile_expr(@nd_expression[nid])
         emit("  " + vref + " = " + val + ";")
       end
-      if rhs_t != "nil" || is_nullable_type(vt) == 0
-        if is_nullable_type(vt) == 0
-          set_var_type(lname, rhs_t)
-        end
+      if is_nullable_type(vt) == 0
+        set_var_type(lname, rhs_t)
       end
       return
     end
