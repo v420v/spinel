@@ -18734,7 +18734,7 @@ class Compiler
     if mname == "concat"
       if recv >= 0
         rt = infer_type(recv)
-        if is_array_type(rt) == 1
+        if is_array_type(rt) == 1 || is_ptr_array_type(rt) == 1
           rc = compile_expr_gc_rooted(recv)
           arg = compile_arg0(nid)
           pfx = array_c_prefix(rt)
