@@ -21,7 +21,25 @@ class Builder
       B.new
     end
   end
+
+  def make_with_return(flag)
+    if flag == 0
+      return A.new
+    end
+    return B.new
+  end
 end
 
-obj = Builder.new.make(0)
-puts obj.read(41)
+b = Builder.new
+
+obj0 = b.make(0)
+puts obj0.read(41)
+
+obj1 = b.make(1)
+puts obj1.read(41)
+
+ret0 = b.make_with_return(0)
+puts ret0.read(41)
+
+ret1 = b.make_with_return(1)
+puts ret1.read(41)
