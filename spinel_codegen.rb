@@ -17295,7 +17295,12 @@ class Compiler
     if pred_type == "string"
       emit("  const char *" + tmp + " = " + pred_val + ";")
     else
-      emit("  mrb_int " + tmp + " = " + pred_val + ";")
+      if is_obj_type(pred_type) == 1
+        obj_cname = pred_type[4, pred_type.length - 4]
+        emit("  sp_" + obj_cname + " *" + tmp + " = " + pred_val + ";")
+      else
+        emit("  mrb_int " + tmp + " = " + pred_val + ";")
+      end
     end
     conds = parse_id_list(@nd_conditions[nid])
     k = 0
@@ -17371,10 +17376,24 @@ class Compiler
         cmp = range_excl_end(cid) == 1 ? "<" : "<="
         result = result + "(" + tmp + " >= " + left + " && " + tmp + " " + cmp + " " + right + ")"
       else
-        if pred_type == "string"
-          result = result + "strcmp(" + tmp + ", " + compile_expr(cid) + ") == 0"
+        if is_obj_type(pred_type) == 1 && @nd_type[cid] == "ConstantReadNode"
+          cname = @nd_name[cid]
+          if find_class_idx(cname) >= 0
+            pred_cname = pred_type[4, pred_type.length - 4]
+            if is_class_or_ancestor(pred_cname, cname) == 1
+              result = result + "1"
+            else
+              result = result + "0"
+            end
+          else
+            result = result + "0"
+          end
         else
-          result = result + tmp + " == " + compile_expr(cid)
+          if pred_type == "string"
+            result = result + "strcmp(" + tmp + ", " + compile_expr(cid) + ") == 0"
+          else
+            result = result + tmp + " == " + compile_expr(cid)
+          end
         end
       end
       k = k + 1
@@ -22467,7 +22486,12 @@ class Compiler
       if pred_type == "string"
         emit("  const char *" + tmp + " = " + pred_val + ";")
       else
-        emit("  mrb_int " + tmp + " = " + pred_val + ";")
+        if is_obj_type(pred_type) == 1
+          obj_cname = pred_type[4, pred_type.length - 4]
+          emit("  sp_" + obj_cname + " *" + tmp + " = " + pred_val + ";")
+        else
+          emit("  mrb_int " + tmp + " = " + pred_val + ";")
+        end
       end
       conds = parse_id_list(@nd_conditions[nid])
       k = 0
