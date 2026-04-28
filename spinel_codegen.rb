@@ -16151,9 +16151,9 @@ class Compiler
       end
     end
 
-    # Math
-    if @nd_type[recv] == "ConstantReadNode"
-      rcname = @nd_name[recv]
+    rcname = constructor_class_name(recv)
+    if rcname != ""
+      # Math
       if rcname == "Math"
         if mname == "sqrt"
           return "sqrt(" + compile_arg0(nid) + ")"
