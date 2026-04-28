@@ -18078,11 +18078,7 @@ class Compiler
     pred_type = infer_type(pred)
     pred_val = compile_expr(pred)
     tmp = new_temp
-    if pred_type == "string"
-      emit("  const char *" + tmp + " = " + pred_val + ";")
-    else
-      emit("  mrb_int " + tmp + " = " + pred_val + ";")
-    end
+    emit("  " + c_type(pred_type) + " " + tmp + " = " + pred_val + ";")
     conds = parse_id_list(@nd_conditions[nid])
     k = 0
     while k < conds.length
@@ -18157,10 +18153,39 @@ class Compiler
         cmp = range_excl_end(cid) == 1 ? "<" : "<="
         result = result + "(" + tmp + " >= " + left + " && " + tmp + " " + cmp + " " + right + ")"
       else
-        if pred_type == "string"
-          result = result + "strcmp(" + tmp + ", " + compile_expr(cid) + ") == 0"
+        if is_obj_type(pred_type) == 1
+          if @nd_type[cid] == "ConstantReadNode"
+            cname = @nd_name[cid]
+            if find_class_idx(cname) >= 0
+              pred_cname = base_type(pred_type)
+              pred_cname = pred_cname[4, pred_cname.length - 4]
+              if is_class_or_ancestor(pred_cname, cname) == 1
+                if is_nullable_type(pred_type) == 1
+                  result = result + tmp + " != NULL"
+                else
+                  result = result + "1"
+                end
+              else
+                result = result + "0"
+              end
+            else
+              result = result + "0"
+            end
+          elsif @nd_type[cid] == "NilNode"
+            if is_nullable_type(pred_type) == 1
+              result = result + tmp + " == NULL"
+            else
+              result = result + "0"
+            end
+          else
+            result = result + "0"
+          end
         else
-          result = result + tmp + " == " + compile_expr(cid)
+          if pred_type == "string"
+            result = result + "strcmp(" + tmp + ", " + compile_expr(cid) + ") == 0"
+          else
+            result = result + tmp + " == " + compile_expr(cid)
+          end
         end
       end
       k = k + 1
