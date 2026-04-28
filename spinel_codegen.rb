@@ -18336,7 +18336,11 @@ class Compiler
                           if cname == "FalseClass"
                             result = result + "(" + tmp + ".tag == SP_TAG_BOOL && !" + tmp + ".v.b)"
                           else
-                            result = result + "0"
+                            if cname == "Array"
+                              result = result + "(" + tmp + ".tag == SP_TAG_OBJ && " + tmp + ".cls_id < 0)"
+                            else
+                              result = result + "0"
+                            end
                           end
                         end
                       end

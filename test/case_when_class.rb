@@ -177,3 +177,31 @@ when ["a", "b", ["x"]]        then puts "abx"
 when ["a", "b", ["x", "y"]]   then puts "abxy"
 else                                puts "other"
 end
+
+# ── Poly variable: when Array matches any array type ─────────────────────────
+
+# str_array matches Array
+arr_sa = Var.new
+arr_sa = ["a", "b"]
+case arr_sa
+when Var   then puts "var"
+when Array then puts "array"
+else            puts "other"
+end
+
+# poly_array matches Array
+arr_pa = Var.new
+arr_pa = ["a", 2]
+case arr_pa
+when Var   then puts "var"
+when Array then puts "array"
+else            puts "other"
+end
+
+# non-array does not match Array
+arr_no = Var.new
+arr_no = 42
+case arr_no
+when Array then puts "array"
+else            puts "other"
+end
