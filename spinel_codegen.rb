@@ -16889,13 +16889,11 @@ class Compiler
       return
     end
     if is_ptr_array_type(src_t) == 1
-      @needs_ptr_array = 1
       i = new_temp
       emit("  for (mrb_int " + i + " = 0; " + i + " < sp_PtrArray_length(" + src_v + "); " + i + "++) sp_IntArray_push(" + dst + ", (mrb_int)(intptr_t)sp_PtrArray_get(" + src_v + ", " + i + "));")
       return
     end
     if src_t == "poly_array"
-      @needs_poly_array = 1
       i = new_temp
       emit("  for (mrb_int " + i + " = 0; " + i + " < sp_PolyArray_length(" + src_v + "); " + i + "++) sp_IntArray_push(" + dst + ", sp_PolyArray_get(" + src_v + ", " + i + ").v.i);")
       return
