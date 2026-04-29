@@ -12749,6 +12749,13 @@ class Compiler
         ptmp = new_temp
         if pred_type == "string"
           emit("  const char *" + ptmp + " = " + pred_val + ";")
+        elsif is_obj_type(pred_type) == 1
+          # See compile_case_stmt — the temp must be the right pointer
+          # type so compile_when_conds can resolve `when ClassName` to
+          # a static match. Issue #67.
+          bt = base_type(pred_type)
+          obj_cname = bt[4, bt.length - 4]
+          emit("  sp_" + obj_cname + " *" + ptmp + " = " + pred_val + ";")
         else
           emit("  mrb_int " + ptmp + " = " + pred_val + ";")
         end
@@ -19411,6 +19418,14 @@ class Compiler
     tmp = new_temp
     if pred_type == "string"
       emit("  const char *" + tmp + " = " + pred_val + ";")
+    elsif is_obj_type(pred_type) == 1
+      # `case obj when ClassName` — keep the temp as the right pointer
+      # type so the when arms can read its NULLability and the static
+      # class match in compile_when_conds picks the matching cls_id
+      # path. Issue #67.
+      bt = base_type(pred_type)
+      obj_cname = bt[4, bt.length - 4]
+      emit("  sp_" + obj_cname + " *" + tmp + " = " + pred_val + ";")
     else
       emit("  mrb_int " + tmp + " = " + pred_val + ";")
     end
@@ -19487,6 +19502,34 @@ class Compiler
         right = compile_expr(@nd_right[cid])
         cmp = range_excl_end(cid) == 1 ? "<" : "<="
         result = result + "(" + tmp + " >= " + left + " && " + tmp + " " + cmp + " " + right + ")"
+      elsif is_obj_type(pred_type) == 1 && @nd_type[cid] == "ConstantReadNode"
+        # `case obj when ClassName` — resolve statically against the
+        # predicate's known class. Predicate type `obj_X`:
+        #   when X (or any ancestor of X)  → match (with a NULL guard
+        #                                    when the predicate is
+        #                                    nullable, since `nil` is
+        #                                    not a class instance)
+        #   when anything else             → no match
+        # Subclass matching across an `obj_<Parent>` predicate that
+        # actually carries an `obj_<Child>` instance needs a runtime
+        # cls_id check; that's a separate enhancement (issue #67 only
+        # covers the static-class form of the bug).
+        cname = @nd_name[cid]
+        if find_class_idx(cname) >= 0
+          bt = base_type(pred_type)
+          pred_cname = bt[4, bt.length - 4]
+          if is_class_or_ancestor(pred_cname, cname) == 1
+            if is_nullable_type(pred_type) == 1
+              result = result + tmp + " != NULL"
+            else
+              result = result + "1"
+            end
+          else
+            result = result + "0"
+          end
+        else
+          result = result + "0"
+        end
       else
         if pred_type == "string"
           result = result + "strcmp(" + tmp + ", " + compile_expr(cid) + ") == 0"
