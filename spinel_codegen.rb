@@ -11027,11 +11027,9 @@ class Compiler
       j = j + 1
     end
     if has_gc_locals == 1
-      if @needs_gc == 1
-        if @in_gc_scope == 0
-          emit("  SP_GC_SAVE();")
-          @in_gc_scope = 1
-        end
+      if @needs_gc == 1 && @in_gc_scope == 0
+        emit("  SP_GC_SAVE();")
+        @in_gc_scope = 1
       end
     end
     j = 0
