@@ -2025,7 +2025,9 @@ class Compiler
       return "int"
     end
     if mname == "then" || mname == "yield_self"
-      # Return type is the block's return type
+      # Return type is the block's return type. Bind the block param to
+      # the receiver's type so infer_type sees the inner shadow, not any
+      # outer same-named local of a different type.
       if recv >= 0
         blk = @nd_block[nid]
         if blk >= 0
@@ -2033,7 +2035,16 @@ class Compiler
           if bbody >= 0
             bbs = get_stmts(bbody)
             if bbs.length > 0
-              return infer_type(bbs.last)
+              bp = get_block_param(nid, 0)
+              if bp == ""
+                bp = "_x"
+              end
+              recv_t = infer_type(recv)
+              push_scope
+              declare_var(bp, recv_t)
+              rt = infer_type(bbs.last)
+              pop_scope
+              return rt
             end
           end
         end
@@ -2572,14 +2583,21 @@ class Compiler
     end
     if mname == "map"
       if recv >= 0
-        # Determine result array type from block return type
+        # Declare bp inside a scope so infer_type sees the inner element type, not a shadowed outer local.
         blk = @nd_block[nid]
         if blk >= 0
           bbody = @nd_body[blk]
           if bbody >= 0
             bbs = get_stmts(bbody)
             if bbs.length > 0
+              recv_t = infer_type(recv)
+              bp1 = get_block_param(nid, 0)
+              push_scope
+              if bp1 != ""
+                declare_var(bp1, iter_elem_type(recv_t))
+              end
               bret = infer_type(bbs.last)
+              pop_scope
               if bret == "string"
                 return "str_array"
               end
@@ -15395,7 +15413,6 @@ class Compiler
         bp1 = "_x"
       end
       et = elem_type_of_array(recv_type)
-      declare_var(bp1, et)
       tmp_t = new_temp
       tmp_f = new_temp
       tmp_res = new_temp
@@ -15403,7 +15420,9 @@ class Compiler
       emit("  " + c_type(recv_type) + " " + tmp_t + " = sp_" + pfx + "_new();")
       emit("  " + c_type(recv_type) + " " + tmp_f + " = sp_" + pfx + "_new();")
       emit("  for (mrb_int " + itmp + " = 0; " + itmp + " < sp_" + pfx + "_length(" + rc + "); " + itmp + "++) {")
-      emit("    lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + itmp + ");")
+      emit("    " + c_type(et) + " lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + itmp + ");")
+      push_scope
+      declare_var(bp1, et)
       blk = @nd_block[nid]
       bexpr = "0"
       if @nd_body[blk] >= 0
@@ -15418,6 +15437,7 @@ class Compiler
         end
       end
       emit("    if (" + bexpr + ") sp_" + pfx + "_push(" + tmp_t + ", lv_" + bp1 + "); else sp_" + pfx + "_push(" + tmp_f + ", lv_" + bp1 + ");")
+      pop_scope
       emit("  }")
       emit("  " + name + " *" + tmp_res + " = (" + name + " *)sp_gc_alloc(sizeof(" + name + "), NULL, " + tuple_scan_name(tt) + ");")
       emit("  " + tmp_res + "->_0 = " + tmp_t + ";")
@@ -16022,11 +16042,12 @@ class Compiler
         if @nd_block[nid] >= 0
           blk = @nd_block[nid]
           bp = get_block_param(nid, 0)
-          declare_var(bp, "int")
           tmp = new_temp
           emit("  sp_StrIntHash *" + tmp + " = sp_StrIntHash_new();")
           emit("  for (mrb_int _i = 0; _i < " + rc + "->len; _i++) {")
           emit("    mrb_int lv_" + bp + " = sp_StrIntHash_get(" + rc + ", " + rc + "->order[_i]);")
+          push_scope
+          declare_var(bp, "int")
           bbody = @nd_body[blk]
           bexpr = "0"
           if bbody >= 0
@@ -16036,6 +16057,7 @@ class Compiler
             end
           end
           emit("    sp_StrIntHash_set(" + tmp + ", " + rc + "->order[_i], " + bexpr + ");")
+          pop_scope
           emit("  }")
           return tmp
         end
@@ -19539,7 +19561,6 @@ class Compiler
           if bp == ""
             bp = "_c"
           end
-          declare_var(bp, "string")
           tmp = new_temp
           src = rc
           if rt == "mutable_str"
@@ -19554,9 +19575,12 @@ class Compiler
           emit("    char *" + char_buf + " = sp_str_alloc_raw(" + cn_tmp + " + 1);")
           emit("    memcpy(" + char_buf + ", " + src_tmp + " + " + tmp + ", " + cn_tmp + ");")
           emit("    " + char_buf + "[" + cn_tmp + "] = 0;")
-          emit("    lv_" + bp + " = " + char_buf + ";")
+          emit("    const char *lv_" + bp + " = " + char_buf + ";")
           @indent = @indent + 1
+          push_scope
+          declare_var(bp, "string")
           compile_stmts_body(@nd_body[@nd_block[nid]])
+          pop_scope
           @indent = @indent - 1
           emit("    " + tmp + " += " + cn_tmp + ";")
           emit("  }")
@@ -19574,7 +19598,6 @@ class Compiler
           if bp == ""
             bp = "_b"
           end
-          declare_var(bp, "int")
           tmp = new_temp
           src = rc
           if rt == "mutable_str"
@@ -19583,9 +19606,12 @@ class Compiler
           src_tmp = new_temp
           emit("  const char *" + src_tmp + " = " + src + ";")
           emit("  for (mrb_int " + tmp + " = 0; " + src_tmp + "[" + tmp + "]; " + tmp + "++) {")
-          emit("    lv_" + bp + " = (unsigned char)" + src_tmp + "[" + tmp + "];")
+          emit("    mrb_int lv_" + bp + " = (unsigned char)" + src_tmp + "[" + tmp + "];")
           @indent = @indent + 1
+          push_scope
+          declare_var(bp, "int")
           compile_stmts_body(@nd_body[@nd_block[nid]])
+          pop_scope
           @indent = @indent - 1
           emit("  }")
           return 1
@@ -19602,7 +19628,6 @@ class Compiler
           if bp == ""
             bp = "_l"
           end
-          declare_var(bp, "string")
           @needs_str_array = 1
           tmp_arr = new_temp
           tmp_i = new_temp
@@ -19612,9 +19637,12 @@ class Compiler
           end
           emit("  sp_StrArray *" + tmp_arr + " = sp_str_split(" + src + ", \"\\n\");")
           emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < " + tmp_arr + "->len; " + tmp_i + "++) {")
-          emit("    lv_" + bp + " = " + tmp_arr + "->data[" + tmp_i + "];")
+          emit("    const char *lv_" + bp + " = " + tmp_arr + "->data[" + tmp_i + "];")
           @indent = @indent + 1
+          push_scope
+          declare_var(bp, "string")
           compile_stmts_body(@nd_body[@nd_block[nid]])
+          pop_scope
           @indent = @indent - 1
           emit("  }")
           return 1
@@ -19652,13 +19680,18 @@ class Compiler
           bp2 = "_b"
         end
         pfx = array_c_prefix(rt)
-        et = c_type(elem_type_of_array(rt))
+        elem_t = elem_type_of_array(rt)
+        et = c_type(elem_t)
         tmp_i = new_temp
         emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_" + pfx + "_length(" + rc + "); " + tmp_i + "++) {")
         emit("    " + et + " lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + tmp_i + ");")
         emit("    " + et + " lv_" + bp2 + " = sp_" + pfx + "_get(" + arg + ", " + tmp_i + ");")
         @indent = @indent + 1
+        push_scope
+        declare_var(bp1, elem_t)
+        declare_var(bp2, elem_t)
         compile_stmts_body(@nd_body[@nd_block[nid]])
+        pop_scope
         @indent = @indent - 1
         emit("  }")
         @in_loop = old
@@ -19699,7 +19732,10 @@ class Compiler
         end
         emit("  for (lv_" + bp1 + " = " + rc + "; lv_" + bp1 + " <= " + limit_val + "; lv_" + bp1 + " += " + step_val + ") {")
         @indent = @indent + 1
+        push_scope
+        declare_var(bp1, "int")
         compile_stmts_body(@nd_body[@nd_block[nid]])
+        pop_scope
         @indent = @indent - 1
         emit("  }")
         if synth == 1
@@ -19722,13 +19758,17 @@ class Compiler
           bp1 = "_x"
         end
         pfx = array_c_prefix(rt)
+        et = elem_type_of_array(rt)
         tmp_c = new_temp
         tmp_i = new_temp
         emit("  for (mrb_int " + tmp_c + " = 0; " + tmp_c + " < " + n + "; " + tmp_c + "++)")
         emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_" + pfx + "_length(" + rc + "); " + tmp_i + "++) {")
-        emit("    lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + tmp_i + ");")
+        emit("    " + c_type(et) + " lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + tmp_i + ");")
         @indent = @indent + 1
+        push_scope
+        declare_var(bp1, et)
         compile_stmts_body(@nd_body[@nd_block[nid]])
+        pop_scope
         @indent = @indent - 1
         emit("  }")
         @in_loop = old
@@ -19757,12 +19797,14 @@ class Compiler
                 tmp_i = new_temp
                 emit("  sp_StrArray *" + tmp_arr + " = sp_re_scan(sp_re_pat_" + ridx.to_s + ", " + rc + ");")
                 emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < " + tmp_arr + "->len; " + tmp_i + "++) {")
-                set_var_type(bp, "string")
-                emit("    lv_" + bp + " = " + tmp_arr + "->data[" + tmp_i + "];")
+                emit("    const char *lv_" + bp + " = " + tmp_arr + "->data[" + tmp_i + "];")
+                push_scope
+                declare_var(bp, "string")
                 blk = @nd_block[nid]
                 if @nd_body[blk] >= 0
                   compile_stmts_body(@nd_body[blk])
                 end
+                pop_scope
                 emit("  }")
                 return 1
               end
@@ -20118,11 +20160,12 @@ class Compiler
               if @nd_block[nid] >= 0
                 lblk = @nd_block[nid]
                 lbp = get_block_param(nid, 0)
-                declare_var(lbp, "string")
                 ltmp = new_temp
                 emit("  { char " + ltmp + "[4096];")
                 emit("  while (fgets(" + ltmp + ", sizeof(" + ltmp + "), " + ftmp + ")) {")
                 emit("    const char *lv_" + lbp + " = " + ltmp + ";")
+                push_scope
+                declare_var(lbp, "string")
                 # Compile block body
                 lbbody = @nd_body[lblk]
                 if lbbody >= 0
@@ -20133,6 +20176,7 @@ class Compiler
                     lbk = lbk + 1
                   end
                 end
+                pop_scope
                 emit("  } }")
                 return
               end
@@ -21565,15 +21609,28 @@ class Compiler
     tmp_j = new_temp
     tmp_len = new_temp
     pfx = array_c_prefix(rt)
-    declare_var(bp1, rt)
     @needs_gc = 1
     emit("  mrb_int " + tmp_len + " = sp_" + pfx + "_length(" + rc + ");")
     emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < " + tmp_len + "; " + tmp_i + " += " + n + ") {")
-    emit("    lv_" + bp1 + " = sp_" + pfx + "_new();")
+    # When bp1 shadows an outer same-named local of a different C type, the
+    # function-level lv_<bp1> has the outer type. Emit a block-scoped fresh
+    # declaration with its own GC root so the slice survives allocations in
+    # the user block body.
+    outer_t = find_var_type(bp1)
+    if outer_t != "" && outer_t != rt
+      emit("    SP_GC_SAVE();")
+      emit("    " + c_type(rt) + " lv_" + bp1 + " = sp_" + pfx + "_new();")
+      emit("    SP_GC_ROOT(lv_" + bp1 + ");")
+    else
+      emit("    lv_" + bp1 + " = sp_" + pfx + "_new();")
+    end
     emit("    for (mrb_int " + tmp_j + " = 0; " + tmp_j + " < " + n + " && " + tmp_i + " + " + tmp_j + " < " + tmp_len + "; " + tmp_j + "++)")
     emit("      sp_" + pfx + "_push(lv_" + bp1 + ", sp_" + pfx + "_get(" + rc + ", " + tmp_i + " + " + tmp_j + "));")
     @indent = @indent + 1
+    push_scope
+    declare_var(bp1, rt)
     compile_stmts_body(@nd_body[@nd_block[nid]])
+    pop_scope
     @indent = @indent - 1
     emit("  }")
     @in_loop = old
@@ -21593,15 +21650,26 @@ class Compiler
     tmp_j = new_temp
     tmp_len = new_temp
     pfx = array_c_prefix(rt)
-    declare_var(bp1, rt)
     @needs_gc = 1
     emit("  mrb_int " + tmp_len + " = sp_" + pfx + "_length(" + rc + ");")
     emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " + " + n + " <= " + tmp_len + "; " + tmp_i + "++) {")
-    emit("    lv_" + bp1 + " = sp_" + pfx + "_new();")
+    # See compile_each_slice_block: shadow case needs a fresh typed slot with
+    # its own GC root.
+    outer_t = find_var_type(bp1)
+    if outer_t != "" && outer_t != rt
+      emit("    SP_GC_SAVE();")
+      emit("    " + c_type(rt) + " lv_" + bp1 + " = sp_" + pfx + "_new();")
+      emit("    SP_GC_ROOT(lv_" + bp1 + ");")
+    else
+      emit("    lv_" + bp1 + " = sp_" + pfx + "_new();")
+    end
     emit("    for (mrb_int " + tmp_j + " = 0; " + tmp_j + " < " + n + "; " + tmp_j + "++)")
     emit("      sp_" + pfx + "_push(lv_" + bp1 + ", sp_" + pfx + "_get(" + rc + ", " + tmp_i + " + " + tmp_j + "));")
     @indent = @indent + 1
+    push_scope
+    declare_var(bp1, rt)
     compile_stmts_body(@nd_body[@nd_block[nid]])
+    pop_scope
     @indent = @indent - 1
     emit("  }")
     @in_loop = old
@@ -21652,7 +21720,10 @@ class Compiler
       emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_" + pfx + "_length(" + rc + "); " + tmp_i + "++) {")
       emit("    " + c_type(elem_type_of_array(rt)) + " lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + tmp_i + ");")
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, elem_type_of_array(rt))
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
       emit("  " + result + " = lv_" + bp2 + ";")
@@ -21682,7 +21753,11 @@ class Compiler
     emit("    " + c_type(elem_type_of_array(rt)) + " lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + tmp + ");")
     emit("    mrb_int lv_" + bp2 + " = " + tmp + ";")
     @indent = @indent + 1
+    push_scope
+    declare_var(bp1, elem_type_of_array(rt))
+    declare_var(bp2, "int")
     compile_stmts_body(@nd_body[@nd_block[nid]])
+    pop_scope
     @indent = @indent - 1
     emit("  }")
     @in_loop = old
@@ -21709,7 +21784,12 @@ class Compiler
         emit("    " + c_type(elem_type_of_array(rt)) + " lv_" + bp1 + " = sp_" + pfx + "_get(" + rc + ", " + tmp + ");")
       end
       @indent = @indent + 1
+      push_scope
+      if has_bp == 1
+        declare_var(bp1, elem_type_of_array(rt))
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21720,7 +21800,12 @@ class Compiler
         emit("    lv_" + bp1 + " = (sp_sym)sp_IntArray_get(" + rc + ", " + tmp + ");")
       end
       @indent = @indent + 1
+      push_scope
+      if has_bp == 1
+        declare_var(bp1, "symbol")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21734,7 +21819,12 @@ class Compiler
         emit("    lv_" + bp1 + " = " + bp_tmp + ";")
       end
       @indent = @indent + 1
+      push_scope
+      if has_bp == 1
+        declare_var(bp1, elem_type)
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21746,7 +21836,13 @@ class Compiler
         emit("    lv_" + bp2 + " = sp_StrIntHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "string")
+      if bp2 != ""
+        declare_var(bp2, "int")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21758,7 +21854,13 @@ class Compiler
         emit("    lv_" + bp2 + " = sp_IntStrHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "int")
+      if bp2 != ""
+        declare_var(bp2, "string")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21770,7 +21872,13 @@ class Compiler
         emit("    lv_" + bp2 + " = sp_StrStrHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "string")
+      if bp2 != ""
+        declare_var(bp2, "string")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21782,7 +21890,13 @@ class Compiler
         emit("    lv_" + bp2 + " = sp_SymIntHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "symbol")
+      if bp2 != ""
+        declare_var(bp2, "int")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21794,7 +21908,13 @@ class Compiler
         emit("    lv_" + bp2 + " = sp_SymStrHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "symbol")
+      if bp2 != ""
+        declare_var(bp2, "string")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21806,7 +21926,13 @@ class Compiler
         emit("    lv_" + bp2 + " = sp_SymPolyHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "symbol")
+      if bp2 != ""
+        declare_var(bp2, "poly")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21818,7 +21944,13 @@ class Compiler
         emit("    lv_" + bp2 + " = sp_StrPolyHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "string")
+      if bp2 != ""
+        declare_var(bp2, "poly")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21828,7 +21960,12 @@ class Compiler
       emit("  sp_Range " + tmp2 + " = " + rc + ";")
       emit("  for (lv_" + bp1 + " = " + tmp2 + ".first; lv_" + bp1 + " <= " + tmp2 + ".last; lv_" + bp1 + "++) {")
       @indent = @indent + 1
+      push_scope
+      if has_bp == 1
+        declare_var(bp1, "int")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21837,7 +21974,12 @@ class Compiler
       emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < sp_PolyArray_length(" + rc + "); " + tmp + "++) {")
       emit("    lv_" + bp1 + " = sp_PolyArray_get(" + rc + ", " + tmp + ");")
       @indent = @indent + 1
+      push_scope
+      if has_bp == 1
+        declare_var(bp1, "poly")
+      end
       compile_stmts_body(@nd_body[@nd_block[nid]])
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -21855,7 +21997,12 @@ class Compiler
       emit("    lv_" + bp1 + " = " + tmp + ";")
     end
     @indent = @indent + 1
+    push_scope
+    if bp1 != ""
+      declare_var(bp1, "int")
+    end
     compile_stmts_body(@nd_body[@nd_block[nid]])
+    pop_scope
     @indent = @indent - 1
     emit("  }")
     @in_loop = old
@@ -21873,7 +22020,12 @@ class Compiler
       emit("    lv_" + bp1 + " = " + tmp + ";")
     end
     @indent = @indent + 1
+    push_scope
+    if bp1 != ""
+      declare_var(bp1, "int")
+    end
     compile_stmts_body(@nd_body[@nd_block[nid]])
+    pop_scope
     @indent = @indent - 1
     emit("  }")
     @in_loop = old
@@ -21891,24 +22043,34 @@ class Compiler
       emit("    lv_" + bp1 + " = " + tmp + ";")
     end
     @indent = @indent + 1
+    push_scope
+    if bp1 != ""
+      declare_var(bp1, "int")
+    end
     compile_stmts_body(@nd_body[@nd_block[nid]])
+    pop_scope
     @indent = @indent - 1
     emit("  }")
     @in_loop = old
   end
 
   def compile_tap_expr(nid)
-    # Execute block with receiver bound to block param, return receiver
+    # Execute block with receiver bound to block param, return receiver.
+    # Open a C block so the param is a fresh local that shadows any
+    # outer same-named lv_<bp> without clobbering its value or type.
     rt = infer_type(@nd_receiver[nid])
     rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp = get_block_param(nid, 0)
     if bp == ""
       bp = "_x"
     end
-    declare_var(bp, rt)
     tmp = new_temp
     emit("  " + c_type(rt) + " " + tmp + " = " + rc + ";")
-    emit("  lv_" + bp + " = " + tmp + ";")
+    emit("  {")
+    emit("    " + c_type(rt) + " lv_" + bp + " = " + tmp + ";")
+    @indent = @indent + 1
+    push_scope
+    declare_var(bp, rt)
     blk = @nd_block[nid]
     bbody = @nd_body[blk]
     if bbody >= 0
@@ -21919,33 +22081,62 @@ class Compiler
         k = k + 1
       end
     end
+    pop_scope
+    @indent = @indent - 1
+    emit("  }")
     tmp
   end
 
   def compile_then_expr(nid)
-    # Execute block with receiver bound to block param, return block result
+    # Execute block with receiver bound to block param, return block result.
+    # Open a C block so the param is a fresh local that shadows any outer
+    # same-named lv_<bp>. The block's last-expression value is funneled
+    # through a result tmp declared in the enclosing scope so callers can
+    # still consume it after the C block closes.
     rt = infer_type(@nd_receiver[nid])
     rc = compile_expr_gc_rooted(@nd_receiver[nid])
     bp = get_block_param(nid, 0)
     if bp == ""
       bp = "_x"
     end
-    declare_var(bp, rt)
-    emit("  lv_" + bp + " = " + rc + ";")
     blk = @nd_block[nid]
     bbody = @nd_body[blk]
+
+    # Peek at the last expression's type under the inner binding so the
+    # result tmp is declared with the type that infer_type sees inside
+    # the block, not the type of any outer same-named local.
+    ret_t = "int"
+    bs = []
     if bbody >= 0
       bs = get_stmts(bbody)
+      if bs.length > 0
+        push_scope
+        declare_var(bp, rt)
+        ret_t = infer_type(bs.last)
+        pop_scope
+      end
+    end
+
+    result_tmp = new_temp
+    emit("  " + c_type(ret_t) + " " + result_tmp + " = " + c_default_val(ret_t) + ";")
+    emit("  {")
+    emit("    " + c_type(rt) + " lv_" + bp + " = " + rc + ";")
+    @indent = @indent + 1
+    push_scope
+    declare_var(bp, rt)
+    if bs.length > 0
       k = 0
       while k < bs.length - 1
         compile_stmt(bs[k])
         k = k + 1
       end
-      if bs.length > 0
-        return compile_expr(bs.last)
-      end
+      last_expr = compile_expr(bs.last)
+      emit("  " + result_tmp + " = " + last_expr + ";")
     end
-    "0"
+    pop_scope
+    @indent = @indent - 1
+    emit("  }")
+    result_tmp
   end
 
   # Emit the loop-open lines for iterating over a receiver expression.
@@ -21979,11 +22170,12 @@ class Compiler
     if bp1 == ""
       bp1 = "_x"
     end
-    declare_var(bp1, iter_elem_type(recv_type))
     tmp_sum = new_temp
     tmp_i = new_temp
     emit("  mrb_int " + tmp_sum + " = 0;")
     emit_iter_open(rc, recv_type, "lv_" + bp1, tmp_i)
+    push_scope
+    declare_var(bp1, iter_elem_type(recv_type))
     blk = @nd_block[nid]
     bexpr = "0"
     if @nd_body[blk] >= 0
@@ -21998,6 +22190,7 @@ class Compiler
       end
     end
     emit("    " + tmp_sum + " += " + bexpr + ";")
+    pop_scope
     emit("  }")
     tmp_sum
   end
@@ -22007,11 +22200,12 @@ class Compiler
     if bp1 == ""
       bp1 = "_x"
     end
-    declare_var(bp1, iter_elem_type(recv_type))
     tmp_cnt = new_temp
     tmp_i = new_temp
     emit("  mrb_int " + tmp_cnt + " = 0;")
     emit_iter_open(rc, recv_type, "lv_" + bp1, tmp_i)
+    push_scope
+    declare_var(bp1, iter_elem_type(recv_type))
     blk = @nd_block[nid]
     bexpr = "0"
     if @nd_body[blk] >= 0
@@ -22026,6 +22220,7 @@ class Compiler
       end
     end
     emit("    if (" + bexpr + ") " + tmp_cnt + "++;")
+    pop_scope
     emit("  }")
     tmp_cnt
   end
@@ -22041,7 +22236,6 @@ class Compiler
     elsif recv_type == "float_array"
       elem_type = "float"
     end
-    set_var_type(bp1, elem_type)
     tmp_res = new_temp
     tmp_key = new_temp
     tmp_i = new_temp
@@ -22051,6 +22245,8 @@ class Compiler
     emit("  " + c_type(elem_type) + " " + bp_tmp + " = " + c_default_val(elem_type) + ";")
     emit_iter_open(rc, recv_type, "lv_" + bp1, tmp_i)
     emit("    " + bp_tmp + " = lv_" + bp1 + ";")
+    push_scope
+    declare_var(bp1, elem_type)
     blk = @nd_block[nid]
     bexpr = "0"
     if @nd_body[blk] >= 0
@@ -22070,6 +22266,7 @@ class Compiler
     end
     emit("    mrb_int _k = " + bexpr + ";")
     emit("    if (" + tmp_i + " == 0 || _k " + cmp + " " + tmp_key + ") { " + tmp_res + " = " + bp_tmp + "; " + tmp_key + " = _k; }")
+    pop_scope
     emit("  }")
     tmp_res
   end
@@ -22079,8 +22276,9 @@ class Compiler
     if bp1 == ""
       bp1 = "_x"
     end
-    declare_var(bp1, iter_elem_type(recv_type))
-    # Determine result type from block return
+    elem_t = iter_elem_type(recv_type)
+    push_scope
+    declare_var(bp1, elem_t)
     blk = @nd_block[nid]
     block_ret = "int"
     if blk >= 0
@@ -22125,6 +22323,7 @@ class Compiler
     emit("  " + c_type(block_ret) + " " + tmp_val + " = " + bexpr + ";")
     emit("  if (" + tmp_val + ") sp_" + pfx_dst + "_push(" + tmp_arr + ", " + tmp_val + ");")
     @indent = @indent - 1
+    pop_scope
     emit("  }")
     tmp_arr
   end
@@ -22135,11 +22334,12 @@ class Compiler
       bp1 = "_x"
     end
     elem_type = iter_elem_type(recv_type)
-    declare_var(bp1, elem_type)
     tmp_res = new_temp
     tmp_i = new_temp
     emit("  " + c_type(elem_type) + " " + tmp_res + " = " + c_default_val(elem_type) + ";")
     emit_iter_open(rc, recv_type, "lv_" + bp1, tmp_i)
+    push_scope
+    declare_var(bp1, elem_type)
     blk = @nd_block[nid]
     bbody = @nd_body[blk]
     bexpr = "0"
@@ -22155,6 +22355,7 @@ class Compiler
       end
     end
     emit("    if (" + bexpr + ") { " + tmp_res + " = lv_" + bp1 + "; break; }")
+    pop_scope
     emit("  }")
     tmp_res
   end
@@ -22165,7 +22366,6 @@ class Compiler
     if bp1 == ""
       bp1 = "_x"
     end
-    declare_var(bp1, iter_elem_type(recv_type))
     tmp_res = new_temp
     tmp_i = new_temp
     init_val = "FALSE"
@@ -22174,6 +22374,8 @@ class Compiler
     end
     emit("  mrb_bool " + tmp_res + " = " + init_val + ";")
     emit_iter_open(rc, recv_type, "lv_" + bp1, tmp_i)
+    push_scope
+    declare_var(bp1, iter_elem_type(recv_type))
     blk = @nd_block[nid]
     bbody = @nd_body[blk]
     bexpr = "0"
@@ -22198,6 +22400,7 @@ class Compiler
       # none?
       emit("    if (" + bexpr + ") { " + tmp_res + " = FALSE; break; }")
     end
+    pop_scope
     emit("  }")
     tmp_res
   end
@@ -22230,14 +22433,15 @@ class Compiler
       @needs_str_str_hash = 1
     end
     @needs_gc = 1
-    declare_var(bp1, "string")
-    declare_var(bp2, val_type)
     tmp = new_temp
     itmp = new_temp
     emit("  " + c_type(hash_type) + tmp + " = " + ctor + "();")
     emit("  for (mrb_int " + itmp + " = 0; " + itmp + " < " + rc + "->len; " + itmp + "++) {")
     emit("    lv_" + bp1 + " = " + rc + "->order[" + itmp + "];")
     emit("    lv_" + bp2 + " = " + getter + "(" + rc + ", lv_" + bp1 + ");")
+    push_scope
+    declare_var(bp1, "string")
+    declare_var(bp2, val_type)
     blk = @nd_block[nid]
     bbody = @nd_body[blk]
     bexpr = "0"
@@ -22258,6 +22462,7 @@ class Compiler
       cond = "!(" + bexpr + ")"
     end
     emit("    if (" + cond + ") " + setter + "(" + tmp + ", lv_" + bp1 + ", lv_" + bp2 + ");")
+    pop_scope
     emit("  }")
     tmp
   end
@@ -22277,6 +22482,7 @@ class Compiler
       val_type = "string"
       getter = "sp_StrStrHash_get"
     end
+    push_scope
     declare_var(bp1, "string")
     declare_var(bp2, val_type)
     itmp = new_temp
@@ -22315,6 +22521,7 @@ class Compiler
       end
       emit("    if (" + bexpr + ") " + tmp_c + "++;")
       emit("  }")
+      pop_scope
       return tmp_c
     end
     if mname == "any?"
@@ -22336,6 +22543,7 @@ class Compiler
       end
       emit("    if (" + bexpr + ") { " + tmp_r + " = TRUE; break; }")
       emit("  }")
+      pop_scope
       return tmp_r
     end
     if mname == "all?"
@@ -22357,6 +22565,7 @@ class Compiler
       end
       emit("    if (!(" + bexpr + ")) { " + tmp_r + " = FALSE; break; }")
       emit("  }")
+      pop_scope
       return tmp_r
     end
     # find / detect — return key of first match
@@ -22379,8 +22588,10 @@ class Compiler
       end
       emit("    if (" + bexpr + ") { " + tmp_r + " = lv_" + bp1 + "; break; }")
       emit("  }")
+      pop_scope
       return tmp_r
     end
+    pop_scope
     "0"
   end
 
@@ -22392,7 +22603,18 @@ class Compiler
     if bp1 == ""
       bp1 = "_x"
     end
-    # Determine result array type from block return type
+    elem_type = "int"
+    if rt == "str_array"
+      elem_type = "string"
+    elsif rt == "float_array"
+      elem_type = "float"
+    elsif rt == "poly_array"
+      elem_type = "poly"
+    elsif is_ptr_array_type(rt) == 1
+      elem_type = ptr_array_elem_type(rt)
+    end
+    push_scope
+    declare_var(bp1, elem_type)
     blk = @nd_block[nid]
     block_ret = "int_array"
     if blk >= 0
@@ -22416,18 +22638,6 @@ class Compiler
     tmp_inner = new_temp
     tmp_j = new_temp
     emit("  " + c_type(block_ret) + tmp_arr + " = sp_" + pfx_dst + "_new();")
-    # Declare block param type from receiver element type
-    elem_type = "int"
-    if rt == "str_array"
-      elem_type = "string"
-    elsif rt == "float_array"
-      elem_type = "float"
-    elsif rt == "poly_array"
-      elem_type = "poly"
-    elsif is_ptr_array_type(rt) == 1
-      elem_type = ptr_array_elem_type(rt)
-    end
-    declare_var(bp1, elem_type)
     emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_" + pfx_src + "_length(" + rc + "); " + tmp_i + "++) {")
     emit("    lv_" + bp1 + " = sp_" + pfx_src + "_get(" + rc + ", " + tmp_i + ");")
     @indent = @indent + 1
@@ -22448,6 +22658,7 @@ class Compiler
     end
     @indent = @indent - 1
     emit("  }")
+    pop_scope
     tmp_arr
   end
 
@@ -22460,6 +22671,10 @@ class Compiler
       bpn = get_block_param(nid, 0)
       res_type = "int"
       blk_n = @nd_block[nid]
+      push_scope
+      if bpn != ""
+        declare_var(bpn, "int")
+      end
       if blk_n >= 0
         body_n = @nd_body[blk_n]
         if body_n >= 0
@@ -22508,6 +22723,7 @@ class Compiler
       end
       @indent = @indent - 1
       emit("  }")
+      pop_scope
       return tmp_arrn
     end
     rt = infer_type(@nd_receiver[nid])
@@ -22525,19 +22741,9 @@ class Compiler
     if rt == "int_array" || rt == "sym_array"
       @needs_int_array = 1
       @needs_gc = 1
-      # Check if block body returns string (for map that produces StrArray)
-      block_ret = "int"
-      blk = @nd_block[nid]
-      if blk >= 0
-        body = @nd_body[blk]
-        if body >= 0
-          stmts = get_stmts(body)
-          if stmts.length > 0
-            block_ret = infer_type(stmts.last)
-          end
-        end
-      end
+      bp_t = elem_type_of_array(rt)
       # Check if block param is used as lambda (elements are lambda pointers in IntArray)
+      blk = @nd_block[nid]
       bp_is_lambda = 0
       if blk >= 0
         bp_is_lambda = param_used_as_lambda(bp1, @nd_body[blk])
@@ -22567,15 +22773,29 @@ class Compiler
           end
         end
       end
+      if bp_is_lambda == 1
+        bp_t = "lambda"
+      end
+      push_scope
+      declare_var(bp1, bp_t)
+      block_ret = "int"
+      if blk >= 0
+        body = @nd_body[blk]
+        if body >= 0
+          stmts = get_stmts(body)
+          if stmts.length > 0
+            block_ret = infer_type(stmts.last)
+          end
+        end
+      end
       if block_ret == "string"
         @needs_str_array = 1
         emit("  sp_StrArray *" + tmp_arr + " = sp_StrArray_new();")
         emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
         if bp_is_lambda == 1
-          declare_var(bp1, "lambda")
-          emit("    lv_" + bp1 + " = (sp_Val *)sp_IntArray_get(" + rc + ", " + tmp_i + ");")
+          emit("    sp_Val * lv_" + bp1 + " = (sp_Val *)sp_IntArray_get(" + rc + ", " + tmp_i + ");")
         else
-          emit("    lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
+          emit("    mrb_int lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
         end
         @indent = @indent + 1
         blk2 = @nd_block[nid]
@@ -22592,15 +22812,15 @@ class Compiler
         end
         @indent = @indent - 1
         emit("  }")
+        pop_scope
         return tmp_arr
       else
         emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
         emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
         if bp_is_lambda == 1
-          declare_var(bp1, "lambda")
-          emit("    lv_" + bp1 + " = (sp_Val *)sp_IntArray_get(" + rc + ", " + tmp_i + ");")
+          emit("    sp_Val * lv_" + bp1 + " = (sp_Val *)sp_IntArray_get(" + rc + ", " + tmp_i + ");")
         else
-          emit("    lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
+          emit("    mrb_int lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
         end
         @indent = @indent + 1
         blk2 = @nd_block[nid]
@@ -22617,6 +22837,7 @@ class Compiler
         end
         @indent = @indent - 1
         emit("  }")
+        pop_scope
         return tmp_arr
       end
     end
@@ -22625,6 +22846,8 @@ class Compiler
       # `tt = foo.map { ... }` silently became `lv_tt = 0` and the
       # subsequent iteration crashed. Issue #43.
       @needs_gc = 1
+      push_scope
+      declare_var(bp1, "string")
       block_ret = "string"
       blk = @nd_block[nid]
       if blk >= 0
@@ -22636,7 +22859,6 @@ class Compiler
           end
         end
       end
-      declare_var(bp1, "string")
       if block_ret == "int"
         @needs_int_array = 1
         emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
@@ -22664,6 +22886,7 @@ class Compiler
         end
         @indent = @indent - 1
         emit("  }")
+        pop_scope
         return tmp_arr
       end
       @needs_str_array = 1
@@ -22689,6 +22912,7 @@ class Compiler
       end
       @indent = @indent - 1
       emit("  }")
+      pop_scope
       return tmp_arr
     end
     "0"
@@ -22706,10 +22930,13 @@ class Compiler
     if rt == "int_array" || rt == "sym_array"
       @needs_int_array = 1
       @needs_gc = 1
+      bp_t = elem_type_of_array(rt)
       emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
       emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
       emit("    mrb_int lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, bp_t)
       blk = @nd_block[nid]
       if blk >= 0
         body = @nd_body[blk]
@@ -22722,6 +22949,7 @@ class Compiler
           end
         end
       end
+      pop_scope
       @indent = @indent - 1
       emit("  }")
       return tmp_arr
@@ -22753,10 +22981,14 @@ class Compiler
     emit("  lv_" + bp1 + " = " + init_val + ";")
     rt = infer_type(@nd_receiver[nid])
     pfx = array_c_prefix(rt)
+    elem_t = elem_type_of_array(rt)
     tmp = new_temp
     emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < sp_" + pfx + "_length(" + rc + "); " + tmp + "++) {")
-    emit("    " + c_type(elem_type_of_array(rt)) + " lv_" + bp2 + " = sp_" + pfx + "_get(" + rc + ", " + tmp + ");")
+    emit("    " + c_type(elem_t) + " lv_" + bp2 + " = sp_" + pfx + "_get(" + rc + ", " + tmp + ");")
     @indent = @indent + 1
+    push_scope
+    declare_var(bp1, elem_t)
+    declare_var(bp2, elem_t)
     blk = @nd_block[nid]
     if blk >= 0
       body = @nd_body[blk]
@@ -22769,6 +23001,7 @@ class Compiler
         end
       end
     end
+    pop_scope
     @indent = @indent - 1
     emit("  }")
   end
@@ -22782,12 +23015,15 @@ class Compiler
     rt = infer_type(@nd_receiver[nid])
     if rt == "int_array" || rt == "sym_array"
       @needs_int_array = 1
+      bp_t = elem_type_of_array(rt)
       tmp_arr = new_temp
       emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
       tmp_i = new_temp
       emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
       emit("    mrb_int lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, bp_t)
       blk = @nd_block[nid]
       if blk >= 0
         body = @nd_body[blk]
@@ -22800,6 +23036,7 @@ class Compiler
           end
         end
       end
+      pop_scope
       @indent = @indent - 1
       emit("  }")
       return tmp_arr
@@ -22822,6 +23059,8 @@ class Compiler
       emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
       emit("    mrb_int lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "int")
       blk = @nd_block[nid]
       if blk >= 0
         body = @nd_body[blk]
@@ -22834,6 +23073,7 @@ class Compiler
           end
         end
       end
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -23625,7 +23865,10 @@ class Compiler
       bpn = get_block_param(nid, 0)
       tmp_arrn = new_temp
       tmp_in = new_temp
-      # infer block result type
+      push_scope
+      if bpn != ""
+        declare_var(bpn, "int")
+      end
       res_type = "int"
       blk_n = @nd_block[nid]
       if blk_n >= 0
@@ -23673,6 +23916,7 @@ class Compiler
       end
       @indent = @indent - 1
       emit("  }")
+      pop_scope
       @in_loop = old
       return
     end
@@ -23689,6 +23933,8 @@ class Compiler
       emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
       emit("    mrb_int lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "int")
       blk = @nd_block[nid]
       if blk >= 0
         body = @nd_body[blk]
@@ -23701,6 +23947,7 @@ class Compiler
           end
         end
       end
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -23710,6 +23957,8 @@ class Compiler
       emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_StrArray_length(" + rc + "); " + tmp_i + "++) {")
       emit("    const char *lv_" + bp1 + " = sp_StrArray_get(" + rc + ", " + tmp_i + ");")
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, "string")
       blk = @nd_block[nid]
       if blk >= 0
         body = @nd_body[blk]
@@ -23722,6 +23971,7 @@ class Compiler
           end
         end
       end
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
@@ -23742,10 +23992,13 @@ class Compiler
     tmp_arr = new_temp
     tmp_i = new_temp
     if rt == "int_array" || rt == "sym_array"
+      bp_t = elem_type_of_array(rt)
       emit("  sp_IntArray *" + tmp_arr + " = sp_IntArray_new();")
       emit("  for (mrb_int " + tmp_i + " = 0; " + tmp_i + " < sp_IntArray_length(" + rc + "); " + tmp_i + "++) {")
       emit("    mrb_int lv_" + bp1 + " = sp_IntArray_get(" + rc + ", " + tmp_i + ");")
       @indent = @indent + 1
+      push_scope
+      declare_var(bp1, bp_t)
       blk = @nd_block[nid]
       if blk >= 0
         body = @nd_body[blk]
@@ -23758,6 +24011,7 @@ class Compiler
           end
         end
       end
+      pop_scope
       @indent = @indent - 1
       emit("  }")
     end
