@@ -141,6 +141,13 @@ static inline int sp_utf8_decode(const char*p,uint32_t*out){unsigned char c=(uns
 static inline int sp_utf8_encode(uint32_t cp,char*out){if(cp<0x80){out[0]=(char)cp;return 1;}if(cp<0x800){out[0]=(char)(0xC0|(cp>>6));out[1]=(char)(0x80|(cp&0x3F));return 2;}if(cp<0x10000){out[0]=(char)(0xE0|(cp>>12));out[1]=(char)(0x80|((cp>>6)&0x3F));out[2]=(char)(0x80|(cp&0x3F));return 3;}out[0]=(char)(0xF0|(cp>>18));out[1]=(char)(0x80|((cp>>12)&0x3F));out[2]=(char)(0x80|((cp>>6)&0x3F));out[3]=(char)(0x80|(cp&0x3F));return 4;}
 static mrb_int sp_str_length(const char*s){mrb_int n=0;while(*s){s+=sp_utf8_advance(s);n++;}return n;}
 static mrb_int sp_str_ord(const char*s){if(!*s)return 0;uint32_t cp;sp_utf8_decode(s,&cp);return(mrb_int)cp;}
+/* NULL-safe string equality. Issue #129: ENV[] returns NULL for unset vars
+   (the dispatch is `sp_str_dup_external(getenv(...))`, which propagates
+   NULL), so emitted strcmp(...) on the result of `ENV["X"] == "1"` would
+   dereference NULL on either side. nil-vs-string equality is false in
+   Ruby; nil == nil is true, so falling back to pointer equality on the
+   NULL path covers both. */
+static inline int sp_str_eq(const char*a,const char*b){if(!a||!b)return a==b;return strcmp(a,b)==0;}
 static size_t sp_utf8_byte_offset(const char*s,mrb_int char_idx){const char*p=s;while(char_idx>0&&*p){p+=sp_utf8_advance(p);char_idx--;}return(size_t)(p-s);}
 static uint32_t*sp_utf8_decode_all(const char*s,size_t*out_n){size_t cap=8,n=0;uint32_t*cps=(uint32_t*)malloc(cap*sizeof(uint32_t));const char*p=s;while(*p){if(n>=cap){cap*=2;cps=(uint32_t*)realloc(cps,cap*sizeof(uint32_t));}uint32_t cp;p+=sp_utf8_decode(p,&cp);cps[n++]=cp;}*out_n=n;return cps;}
 static int sp_utf8_set_has(const uint32_t*cps,size_t n,uint32_t cp){for(size_t i=0;i<n;i++)if(cps[i]==cp)return 1;return 0;}

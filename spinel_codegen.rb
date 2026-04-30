@@ -2834,6 +2834,15 @@ class Compiler
     end
     if mname == "[]"
       if recv >= 0
+        # Issue #129: ENV["X"] dispatches to sp_str_dup_external(getenv(...))
+        # which returns const char *. Without this early check, ConstantReadNode
+        # for "ENV" infers as int (the default for unknown constants), the
+        # receiver-type dispatch below misses every branch, and the function
+        # returns int — making `infer_constant_recv_type`'s ENV branch (3019)
+        # unreachable for `[]`. Mirrors the dispatch site's ENV check.
+        if @nd_type[recv] == "ConstantReadNode" && @nd_name[recv] == "ENV"
+          return "string"
+        end
         rt = infer_type(recv)
         if rt == "string"
           return "string"
@@ -18151,10 +18160,14 @@ class Compiler
       if cc != ""
         return cc
       end
+      # Issue #129: NULL-safe equality via sp_str_eq. Plain strcmp(NULL, ...)
+      # is UB and segfaults on real inputs (ENV[] returns NULL for unset
+      # vars). The helper does a NULL check, then strcmp; identical answer
+      # for non-NULL operands so existing equality call sites are unaffected.
       if op == "=="
-        return "(strcmp(" + lc + ", " + rc + ") == 0)"
+        return "sp_str_eq(" + lc + ", " + rc + ")"
       else
-        return "(strcmp(" + lc + ", " + rc + ") != 0)"
+        return "(!sp_str_eq(" + lc + ", " + rc + "))"
       end
     end
     if at == "nil"
