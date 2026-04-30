@@ -5966,12 +5966,27 @@ class Compiler
           cname = rt[4, rt.length - 4]
           ci = find_class_idx(cname)
           if ci >= 0
+            # Walk inheritance: when the method isn't on `ci` directly,
+            # find the parent that actually defines it and update
+            # *that* class's @cls_meth_ptypes so the body-side
+            # promotion (infer_param_array_type_from_body) sees the
+            # caller's arg types. Issue #84.
+            owner_ci = ci
             midx = cls_find_method_direct(ci, mname)
+            if midx < 0
+              owner = find_method_owner(ci, mname)
+              if owner != "" && owner != cname
+                owner_ci = find_class_idx(owner)
+                if owner_ci >= 0
+                  midx = cls_find_method_direct(owner_ci, mname)
+                end
+              end
+            end
             if midx >= 0
               args_id = @nd_arguments[nid]
               if args_id >= 0
                 arg_ids = get_args(args_id)
-                all_ptypes = @cls_meth_ptypes[ci].split("|")
+                all_ptypes = @cls_meth_ptypes[owner_ci].split("|")
                 if midx < all_ptypes.length
                   ptypes = all_ptypes[midx].split(",")
                   kk = 0
@@ -5987,7 +6002,7 @@ class Compiler
                     kk = kk + 1
                   end
                   all_ptypes[midx] = ptypes.join(",")
-                  @cls_meth_ptypes[ci] = all_ptypes.join("|")
+                  @cls_meth_ptypes[owner_ci] = all_ptypes.join("|")
                 end
               end
             end
