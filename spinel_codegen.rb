@@ -11441,6 +11441,202 @@ class Compiler
     end
   end
 
+  # Body-side param narrowing (Stage 1 of the callee→caller direction
+  # of type inference, complementing scan_new_calls' caller→callee
+  # widening). For each method's params still typed at the default
+  # `int`, walk the body for `param.<m>` calls. If <m> is defined
+  # on exactly one user class (and isn't a common operator / built-
+  # in-overlap method), the param's static type narrows to that
+  # class. Conflicting strong signals leave the param at int.
+  #
+  # The narrow direction (int → obj_<C>) only fires when the caller-
+  # side widening hasn't already pinned the param to a non-int type,
+  # so it never overrides observation from a real call site. If a
+  # later iteration's caller-side scan finds an actual int arg flowing
+  # into this slot, unify_call_types will widen back to poly — net
+  # effect no worse than skipping the narrow.
+  #
+  # Excluded method names cover operators (which user classes
+  # routinely overload but built-in primitives also implement) and
+  # the common Object/Enumerable surface (`length`, `each`, `to_s`,
+  # ...) — when these match a user class they don't actually
+  # discriminate from a built-in.
+  def narrow_param_types_from_body_method_calls
+    # Top-level methods.
+    mi = 0
+    while mi < @meth_names.length
+      bid = @meth_body_ids[mi]
+      if bid >= 0
+        pnames = @meth_param_names[mi].split(",")
+        ptypes = @meth_param_types[mi].split(",")
+        observations = "".split(",")
+        collect_param_method_calls(bid, pnames, observations)
+        changed = 0
+        pk = 0
+        while pk < pnames.length
+          if pk < ptypes.length && ptypes[pk] == "int"
+            target_cls = unify_param_class_from_observations(pnames[pk], observations)
+            if target_cls >= 0
+              ptypes[pk] = "obj_" + @cls_names[target_cls]
+              changed = 1
+            end
+          end
+          pk = pk + 1
+        end
+        if changed == 1
+          @meth_param_types[mi] = ptypes.join(",")
+        end
+      end
+      mi = mi + 1
+    end
+    # Class instance methods.
+    ci = 0
+    while ci < @cls_names.length
+      all_params = @cls_meth_params[ci].split("|")
+      all_ptypes = @cls_meth_ptypes[ci].split("|")
+      bodies = @cls_meth_bodies[ci].split(";")
+      cls_changed = 0
+      mj = 0
+      while mj < all_params.length
+        bid = -1
+        if mj < bodies.length
+          bid = bodies[mj].to_i
+        end
+        if bid >= 0
+          cm_pnames = all_params[mj].split(",")
+          cm_ptypes = "".split(",")
+          if mj < all_ptypes.length
+            cm_ptypes = all_ptypes[mj].split(",")
+          end
+          observations = "".split(",")
+          collect_param_method_calls(bid, cm_pnames, observations)
+          m_changed = 0
+          pk = 0
+          while pk < cm_pnames.length
+            if pk < cm_ptypes.length && cm_ptypes[pk] == "int"
+              target_cls = unify_param_class_from_observations(cm_pnames[pk], observations)
+              if target_cls >= 0
+                cm_ptypes[pk] = "obj_" + @cls_names[target_cls]
+                m_changed = 1
+              end
+            end
+            pk = pk + 1
+          end
+          if m_changed == 1
+            all_ptypes[mj] = cm_ptypes.join(",")
+            cls_changed = 1
+          end
+        end
+        mj = mj + 1
+      end
+      if cls_changed == 1
+        @cls_meth_ptypes[ci] = all_ptypes.join("|")
+      end
+      ci = ci + 1
+    end
+  end
+
+  # Walk `nid` for CallNode whose receiver is a LocalVariableReadNode
+  # naming one of the params. Each such site contributes one entry
+  # `<pname>\t<mname>` to `observations`. Stops at nested DefNode
+  # (those introduce their own scope with different params).
+  def collect_param_method_calls(nid, pnames, observations)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "DefNode"
+      return
+    end
+    if @nd_type[nid] == "CallNode"
+      recv = @nd_receiver[nid]
+      if recv >= 0 && @nd_type[recv] == "LocalVariableReadNode"
+        vname = @nd_name[recv]
+        if not_in(vname, pnames) == 0
+          mname = @nd_name[nid]
+          observations.push(vname + "\t" + mname)
+        end
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      collect_param_method_calls(cs[k], pnames, observations)
+      k = k + 1
+    end
+  end
+
+  # For all `<pname>\t<mname>` observations, find the unique user
+  # class that defines `<mname>`. If every strong observation
+  # (single-class match, not on the deny list) points to the same
+  # class, return its index. Conflicting classes or no signal at
+  # all return -1.
+  def unify_param_class_from_observations(pname, observations)
+    unique_class = -1
+    has_signal = 0
+    k = 0
+    while k < observations.length
+      tab = observations[k].index("\t")
+      if tab >= 0
+        obs_p = observations[k][0, tab]
+        if obs_p == pname
+          mname = observations[k][tab + 1, observations[k].length - tab - 1]
+          if is_common_method_name(mname) == 0
+            cls_count = 0
+            cls_idx = -1
+            ci = 0
+            while ci < @cls_names.length
+              if cls_find_method_direct(ci, mname) >= 0
+                cls_count = cls_count + 1
+                cls_idx = ci
+              end
+              ci = ci + 1
+            end
+            if cls_count == 1
+              if unique_class == -1
+                unique_class = cls_idx
+                has_signal = 1
+              elsif unique_class != cls_idx
+                return -1
+              end
+            end
+          end
+        end
+      end
+      k = k + 1
+    end
+    if has_signal == 1
+      return unique_class
+    end
+    -1
+  end
+
+  # Methods whose name doesn't reliably discriminate a user class
+  # from a built-in receiver. Reuses `is_primitive_shared_method`
+  # (the same list #302/#305 use to gate compile_int_class_fallback
+  # _expr) so the body-side narrow stays consistent with the emit-
+  # time int-recv fallback's safety net. Plus a small deny list of
+  # numeric / boolean operators that the primitive-shared list
+  # doesn't currently cover.
+  def is_common_method_name(mname)
+    if is_primitive_shared_method(mname) == 1
+      return 1
+    end
+    if mname == "+" || mname == "-" || mname == "*" || mname == "/"
+      return 1
+    end
+    if mname == "%" || mname == "**" || mname == "&" || mname == "|" || mname == "^" || mname == "~"
+      return 1
+    end
+    if mname == "<" || mname == ">" || mname == "<=" || mname == ">=" || mname == "<=>"
+      return 1
+    end
+    if mname == ">>"
+      return 1
+    end
+    0
+  end
+
   # Helper: given the set of element types observed in pname.push(...)
   # patterns, return the typed-array tag to promote to, or "" if the
   # observations don't agree on a single concrete type.
@@ -14824,6 +15020,7 @@ class Compiler
       # Then the next iteration's scan_locals back-propagates those
       # promoted types to caller-side locals.
       infer_param_array_type_from_body
+      narrow_param_types_from_body_method_calls
       detect_poly_params
       cur_sig = inference_signature
       if cur_sig == prev_sig
