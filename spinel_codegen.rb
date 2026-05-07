@@ -10663,6 +10663,67 @@ class Compiler
             end
           end
         end
+        # Forward-ref dispatch: when the receiver is statically `int`
+        # (a yet-untyped ivar / param read whose true class hasn't
+        # propagated through the inference fixpoint yet) but `mname`
+        # belongs to exactly one user class — and isn't shared with a
+        # primitive type's method of the same name — the int→class
+        # fallback at the bottom of compile_no_recv_call_expr will
+        # dispatch the call to that class's C function. Widen the
+        # callee's param types from this site's args so the C
+        # signatures match the values the fallback passes. Without
+        # this, file orderings that put the caller (e.g. `rom.rb`'s
+        # `@ppu.set_chr_mem(@chr_ref, @chr_ram)`) before the callee
+        # (PPU) leave the callee's params at the default `mrb_int`,
+        # producing Wint-conversion / incompatible-pointer errors at
+        # the int→class call site. unify_call_types collapses to
+        # poly when later sites disagree.
+        #
+        # Gate on the receiver being an ivar / local read — those are
+        # the only shapes the fallback realistically widens through.
+        # Skipping CallNode / IntegerNode / etc. avoids accidentally
+        # treating `(self <=> other) > 0` (where the recv is the int
+        # result of `<=>` and `>` is genuinely an int operator) as a
+        # forward-ref to `Temperature#>`, which would unify the
+        # already-correct `obj_Temperature` param against the literal
+        # `0` arg and collapse it to poly.
+        recv_iow_fwd = @nd_receiver[nid]
+        recv_is_ivar_or_local = recv_iow_fwd >= 0 && (@nd_type[recv_iow_fwd] == "InstanceVariableReadNode" || @nd_type[recv_iow_fwd] == "LocalVariableReadNode")
+        if rt == "int" && recv_is_ivar_or_local && primitive_method_shared_with_user_class(mname) == 0
+          matched_ci_fwd = -1
+          ci_fwd = 0
+          while ci_fwd < @cls_names.length
+            if cls_find_method_direct(ci_fwd, mname) >= 0
+              if matched_ci_fwd >= 0
+                matched_ci_fwd = -2
+                break
+              end
+              matched_ci_fwd = ci_fwd
+            end
+            ci_fwd = ci_fwd + 1
+          end
+          if matched_ci_fwd >= 0
+            midx_fwd = cls_find_method_direct(matched_ci_fwd, mname)
+            args_id_fwd = @nd_arguments[nid]
+            if args_id_fwd >= 0 && midx_fwd >= 0
+              arg_ids_fwd = get_args(args_id_fwd)
+              all_ptypes_fwd = @cls_meth_ptypes[matched_ci_fwd].split("|")
+              if midx_fwd < all_ptypes_fwd.length
+                ptypes_fwd = all_ptypes_fwd[midx_fwd].split(",")
+                kk_fwd = 0
+                while kk_fwd < arg_ids_fwd.length
+                  at_fwd = infer_type(arg_ids_fwd[kk_fwd])
+                  if kk_fwd < ptypes_fwd.length
+                    ptypes_fwd[kk_fwd] = unify_call_types(ptypes_fwd[kk_fwd], at_fwd, arg_ids_fwd[kk_fwd])
+                  end
+                  kk_fwd = kk_fwd + 1
+                end
+                all_ptypes_fwd[midx_fwd] = ptypes_fwd.join(",")
+                @cls_meth_ptypes[matched_ci_fwd] = all_ptypes_fwd.join("|")
+              end
+            end
+          end
+        end
         # Poly-receiver widening: when the receiver is poly (e.g. a
         # method param widened to accept multiple user classes),
         # the per-class arms emitted by compile_poly_method_call
