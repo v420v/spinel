@@ -9509,6 +9509,22 @@ class Compiler
       end
       return tmp
     end
+    # `[nil] * N` against a poly slot (e.g. optcarrots @fetch widened
+    # to sp_RbVal because of cyclic inference): build a sp_PolyArray
+    # of N nils and box it. Subsequent heterogeneous writes via the
+    # poly-recv `[]=` branch dispatch into the PolyArray correctly.
+    # Without this branch, `[nil] * N` produces an IntArray and the
+    # subsequent `@x[i] = method_obj` writes the pointer as an int —
+    # reads then return ints and the method dispatch never fires.
+    if expected_base == "poly" && is_sized_empty_array_default(nid) == 1
+      @needs_gc = 1
+      @needs_rb_value = 1
+      cnt_e = compile_arg0(nid)
+      tmp = new_temp
+      emit("  sp_PolyArray *" + tmp + " = sp_PolyArray_new();")
+      emit("  { mrb_int _n = " + cnt_e + "; for (mrb_int _i = 0; _i < _n; _i++) sp_PolyArray_push(" + tmp + ", sp_box_nil()); }")
+      return "sp_box_poly_array(" + tmp + ")"
+    end
     val = compile_expr(nid)
     at = infer_type(nid)
     if expected_base == "poly" && at != "poly"
@@ -17281,6 +17297,18 @@ class Compiler
                   emit_raw("  { mrb_int _n = " + cnt_e_iv + "; for (mrb_int _i = 0; _i < _n; _i++) sp_PtrArray_push(" + tmp_iv + ", NULL); }")
                 end
                 emit_raw("  " + self_arrow + ivar + " = " + tmp_iv + ";")
+              elsif ivt == "poly" && is_sized_empty_array_default(expr_id_iv) == 1
+                # `@arr = [nil] * N` against a poly slot. Build a
+                # sized PolyArray and box it so the runtime storage
+                # supports heterogeneous writes via the poly-recv
+                # `[]=` dispatch.
+                @needs_gc = 1
+                @needs_rb_value = 1
+                cnt_e_iv = compile_arg0(expr_id_iv)
+                tmp_iv = new_temp
+                emit_raw("  sp_PolyArray *" + tmp_iv + " = sp_PolyArray_new();")
+                emit_raw("  { mrb_int _n = " + cnt_e_iv + "; for (mrb_int _i = 0; _i < _n; _i++) sp_PolyArray_push(" + tmp_iv + ", sp_box_nil()); }")
+                emit_raw("  " + self_arrow + ivar + " = sp_box_poly_array(" + tmp_iv + ");")
               elsif ivt == "poly_array" && @nd_type[expr_id_iv] == "ArrayNode"
                 # Non-empty array literal `[a, b, ...]` going into a
                 # poly_array slot. compile_array_literal infers a typed
@@ -28214,6 +28242,22 @@ class Compiler
           emit("  { mrb_int _n = " + cnt_e + "; for (mrb_int _i = 0; _i < _n; _i++) sp_PtrArray_push(" + tmp_arr + ", NULL); }")
         end
         emit("  " + self_arrow + sanitize_ivar(iname) + " = " + tmp_arr + ";")
+        return
+      end
+      # `@arr = [nil] * N` where @arr is a poly slot (sp_RbVal). The
+      # cyclic inference can leave a slot at poly when its definition
+      # site `[nil] * N` would naturally infer as int_array but a
+      # subsequent heterogeneous write demands more. Emit as a sized
+      # PolyArray boxed to poly so the runtime storage supports
+      # heterogeneous writes via the poly-recv `[]=` dispatch.
+      if ivt == "poly" && is_sized_empty_array_default(expr_id) == 1
+        @needs_gc = 1
+        @needs_rb_value = 1
+        cnt_e = compile_arg0(expr_id)
+        tmp_arr = new_temp
+        emit("  sp_PolyArray *" + tmp_arr + " = sp_PolyArray_new();")
+        emit("  { mrb_int _n = " + cnt_e + "; for (mrb_int _i = 0; _i < _n; _i++) sp_PolyArray_push(" + tmp_arr + ", sp_box_nil()); }")
+        emit("  " + self_arrow + sanitize_ivar(iname) + " = sp_box_poly_array(" + tmp_arr + ");")
         return
       end
       # Non-empty array literal `[a, b, ...]` going into a poly_array
