@@ -26152,6 +26152,33 @@ class Compiler
         @needs_rb_value = 1
         return "sp_SymPolyHash_values(" + rc + ")"
       end
+      if mname == "merge"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          aargs = get_args(args_id)
+          if aargs.length == 1
+            arg_t = infer_type(aargs[0])
+            if arg_t == "sym_poly_hash"
+              tmp = new_temp
+              emit("  sp_SymPolyHash *" + tmp + " = sp_SymPolyHash_merge(" + rc + ", " + compile_arg0(nid) + ");")
+              return tmp
+            elsif arg_t == "poly"
+              # Poly-typed local whose runtime value is a sym_poly_hash
+              # (typical when an `is_a?` branch widened the static
+              # type). Guard the unbox with a cls_id check; if the
+              # arg is something else at runtime, fall back to a
+              # receiver-only copy (the override is silently dropped,
+              # which matches the pre-existing behaviour for
+              # unsupported argument types).
+              tmp_arg = new_temp
+              tmp = new_temp
+              emit("  sp_RbVal " + tmp_arg + " = " + compile_arg0(nid) + ";")
+              emit("  sp_SymPolyHash *" + tmp + " = (" + tmp_arg + ".tag == SP_TAG_OBJ && " + tmp_arg + ".cls_id == SP_BUILTIN_SYM_POLY_HASH) ? sp_SymPolyHash_merge(" + rc + ", (sp_SymPolyHash *)" + tmp_arg + ".v.p) : sp_SymPolyHash_merge(" + rc + ", sp_SymPolyHash_new());")
+              return tmp
+            end
+          end
+        end
+      end
     end
     if recv_type == "str_poly_hash"
       if mname == "[]"
@@ -27878,6 +27905,17 @@ class Compiler
         mrhs = is_poly_ret == 1 ? "sp_box_int(" + mc + ")" : mc
         emit("    if (" + recv_tmp + ".cls_id == " + method_idx.to_s + ") " + result_tmp + " = " + mrhs + ";")
       end
+    end
+    # `[]` with a symbol key — sym_poly_hash dispatch. Mirrors the
+    # int-key block above for the case where a poly receiver carries
+    # a SymPolyHash at runtime (e.g. a constant hash boxed back into
+    # a slot whose static type is poly because of an earlier
+    # is_a?(String) branch).
+    a0_is_sym = arg_compiled.length >= 1 && arg_types.length >= 1 && arg_types[0] == "symbol"
+    if mname == "[]" && a0_is_sym
+      shc = "sp_SymPolyHash_get((sp_SymPolyHash *)" + recv_tmp + ".v.p, " + arg_compiled[0] + ")"
+      shrhs = is_poly_ret == 1 ? shc : "(" + shc + ").v.i"
+      emit("    if (" + recv_tmp + ".cls_id == SP_BUILTIN_SYM_POLY_HASH) " + result_tmp + " = " + shrhs + ";")
     end
     # `length` / `size` — every built-in array exposes its own
     # `_length` helper (sym_array shares IntArray's). PtrArray is
