@@ -4519,6 +4519,17 @@ class Compiler
               if body_an >= 0
                 stmts_an = get_stmts(body_an)
                 if stmts_an.length > 0
+                  # `[]` / `[].dup` block tail: the inner element type
+                  # is statically ambiguous. Use poly_array (a
+                  # PolyArray-of-PolyArray) for the result so later
+                  # pushes of pointer-typed values (3-tuples,
+                  # IntArrays, etc.) survive — the sp_poly_shl runtime
+                  # dispatch handles any push kind via cls_id.
+                  if is_empty_array_or_dup(stmts_an.last) == 1
+                    @needs_rb_value = 1
+                    @needs_gc = 1
+                    return "poly_array"
+                  end
                   bret = infer_type(stmts_an.last)
                   if bret == "string"
                     return "str_array"
@@ -5338,6 +5349,35 @@ class Compiler
       return 1
     end
     0
+  end
+
+  # `[]` / `[].dup` — an empty array whose static element type is
+  # ambiguous. When this is the tail of a block whose result becomes
+  # the inner storage of a nested array (`Array.new(N) { [].dup }`,
+  # `(0..N).map { [].dup }`), defaulting to `int_array` is unsafe:
+  # later pushes of pointer-typed values (3-tuples, IntArrays, etc.)
+  # silently truncate the pointer to mrb_int. Use `poly_array` for
+  # the inner container instead so push goes through sp_PolyArray
+  # (with sp_RbVal slots) and the runtime cls_id dispatch in
+  # sp_poly_shl handles any pushed kind correctly.
+  def is_empty_array_or_dup(nid)
+    if is_empty_array_literal(nid) == 1
+      return 1
+    end
+    if nid < 0
+      return 0
+    end
+    if @nd_type[nid] != "CallNode"
+      return 0
+    end
+    if @nd_name[nid] != "dup"
+      return 0
+    end
+    recv = @nd_receiver[nid]
+    if recv < 0
+      return 0
+    end
+    is_empty_array_literal(recv)
   end
 
   # `[nil] * N` / `[0] * N` is a sized empty default — the elements
@@ -8337,6 +8377,13 @@ class Compiler
                 if body_an2 >= 0
                   stmts_an2 = get_stmts(body_an2)
                   if stmts_an2.length > 0
+                    # `[]` / `[].dup` block tail → poly_array (see
+                    # infer_constructor_type for rationale).
+                    if is_empty_array_or_dup(stmts_an2.last) == 1
+                      @needs_rb_value = 1
+                      @needs_gc = 1
+                      return "poly_array"
+                    end
                     bret2 = infer_type(stmts_an2.last)
                     if bret2 == "string"
                       return "str_array"
@@ -23844,10 +23891,21 @@ class Compiler
             arrnew_count = compile_expr(arrnew_aargs.first)
             arrnew_bp = get_block_param(nid, 0)
             block_ret_an = "int"
+            arrnew_empty_inner = 0
             if arrnew_body >= 0
               arrnew_pre_stmts = get_stmts(arrnew_body)
               if arrnew_pre_stmts.length > 0
-                block_ret_an = infer_type(arrnew_pre_stmts.last)
+                # `[]` / `[].dup` block tail: emit each inner as a fresh
+                # poly_array so future pushes (with sp_poly_shl runtime
+                # cls_id dispatch) handle any pushed kind. This is the
+                # "deferred element type" path — the static type is
+                # `poly_array_ptr_array`.
+                if is_empty_array_or_dup(arrnew_pre_stmts.last) == 1
+                  arrnew_empty_inner = 1
+                  block_ret_an = "poly_array"
+                else
+                  block_ret_an = infer_type(arrnew_pre_stmts.last)
+                end
               end
             end
             an_ret_is_arr = (block_ret_an == "int_array" || block_ret_an == "float_array" || block_ret_an == "str_array" || block_ret_an == "sym_array")
@@ -23890,19 +23948,27 @@ class Compiler
                   compile_stmt(arrnew_stmts2[arrnew_k])
                   arrnew_k = arrnew_k + 1
                 end
-                arrnew_lastv = compile_expr(arrnew_stmts2.last)
-                if block_ret_an == "string"
-                  emit("  sp_StrArray_push(" + arrnew_tmp + ", " + arrnew_lastv + ");")
-                elsif block_ret_an == "float"
-                  emit("  sp_FloatArray_push(" + arrnew_tmp + ", " + arrnew_lastv + ");")
-                elsif block_ret_an == "poly"
-                  emit("  sp_PolyArray_push(" + arrnew_tmp + ", " + arrnew_lastv + ");")
-                elsif an_ret_is_deep_arr
-                  emit("  sp_PolyArray_push(" + arrnew_tmp + ", " + box_value_to_poly(block_ret_an, arrnew_lastv) + ");")
-                elsif an_ret_is_arr
-                  emit("  sp_PtrArray_push(" + arrnew_tmp + ", (void *)(" + arrnew_lastv + "));")
+                if arrnew_empty_inner == 1
+                  # Skip compiling the `[]` / `[].dup` tail entirely —
+                  # we know it's an empty array; emit a fresh
+                  # sp_PolyArray instead so each inner is allocated as
+                  # the deferred-type container.
+                  emit("  sp_PolyArray_push(" + arrnew_tmp + ", sp_box_poly_array(sp_PolyArray_new()));")
                 else
-                  emit("  sp_IntArray_push(" + arrnew_tmp + ", " + arrnew_lastv + ");")
+                  arrnew_lastv = compile_expr(arrnew_stmts2.last)
+                  if block_ret_an == "string"
+                    emit("  sp_StrArray_push(" + arrnew_tmp + ", " + arrnew_lastv + ");")
+                  elsif block_ret_an == "float"
+                    emit("  sp_FloatArray_push(" + arrnew_tmp + ", " + arrnew_lastv + ");")
+                  elsif block_ret_an == "poly"
+                    emit("  sp_PolyArray_push(" + arrnew_tmp + ", " + arrnew_lastv + ");")
+                  elsif an_ret_is_deep_arr
+                    emit("  sp_PolyArray_push(" + arrnew_tmp + ", " + box_value_to_poly(block_ret_an, arrnew_lastv) + ");")
+                  elsif an_ret_is_arr
+                    emit("  sp_PtrArray_push(" + arrnew_tmp + ", (void *)(" + arrnew_lastv + "));")
+                  else
+                    emit("  sp_IntArray_push(" + arrnew_tmp + ", " + arrnew_lastv + ");")
+                  end
                 end
               end
             end
@@ -27984,6 +28050,52 @@ class Compiler
   # Box an already-compiled value of static type `at` into an sp_RbVal.
   # Mirrors box_expr_to_poly but operates on a raw (type, value) pair so
   # callers that already have temps don't have to re-emit the expr.
+  # Unbox an sp_RbVal expression `val` into the C representation
+  # of `at`. Used at sites where the destructure / cls_id-aware
+  # dispatch produced an sp_RbVal but the consumer slot is a
+  # concrete C type (mrb_int, sp_IntArray *, const char *, ...).
+  # No runtime cls_id check — caller has already narrowed via
+  # static type / wrapping cls_id dispatch.
+  def unbox_poly_to(at, val)
+    base = is_nullable_type(at) == 1 ? base_type(at) : at
+    if base == "int" || base == "bool" || base == "nil"
+      return "(" + val + ").v.i"
+    end
+    if base == "float"
+      return "(" + val + ").v.f"
+    end
+    if base == "string"
+      return "(const char *)(" + val + ").v.p"
+    end
+    if base == "symbol"
+      return "(sp_sym)(" + val + ").v.i"
+    end
+    if base == "int_array"
+      return "(sp_IntArray *)(" + val + ").v.p"
+    end
+    if base == "float_array"
+      return "(sp_FloatArray *)(" + val + ").v.p"
+    end
+    if base == "str_array"
+      return "(sp_StrArray *)(" + val + ").v.p"
+    end
+    if base == "sym_array"
+      return "(sp_IntArray *)(" + val + ").v.p"
+    end
+    if base == "poly_array"
+      return "(sp_PolyArray *)(" + val + ").v.p"
+    end
+    if is_ptr_array_type(base) == 1
+      return "(sp_PtrArray *)(" + val + ").v.p"
+    end
+    if is_obj_type(base) == 1
+      cname = base[4, base.length - 4]
+      return "(sp_" + cname + " *)(" + val + ").v.p"
+    end
+    # Fallback: cast generic pointer.
+    "(void *)(" + val + ").v.p"
+  end
+
   def box_value_to_poly(at, val)
     nullable = is_nullable_type(at)
     raw_at = at
@@ -30447,6 +30559,12 @@ class Compiler
       if vt == "poly" && value_type != "" && value_type != "poly"
         v = box_value_to_poly(value_type, value_expr)
       end
+      # Reverse direction: poly RHS into a concrete-typed local
+      # slot. Happens when destructuring a poly_array element
+      # (each slot was sp_PolyArray_get, returning sp_RbVal).
+      if value_type == "poly" && vt != "" && vt != "poly"
+        v = unbox_poly_to(vt, value_expr)
+      end
       emit("  " + fiber_var_ref(lname) + " = " + v + ";")
       return
     end
@@ -30474,6 +30592,9 @@ class Compiler
           it = cls_ivar_type(@current_class_idx, iname)
           if it == "poly" && value_type != "" && value_type != "poly"
             v = box_value_to_poly(value_type, value_expr)
+          end
+          if value_type == "poly" && it != "" && it != "poly"
+            v = unbox_poly_to(it, value_expr)
           end
         end
         emit("  " + self_arrow + sanitize_ivar(iname) + " = " + v + ";")
@@ -30827,6 +30948,16 @@ class Compiler
       if val_t_local == "poly_array"
         @needs_rb_value = 1
         emit("  sp_PolyArray *" + tmp + " = " + compile_expr(val_id) + ";")
+      elsif val_t_local == "poly"
+        # RHS is a poly value (e.g. `@attr_lut[i]` where @attr_lut
+        # is a poly_array of inner arrays — each element is a
+        # boxed sp_PolyArray with cls_id POLY_ARRAY). Unbox to
+        # sp_PolyArray * and destructure via sp_PolyArray_get.
+        # Same shape as the static poly_array branch above.
+        @needs_rb_value = 1
+        rb_tmp_mw = new_temp
+        emit("  sp_RbVal " + rb_tmp_mw + " = " + compile_expr(val_id) + ";")
+        emit("  sp_PolyArray *" + tmp + " = (" + rb_tmp_mw + ".cls_id == SP_BUILTIN_POLY_ARRAY) ? (sp_PolyArray *)" + rb_tmp_mw + ".v.p : NULL;")
       else
         @needs_int_array = 1
         emit("  sp_IntArray *" + tmp + " = " + compile_expr(val_id) + ";")
@@ -30835,7 +30966,7 @@ class Compiler
       k = 0
       while k < targets.length
         tid = targets[k]
-        if val_t_local == "poly_array"
+        if val_t_local == "poly_array" || val_t_local == "poly"
           rhs = "sp_PolyArray_get(" + tmp + ", " + k.to_s + ")"
           val_t_for_target = "poly"
         else
