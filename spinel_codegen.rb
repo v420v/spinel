@@ -28558,6 +28558,15 @@ class Compiler
       @needs_rb_value = 1
       return "poly"
     end
+    # Setters: mname ends with "=" and at least one class has an
+    # attr_writer for the bare name. Return type is the ivar type
+    # (Ruby returns the rhs from `x = v`); without this, the result
+    # tmp's C type defaults to `mrb_int` and `tmp = rhs` mismatches
+    # for non-int slots.
+    setter_bname = ""
+    if mname.length > 1 && mname[mname.length - 1] == "="
+      setter_bname = mname[0, mname.length - 1]
+    end
     common = ""
     ci = 0
     while ci < @cls_names.length
@@ -28567,6 +28576,9 @@ class Compiler
       elsif cls_has_attr_reader(ci, mname) == 1
         # An attr_reader returns the ivar type. Issue #119.
         rt = cls_ivar_type(ci, "@" + mname)
+      elsif setter_bname != "" && cls_has_attr_writer(ci, setter_bname) == 1
+        # An attr_writer setter returns the ivar's type.
+        rt = cls_ivar_type(ci, "@" + setter_bname)
       end
       if rt != ""
         if common == ""
@@ -28851,6 +28863,39 @@ class Compiler
         else
           emit("    if (" + recv_tmp + ".cls_id == " + i.to_s + ") " + tmp + " = " + rhs + ";")
         end
+      elsif mname.length > 1 && mname[mname.length - 1] == "=" && cls_has_attr_writer(i, mname[0, mname.length - 1]) == 1
+        # An auto-registered attr_writer setter (`obj.x = v`) on a
+        # poly-typed receiver. Without this arm the cls_id dispatch
+        # finds neither a real method nor an attr_reader, falls
+        # through silently, and the assignment never executes —
+        # `obj.x = v` becomes a no-op.
+        bname = mname[0, mname.length - 1]
+        raw_val = arg_compiled.length > 0 ? arg_compiled[0] : "0"
+        raw_t   = arg_types.length > 0 ? arg_types[0] : ""
+        slot_t  = cls_ivar_type(i, "@" + bname)
+        # Match the rhs to the slot's concrete C type for *this arm*.
+        # Three cases:
+        #   slot poly + arg concrete  -> box the arg.
+        #   slot concrete + arg poly  -> unbox the arg.
+        #   else                      -> direct assign.
+        # Different arms in the dispatch may take different branches
+        # (e.g. one slot is `int`, another is `string`).
+        store_val = raw_val
+        if slot_t == "poly" && raw_t != "poly" && raw_t != ""
+          store_val = box_value_to_poly(raw_t, raw_val)
+        elsif slot_t != "poly" && raw_t == "poly"
+          store_val = unbox_poly_to(slot_t, raw_val)
+        end
+        ivar_lhs = "((sp_" + cname + " *)" + recv_tmp + ".v.p)->" + sanitize_ivar("@" + bname)
+        # `x = v` returns v in Ruby. The result tmp's type is set by
+        # poly_dispatch_return_type (poly when slot types diverge,
+        # otherwise the common slot type). Box / coerce the stored
+        # value into the tmp's expected shape.
+        rhs_for_tmp = store_val
+        if is_poly_ret == 1
+          rhs_for_tmp = box_val_to_poly(store_val, slot_t)
+        end
+        emit("    if (" + recv_tmp + ".cls_id == " + i.to_s + ") { " + ivar_lhs + " = " + store_val + "; " + tmp + " = " + rhs_for_tmp + "; }")
       end
       i = i + 1
     end
@@ -29254,7 +29299,13 @@ class Compiler
       return "sp_box_bool(" + val + ")"
     end
     if at == "nil"
-      return "sp_box_nil()"
+      # `val` may be a side-effecting call (e.g. an arm in a
+      # cls_id-dispatched table where the user-defined override
+      # returns nil because its body is a `puts` / similar). Drop
+      # the value but keep the side effect via the comma operator;
+      # otherwise the generated dispatch silently elides the call
+      # for any subclass whose method's static return type is nil.
+      return "((void)(" + val + "), sp_box_nil())"
     end
     if at == "symbol"
       return "sp_box_sym(" + val + ")"
