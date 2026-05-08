@@ -7866,6 +7866,34 @@ class Compiler
       if names[k] == iname
         if k < types.length
           old = types[k]
+          # Stale unqualified obj-name normalization. collect_ivars
+          # registers ivar types during Pass 1 (class enumeration), in
+          # source order; at that point sibling classes that come later
+          # in the file haven't been registered yet. A
+          # `@cpu = CPU.new(@conf)` write inside the lexically-first
+          # class then resolves "CPU" against an incomplete class
+          # table, lands at unqualified "obj_CPU", and pins the slot.
+          # When a subsequent pass — with all classes registered —
+          # records the qualified "obj_<scope>_CPU" via scan_writer_calls
+          # (whose lexical resolution does succeed), the stale and
+          # qualified forms compare unequal and the heterogeneity
+          # branch below widens to "poly". Detect the relationship
+          # (old's bare name matches the trailing segment of new's
+          # name AND old's bare name doesn't refer to any registered
+          # class) and accept the qualified form as a refinement
+          # rather than a disagreement.
+          if is_obj_type(old) == 1 && is_obj_type(new_type) == 1 && old != new_type
+            old_bare_uit = old[4, old.length - 4]
+            new_bare_uit = new_type[4, new_type.length - 4]
+            if find_class_idx(old_bare_uit) < 0 && find_class_idx(new_bare_uit) >= 0
+              suffix_uit = "_" + old_bare_uit
+              if new_bare_uit.length > suffix_uit.length && new_bare_uit[(new_bare_uit.length - suffix_uit.length), suffix_uit.length] == suffix_uit
+                types[k] = new_type
+                @cls_ivar_types[ci] = types.join(";")
+                old = new_type
+              end
+            end
+          end
           # Heterogeneous int/nil + obj → poly when the prior write
           # was a *definite* int/nil literal. The previous "int wins"
           # / "nil wins" overwrite silently cast the int payload to a
@@ -10007,6 +10035,32 @@ class Compiler
   def unify_call_types(old_pt, at, arg_id)
     if old_pt == at
       return old_pt
+    end
+    # Stale unqualified obj-name normalization. Same shape as the
+    # update_ivar_type fix: a Pass 1 ivar / param scan that ran
+    # before all sibling classes were registered may have stamped
+    # an unqualified `obj_<bare>` on a slot, which a later pass
+    # then sees alongside the qualified `obj_<scope>_<bare>`.
+    # Without this normalization the two strings compare unequal
+    # and the trailing `incompatible → poly` tail collapses the
+    # ptype, then propagates poly across every Class.new call site
+    # that reads the slot. Detect the relationship and accept the
+    # qualified form.
+    if is_obj_type(old_pt) == 1 && is_obj_type(at) == 1
+      old_bare_uct = old_pt[4, old_pt.length - 4]
+      new_bare_uct = at[4, at.length - 4]
+      if find_class_idx(old_bare_uct) < 0 && find_class_idx(new_bare_uct) >= 0
+        suffix_uct = "_" + old_bare_uct
+        if new_bare_uct.length > suffix_uct.length && new_bare_uct[(new_bare_uct.length - suffix_uct.length), suffix_uct.length] == suffix_uct
+          return at
+        end
+      end
+      if find_class_idx(new_bare_uct) < 0 && find_class_idx(old_bare_uct) >= 0
+        suffix_uct = "_" + new_bare_uct
+        if old_bare_uct.length > suffix_uct.length && old_bare_uct[(old_bare_uct.length - suffix_uct.length), suffix_uct.length] == suffix_uct
+          return old_pt
+        end
+      end
     end
     arg_is_literal = 0
     if arg_id >= 0 && is_literal_value_expr(arg_id) == 1
@@ -12417,6 +12471,65 @@ class Compiler
     finalize_ivar_heterogeneity
   end
 
+  # Drop "obj_<bare>" observations from `obs` when (a) <bare> doesn't
+  # resolve to any registered class, AND (b) some other observation in
+  # the list is "obj_<scope>_<bare>" for the same trailing <bare> and
+  # <scope>_<bare> IS registered. Caller passes the raw split list of
+  # observed types; we return a filtered list with stale unqualified
+  # obj-names removed (their qualified peer carries the same slot type
+  # information). Used by finalize_ivar_heterogeneity so the
+  # distinct-count poly-widen decision doesn't flip a single-class
+  # ivar to poly just because Pass 1 recorded the bare name and a
+  # later pass recorded the qualified one.
+  def drop_stale_unqualified_obj_obs(obs)
+    out = "".split(",")
+    # Type-prime locals as strings so spinel-self-compile picks the
+    # right C type (sp_str_sub_range / sp_str_concat returns
+    # `const char *`; without the empty-string seed scan_locals
+    # falls back to `mrb_int`, which then fails the `-Wint-conversion`
+    # bootstrap when this method is invoked from finalize_ivar_heterogeneity).
+    o = ""
+    p = ""
+    ob = ""
+    pb = ""
+    sfx = ""
+    tail = ""
+    oi = 0
+    while oi < obs.length
+      o = obs[oi]
+      keep = 1
+      if is_obj_type(o) == 1
+        ob = o[4, o.length - 4]
+        if find_class_idx(ob) < 0
+          oj = 0
+          while oj < obs.length
+            if oj != oi
+              p = obs[oj]
+              if is_obj_type(p) == 1
+                pb = p[4, p.length - 4]
+                if find_class_idx(pb) >= 0
+                  sfx = "_" + ob
+                  if pb.length > sfx.length
+                    tail = pb[(pb.length - sfx.length), sfx.length]
+                    if tail == sfx
+                      keep = 0
+                    end
+                  end
+                end
+              end
+            end
+            oj = oj + 1
+          end
+        end
+      end
+      if keep == 1
+        out.push(o)
+      end
+      oi = oi + 1
+    end
+    out
+  end
+
   def finalize_ivar_heterogeneity
     ci = 0
     while ci < @cls_names.length
@@ -12428,6 +12541,17 @@ class Compiler
       while ivk < names.length
         if ivk < types.length && ivk < obs.length && types[ivk] != "poly"
           distinct = obs[ivk].split(",")
+          # Collapse stale unqualified obj-name observations against
+          # their qualified form before the distinct-count widening
+          # decision. A first-pass `@x = Foo.new(...)` recorded inside
+          # a class whose sibling `Foo` hadn't been registered yet
+          # stamped "obj_Foo" into the observation list; a later pass
+          # (with all classes registered) records the proper
+          # "obj_<scope>_Foo". They refer to the same class, but the
+          # raw distinct-count below would treat them as 2 types and
+          # widen the slot to poly. Mirror the update_ivar_type /
+          # unify_call_types normalization.
+          distinct = drop_stale_unqualified_obj_obs(distinct)
           if distinct.length >= 2
             # When every observed type is itself an array AND the
             # current type is already `poly_array` (set by an earlier
@@ -15327,11 +15451,6 @@ class Compiler
       infer_function_body_call_types
       infer_class_body_call_types
       infer_ivar_types_from_writers
-      # After scan_locals has populated @meth_param_empty via the
-      # per-call-site forward propagation, promote int_array
-      # params to concrete typed-arrays where bodies push known
-      # types. The next iteration's scan_locals back-propagates
-      # those promoted types to caller-side locals.
       infer_param_array_type_from_body
       narrow_param_types_from_body_method_calls
       detect_poly_params
