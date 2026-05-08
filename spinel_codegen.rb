@@ -28648,20 +28648,32 @@ class Compiler
         # through silently, and the assignment never executes —
         # `obj.x = v` becomes a no-op.
         bname = mname[0, mname.length - 1]
-        val_expr = arg_compiled.length > 0 ? arg_compiled[0] : "0"
-        slot_t = cls_ivar_type(i, "@" + bname)
-        if slot_t == "poly" && arg_types.length > 0 && arg_types[0] != "poly" && arg_types[0] != ""
-          val_expr = box_value_to_poly(arg_types[0], val_expr)
+        raw_val = arg_compiled.length > 0 ? arg_compiled[0] : "0"
+        raw_t   = arg_types.length > 0 ? arg_types[0] : ""
+        slot_t  = cls_ivar_type(i, "@" + bname)
+        # Match the rhs to the slot's concrete C type for *this arm*.
+        # Three cases:
+        #   slot poly + arg concrete  -> box the arg.
+        #   slot concrete + arg poly  -> unbox the arg.
+        #   else                      -> direct assign.
+        # Different arms in the dispatch may take different branches
+        # (e.g. one slot is `int`, another is `string`).
+        store_val = raw_val
+        if slot_t == "poly" && raw_t != "poly" && raw_t != ""
+          store_val = box_value_to_poly(raw_t, raw_val)
+        elsif slot_t != "poly" && raw_t == "poly"
+          store_val = unbox_poly_to(slot_t, raw_val)
         end
         ivar_lhs = "((sp_" + cname + " *)" + recv_tmp + ".v.p)->" + sanitize_ivar("@" + bname)
-        # `x = v` returns v in Ruby; capture it in `tmp` for
-        # expression-position use, but the primary effect is the
-        # ivar write.
-        rhs_for_tmp = val_expr
+        # `x = v` returns v in Ruby. The result tmp's type is set by
+        # poly_dispatch_return_type (poly when slot types diverge,
+        # otherwise the common slot type). Box / coerce the stored
+        # value into the tmp's expected shape.
+        rhs_for_tmp = store_val
         if is_poly_ret == 1
-          rhs_for_tmp = box_val_to_poly(val_expr, slot_t)
+          rhs_for_tmp = box_val_to_poly(store_val, slot_t)
         end
-        emit("    if (" + recv_tmp + ".cls_id == " + i.to_s + ") { " + ivar_lhs + " = " + val_expr + "; " + tmp + " = " + rhs_for_tmp + "; }")
+        emit("    if (" + recv_tmp + ".cls_id == " + i.to_s + ") { " + ivar_lhs + " = " + store_val + "; " + tmp + " = " + rhs_for_tmp + "; }")
       end
       i = i + 1
     end
