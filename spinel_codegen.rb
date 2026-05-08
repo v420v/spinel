@@ -11147,6 +11147,241 @@ class Compiler
     end
   end
 
+  # Widen each method's stored parameter types to encompass any
+  # in-body reassignments to the parameter name. Without this,
+  # a body shape like
+  #
+  #   def f(hclk, ...)
+  #     hclk = "forever" if hclk == FOREVER_CLOCK
+  #     ...
+  #   end
+  #
+  # leaves `hclk`'s slot at the call-site-inferred `int`, and the
+  # `lv_hclk = (const char *)…` C statement fails -Wint-conversion.
+  # Widening to "poly" lets the slot hold both shapes via sp_RbVal.
+  #
+  # `int` is treated as a default/fallback (matches unify_call_types):
+  # int + concrete-non-int → concrete. Only genuinely incompatible
+  # writes (e.g. ptype already concrete and a different concrete
+  # write) escalate to poly.
+  def widen_param_types_from_body_writes
+    # Top-level methods.
+    mi = 0
+    while mi < @meth_names.length
+      bid = @meth_body_ids[mi]
+      if bid >= 0
+        pnames = @meth_param_names[mi].split(",")
+        ptypes = @meth_param_types[mi].split(",")
+        ptypes_changed = 0
+        pk = 0
+        while pk < pnames.length
+          if pk < ptypes.length
+            new_t = scan_param_body_write_unify(bid, pnames[pk], ptypes[pk])
+            if new_t != ptypes[pk]
+              ptypes[pk] = new_t
+              ptypes_changed = 1
+            end
+          end
+          pk = pk + 1
+        end
+        if ptypes_changed == 1
+          @meth_param_types[mi] = ptypes.join(",")
+        end
+      end
+      mi = mi + 1
+    end
+
+    # Per-class instance and class methods.
+    ci = 0
+    while ci < @cls_names.length
+      mnames = @cls_meth_names[ci].split(";")
+      all_params = @cls_meth_params[ci].split("|")
+      all_ptypes = @cls_meth_ptypes[ci].split("|")
+      bodies = @cls_meth_bodies[ci].split(";")
+      cls_changed = 0
+      mj = 0
+      while mj < mnames.length
+        if mj < all_params.length && mj < all_ptypes.length && mj < bodies.length
+          bid_j = bodies[mj].to_i
+          if bid_j >= 0
+            pnames_j = all_params[mj].split(",")
+            ptypes_j = all_ptypes[mj].split(",")
+            inner_changed = 0
+            pk = 0
+            while pk < pnames_j.length
+              if pk < ptypes_j.length
+                new_t = scan_param_body_write_unify(bid_j, pnames_j[pk], ptypes_j[pk])
+                if new_t != ptypes_j[pk]
+                  ptypes_j[pk] = new_t
+                  inner_changed = 1
+                end
+              end
+              pk = pk + 1
+            end
+            if inner_changed == 1
+              all_ptypes[mj] = ptypes_j.join(",")
+              cls_changed = 1
+            end
+          end
+        end
+        mj = mj + 1
+      end
+      if cls_changed == 1
+        @cls_meth_ptypes[ci] = all_ptypes.join("|")
+      end
+      ci = ci + 1
+    end
+  end
+
+  # Walk under `nid` looking for `LocalVariableWriteNode`s targeting
+  # `pname` and unify the literal-typed RHS with `cur_t`. Method-call
+  # RHSes are skipped: this pass runs before return-type inference,
+  # so `infer_type(<call>)` for an unanalyzed method falls through to
+  # the `int` default and would falsely widen a string param to poly.
+  # Literal RHSes (StringNode, IntegerNode, FloatNode, SymbolNode,
+  # NilNode, true/false) are reliable enough to widen on.
+  def scan_param_body_write_unify(nid, pname, cur_t)
+    if nid < 0
+      return cur_t
+    end
+    nt = @nd_type[nid]
+    if nt == "LocalVariableWriteNode"
+      if @nd_name[nid] == pname
+        rhs = @nd_expression[nid]
+        if rhs >= 0 && is_reliable_literal_for_widen(rhs) == 1
+          at = infer_type(rhs)
+          cur_t = unify_param_for_body_write(cur_t, at)
+        end
+      end
+    end
+    if nt == "MultiWriteNode"
+      mw_targets = parse_id_list(@nd_targets[nid])
+      mw_val = @nd_expression[nid]
+      ti = 0
+      mw_targets.each { |tid|
+        if @nd_type[tid] == "LocalVariableTargetNode" && @nd_name[tid] == pname
+          if mw_val >= 0 && @nd_type[mw_val] == "ArrayNode"
+            elems = parse_id_list(@nd_elements[mw_val])
+            if ti < elems.length && is_reliable_literal_for_widen(elems[ti]) == 1
+              slot_t = infer_type(elems[ti])
+              cur_t = unify_param_for_body_write(cur_t, slot_t)
+            end
+          end
+        end
+        ti = ti + 1
+      }
+    end
+    # Recurse into all child fields. Mirrors collect_param_methods'
+    # walk shape so we don't miss conditional/loop branches.
+    if @nd_body[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_body[nid], pname, cur_t)
+    end
+    stmts = parse_id_list(@nd_stmts[nid])
+    k = 0
+    while k < stmts.length
+      cur_t = scan_param_body_write_unify(stmts[k], pname, cur_t)
+      k = k + 1
+    end
+    if @nd_expression[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_expression[nid], pname, cur_t)
+    end
+    if @nd_predicate[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_predicate[nid], pname, cur_t)
+    end
+    if @nd_subsequent[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_subsequent[nid], pname, cur_t)
+    end
+    if @nd_else_clause[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_else_clause[nid], pname, cur_t)
+    end
+    if @nd_receiver[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_receiver[nid], pname, cur_t)
+    end
+    if @nd_arguments[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_arguments[nid], pname, cur_t)
+    end
+    args = parse_id_list(@nd_args[nid])
+    k = 0
+    while k < args.length
+      cur_t = scan_param_body_write_unify(args[k], pname, cur_t)
+      k = k + 1
+    end
+    conds = parse_id_list(@nd_conditions[nid])
+    k = 0
+    while k < conds.length
+      cur_t = scan_param_body_write_unify(conds[k], pname, cur_t)
+      k = k + 1
+    end
+    if @nd_left[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_left[nid], pname, cur_t)
+    end
+    if @nd_right[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_right[nid], pname, cur_t)
+    end
+    if @nd_block[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_block[nid], pname, cur_t)
+    end
+    elems = parse_id_list(@nd_elements[nid])
+    k = 0
+    while k < elems.length
+      cur_t = scan_param_body_write_unify(elems[k], pname, cur_t)
+      k = k + 1
+    end
+    if @nd_rescue_clause[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_rescue_clause[nid], pname, cur_t)
+    end
+    if @nd_ensure_clause[nid] >= 0
+      cur_t = scan_param_body_write_unify(@nd_ensure_clause[nid], pname, cur_t)
+    end
+    cur_t
+  end
+
+  # `nid` is a literal whose type is reliable even before
+  # return-type inference has run. Limits the body-write widening
+  # to writes whose RHS is unambiguous, avoiding false widenings
+  # driven by `infer_type` of unanalyzed method calls (which falls
+  # through to the `int` default).
+  def is_reliable_literal_for_widen(nid)
+    if nid < 0
+      return 0
+    end
+    nt = @nd_type[nid]
+    if nt == "StringNode" || nt == "IntegerNode" || nt == "FloatNode" || nt == "SymbolNode" || nt == "NilNode" || nt == "TrueNode" || nt == "FalseNode"
+      return 1
+    end
+    0
+  end
+
+  # Body-write unification rule. Distinct from `unify_call_types`
+  # because the call-site rule treats `int` as a placeholder that
+  # gets overwritten by any concrete `at` — that produces
+  # `int + string → string`, which is fine for call-site widening
+  # (`int` was a default) but wrong for body-write widening (the
+  # call site really did pass int, so the slot must hold both shapes).
+  def unify_param_for_body_write(pt_a, pt_b)
+    if pt_a == pt_b
+      return pt_a
+    end
+    # `nil` writes don't widen; `if x.nil?` body-side `x = sentinel`
+    # is a common shape that mustn't push the slot to poly.
+    if pt_a == "nil"
+      return pt_b
+    end
+    if pt_b == "nil"
+      return pt_a
+    end
+    # int + float coerce to float (numeric-compatible).
+    if pt_a == "int" && pt_b == "float"
+      return "float"
+    end
+    if pt_a == "float" && pt_b == "int"
+      return "float"
+    end
+    # Genuinely incompatible: must hold both at runtime.
+    @needs_rb_value = 1
+    return "poly"
+  end
+
   # Collect every method name called on `pname` anywhere under nid.
   # Used by parameter type inference to find the class that satisfies
   # ALL accesses, avoiding a single-reader match that ignores later
@@ -12880,6 +13115,11 @@ class Compiler
     update_ivar_types_from_params
     # Infer setter param types from ivar types
     infer_writer_param_types
+    # Widen param slot types when a body reassigns the param to an
+    # incompatible value (e.g. `def f(hclk); hclk = "forever" if
+    # hclk.nil?; end` — call sites pass int, body assigns string,
+    # so the slot becomes poly).
+    widen_param_types_from_body_writes
 
     # Top-level methods
     i = 0
