@@ -21308,7 +21308,16 @@ class Compiler
       exit(1)
     end
     if t == "IntegerNode"
-      return @nd_value[nid].to_s
+      # Suffix with `LL` so the literal is `long long` rather than
+      # `int` in the emitted C. Without it, an expression of int
+      # literals whose product exceeds int32 (e.g. APU mixer
+      # constant `24329 * 256 * 500 = 3,114,112,000`) overflows
+      # at constant-folding time and the C compiler emits a wrong
+      # value. Plain literals at runtime sites get implicitly
+      # promoted to mrb_int (= long long) on assignment, but
+      # constant-init expressions are evaluated by the C compiler
+      # using the literals' declared type.
+      return @nd_value[nid].to_s + "LL"
     end
     if t == "FloatNode"
       return @nd_content[nid]
