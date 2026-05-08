@@ -4802,6 +4802,9 @@ class Compiler
           if mname == "[]"
             return "string"
           end
+          if mname == "fetch"
+            return "string"
+          end
         end
         if rcname == "Dir"
           if mname == "home"
@@ -27915,6 +27918,29 @@ class Compiler
       if rcname == "ENV"
         if mname == "[]"
           return "sp_str_dup_external(getenv(" + compile_arg0(nid) + "))"
+        end
+        if mname == "fetch"
+          # Two-arg form: ENV.fetch(key, default). If the env var is
+          # set, return its value; otherwise return the supplied
+          # default. The single-arg form (`ENV.fetch("X")`) raises
+          # KeyError in CRuby; spinel doesn't model that, so it
+          # behaves like ENV[] -- callers wanting strict behaviour
+          # should pass an explicit default.
+          args_id = @nd_arguments[nid]
+          if args_id >= 0
+            argz = get_args(args_id)
+            if argz.length >= 2
+              key = compile_expr(argz[0])
+              dfl = compile_expr_as_string(argz[1])
+              tmp = new_temp
+              return "({ const char *" + tmp + " = getenv(" + key + "); " +
+                     tmp + " ? sp_str_dup_external(" + tmp + ") : (" + dfl + "); })"
+            end
+            if argz.length == 1
+              return "sp_str_dup_external(getenv(" + compile_arg0(nid) + "))"
+            end
+          end
+          return "(&(\"\\xff\")[1])"
         end
       end
       # Dir
