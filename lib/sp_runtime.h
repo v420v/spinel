@@ -1309,6 +1309,16 @@ static sp_Val *sp_lam_int(mrb_int n) { sp_Val *v = (sp_Val *)sp_lam_alloc(sizeof
 static sp_Val *sp_lam_bool(mrb_bool b) { sp_Val *v = (sp_Val *)sp_lam_alloc(sizeof(sp_Val)); v->tag = SP_BOOL2; v->u.bval = b; return v; }
 static sp_Val sp_lam_nil_val = { .tag = SP_NIL2 };
 static sp_Val *sp_lam_call(sp_Val *f, sp_Val *arg) { return f->u.proc.fn(f, arg); }
+/* Multi-arg lambda dispatch (issue #400). The fn pointer is stored
+   typed as `sp_fn_t` (1-arg) so re-cast at the call site to the
+   right arity. The generated lambda body is declared with the
+   matching arity so the actual ABI matches. */
+typedef sp_Val *(*sp_fn2_t)(sp_Val *self, sp_Val *a, sp_Val *b);
+typedef sp_Val *(*sp_fn3_t)(sp_Val *self, sp_Val *a, sp_Val *b, sp_Val *c);
+typedef sp_Val *(*sp_fn4_t)(sp_Val *self, sp_Val *a, sp_Val *b, sp_Val *c, sp_Val *d);
+static sp_Val *sp_lam_call2(sp_Val *f, sp_Val *a, sp_Val *b) { return ((sp_fn2_t)(uintptr_t)f->u.proc.fn)(f, a, b); }
+static sp_Val *sp_lam_call3(sp_Val *f, sp_Val *a, sp_Val *b, sp_Val *c) { return ((sp_fn3_t)(uintptr_t)f->u.proc.fn)(f, a, b, c); }
+static sp_Val *sp_lam_call4(sp_Val *f, sp_Val *a, sp_Val *b, sp_Val *c, sp_Val *d) { return ((sp_fn4_t)(uintptr_t)f->u.proc.fn)(f, a, b, c, d); }
 static mrb_int sp_lam_to_int(sp_Val *v) { return v->u.ival; }
 
 /* ---- Fiber runtime (ucontext) ---- */
