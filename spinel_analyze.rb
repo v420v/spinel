@@ -1828,6 +1828,27 @@ class Compiler
     # the cache once with correct context, infer_type stays
     # uncached during emission.
     t = @nd_type[nid]
+    if t == "SuperNode" || t == "ForwardingSuperNode"
+      # `super` returns whatever the parent's same-named method
+      # returns. Walk to the parent's `find_method_owner`-resolved
+      # method and read its return type.
+      if @current_class_idx >= 0 && @current_method_name != ""
+        parent_name_st = @cls_parents[@current_class_idx]
+        if parent_name_st != ""
+          parent_ci_st = find_class_idx(parent_name_st)
+          if parent_ci_st >= 0
+            owner_st = find_method_owner(parent_ci_st, @current_method_name)
+            if owner_st != ""
+              ret_st = cls_method_return(find_class_idx(owner_st), @current_method_name)
+              if ret_st != ""
+                return ret_st
+              end
+            end
+          end
+        end
+      end
+      return "int"
+    end
     if t == "IntegerNode"
       return "int"
     end
