@@ -2713,6 +2713,49 @@ class Compiler
       if mi_user >= 0
         return @meth_return_types[mi_user]
       end
+      # Issue #405: bare call inside a `def self.X` body resolves to
+      # a sibling cmeth on the same class/module. Two signals reach
+      # here at different stages: inference sets @current_method_name
+      # to "<Class>_cls_<m>" (so the marker scan succeeds); emission
+      # sets only @current_method_has_self == 0 + @current_class_idx
+      # for real-class cmeths (with @current_method_name = plain
+      # mname, no marker).
+      if @current_method_name != ""
+        mark_cm_405 = @current_method_name.index("_cls_")
+        if mark_cm_405 != nil && mark_cm_405 >= 0
+          owning_cm_405 = @current_method_name[0, mark_cm_405]
+          if module_name_exists(owning_cm_405) == 1
+            synth_cm_405 = owning_cm_405 + "_cls_" + mname
+            mi_cm_405 = find_method_idx(synth_cm_405)
+            if mi_cm_405 >= 0
+              return @meth_return_types[mi_cm_405]
+            end
+          end
+          cci_cm_405 = find_class_idx(owning_cm_405)
+          if cci_cm_405 >= 0
+            cmnames_cm_405 = @cls_cmeth_names[cci_cm_405].split(";")
+            cmreturns_cm_405 = @cls_cmeth_returns[cci_cm_405].split(";")
+            cmidx_cm_405 = 0
+            while cmidx_cm_405 < cmnames_cm_405.length
+              if cmnames_cm_405[cmidx_cm_405] == mname && cmidx_cm_405 < cmreturns_cm_405.length
+                return cmreturns_cm_405[cmidx_cm_405]
+              end
+              cmidx_cm_405 = cmidx_cm_405 + 1
+            end
+          end
+        end
+      end
+      if @current_class_idx >= 0 && @current_method_has_self == 0
+        cmnames_cm_405r = @cls_cmeth_names[@current_class_idx].split(";")
+        cmreturns_cm_405r = @cls_cmeth_returns[@current_class_idx].split(";")
+        cmidx_cm_405r = 0
+        while cmidx_cm_405r < cmnames_cm_405r.length
+          if cmnames_cm_405r[cmidx_cm_405r] == mname && cmidx_cm_405r < cmreturns_cm_405r.length
+            return cmreturns_cm_405r[cmidx_cm_405r]
+          end
+          cmidx_cm_405r = cmidx_cm_405r + 1
+        end
+      end
     end
 
     # Method name-based type inference
@@ -9354,6 +9397,53 @@ class Compiler
                   kk_286 = kk_286 + 1
                 end
                 cls_meth_ptypes_put(cls_owner_286, midx_286, ptypes_286)
+              end
+            end
+          end
+        end
+        # Issue #405: bare call inside a `def self.X` body resolves
+        # to a sibling cmeth on the same class/module. Widen the
+        # sibling's ptypes from this call site's args. Mirrors the
+        # explicit-`M.X(args)` widening branch below but keyed off
+        # @current_method_name's `<Class>_cls_<m>` marker (set by
+        # infer_function_body_call_types / infer_class_body_call_types
+        # before walking each cmeth body) since recv is absent here.
+        if @current_method_name != ""
+          marker_405 = @current_method_name.index("_cls_")
+          if marker_405 != nil && marker_405 >= 0
+            owning_405 = @current_method_name[0, marker_405]
+            cci_405 = find_class_idx(owning_405)
+            if cci_405 >= 0
+              cmnames_405 = @cls_cmeth_names[cci_405].split(";")
+              cmidx_405 = 0
+              while cmidx_405 < cmnames_405.length
+                if cmnames_405[cmidx_405] == mname
+                  args_id_405 = @nd_arguments[nid]
+                  if args_id_405 >= 0
+                    arg_ids_405 = get_args(args_id_405)
+                    cmpt_405 = cls_cmeth_ptypes_get(cci_405, cmidx_405)
+                    if cmpt_405.length > 0
+                      cmpn_405 = cls_cmeth_pnames_get(cci_405, cmidx_405)
+                      widen_ptypes_from_args(arg_ids_405, cmpn_405, cmpt_405)
+                      cls_cmeth_ptypes_put(cci_405, cmidx_405, cmpt_405)
+                    end
+                  end
+                end
+                cmidx_405 = cmidx_405 + 1
+              end
+            end
+            if module_name_exists(owning_405) == 1
+              synth_405 = owning_405 + "_cls_" + mname
+              sib_mi_405m = find_method_idx(synth_405)
+              if sib_mi_405m >= 0
+                args_id_405m = @nd_arguments[nid]
+                if args_id_405m >= 0
+                  arg_ids_405m = get_args(args_id_405m)
+                  ptypes_405m = @meth_param_types[sib_mi_405m].split(",")
+                  pnames_405m = @meth_param_names[sib_mi_405m].split(",")
+                  widen_ptypes_from_args(arg_ids_405m, pnames_405m, ptypes_405m)
+                  @meth_param_types[sib_mi_405m] = ptypes_405m.join(",")
+                end
               end
             end
           end

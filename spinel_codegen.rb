@@ -11323,6 +11323,74 @@ class Compiler
         rk = rk + 1
       end
     end
+    # Issue #405: bare call inside a `def self.X` body resolves to a
+    # sibling class method on the same class/module. Without this,
+    # `def self.insert(t); rows_for(t)[1] = "x"; end` falls through
+    # to warn_unresolved_call and emits 0, while CRuby/JRuby/mruby
+    # treat it as `self.rows_for(t)`. Two emit-time signals reach
+    # this point: module cmeths set @current_method_name to the
+    # synthetic `<Mod>_cls_<m>` form (so the marker scan below
+    # succeeds); real-class cmeths set @current_class_idx + plain
+    # mname, with @current_method_has_self == 0 distinguishing them
+    # from instance methods (which would have already resolved
+    # above at the @current_class_idx >= 0 branch).
+    if @current_method_name != ""
+      cls_idx_marker_405 = @current_method_name.index("_cls_")
+      if cls_idx_marker_405 != nil && cls_idx_marker_405 >= 0
+        owning_405 = @current_method_name[0, cls_idx_marker_405]
+        # Real-class case via the marker (set by infer_*_call_types
+        # during inference; emission re-derives via the @current_class_idx
+        # arm below).
+        cci_405 = find_class_idx(owning_405)
+        if cci_405 >= 0
+          cmnames_405 = @cls_cmeth_names[cci_405].split(";")
+          cmidx_405 = 0
+          while cmidx_405 < cmnames_405.length
+            if cmnames_405[cmidx_405] == mname
+              ca_405 = compile_call_args(nid)
+              if ca_405 == ""
+                return "sp_" + owning_405 + "_cls_" + sanitize_name(mname) + "()"
+              end
+              return "sp_" + owning_405 + "_cls_" + sanitize_name(mname) + "(" + ca_405 + ")"
+            end
+            cmidx_405 = cmidx_405 + 1
+          end
+        end
+        # Module case: cmeth is stored as synthetic `<Mod>_cls_<m>`
+        # in @meth_*. find_method_idx already handles the lookup.
+        if module_name_exists(owning_405) == 1
+          synth_405 = owning_405 + "_cls_" + mname
+          mi_405 = find_method_idx(synth_405)
+          if mi_405 >= 0
+            ca_405m = compile_call_args(nid)
+            if ca_405m == ""
+              return "sp_" + sanitize_name(synth_405) + "()"
+            end
+            return "sp_" + sanitize_name(synth_405) + "(" + ca_405m + ")"
+          end
+        end
+      end
+    end
+    # Real-class cmeth emit path: emit_class_level_method sets
+    # @current_method_name to the bare mname (no `_cls_` marker)
+    # and @current_method_has_self to 0, distinguishing it from
+    # instance methods (which set has_self = 1). Resolve sibling
+    # cmeths against @cls_cmeth_names directly.
+    if @current_class_idx >= 0 && @current_method_has_self == 0
+      cmnames_405r = @cls_cmeth_names[@current_class_idx].split(";")
+      cmidx_405r = 0
+      while cmidx_405r < cmnames_405r.length
+        if cmnames_405r[cmidx_405r] == mname
+          ca_405r = compile_call_args(nid)
+          owning_405r = @cls_names[@current_class_idx]
+          if ca_405r == ""
+            return "sp_" + owning_405r + "_cls_" + sanitize_name(mname) + "()"
+          end
+          return "sp_" + owning_405r + "_cls_" + sanitize_name(mname) + "(" + ca_405r + ")"
+        end
+        cmidx_405r = cmidx_405r + 1
+      end
+    end
     # Unresolved bare-name call (`foobar(0)`, `foobar`). CRuby would
     # raise NoMethodError; Spinel can't, but warning at codegen so the
     # user sees the problem is far better than a silently-empty binary.
