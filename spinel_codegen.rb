@@ -3247,6 +3247,49 @@ class Compiler
       if mi_user >= 0
         return @meth_return_types[mi_user]
       end
+      # Issue #405: bare call inside a `def self.X` body resolves to
+      # a sibling cmeth on the same class/module. Two signals reach
+      # here at different stages: inference sets @current_method_name
+      # to "<Class>_cls_<m>" (so the marker scan succeeds); emission
+      # sets only @current_method_has_self == 0 + @current_class_idx
+      # for real-class cmeths (with @current_method_name = plain
+      # mname, no marker).
+      if @current_method_name != ""
+        mark_cm_405 = @current_method_name.index("_cls_")
+        if mark_cm_405 != nil && mark_cm_405 >= 0
+          owning_cm_405 = @current_method_name[0, mark_cm_405]
+          if module_name_exists(owning_cm_405) == 1
+            synth_cm_405 = owning_cm_405 + "_cls_" + mname
+            mi_cm_405 = find_method_idx(synth_cm_405)
+            if mi_cm_405 >= 0
+              return @meth_return_types[mi_cm_405]
+            end
+          end
+          cci_cm_405 = find_class_idx(owning_cm_405)
+          if cci_cm_405 >= 0
+            cmnames_cm_405 = @cls_cmeth_names[cci_cm_405].split(";")
+            cmreturns_cm_405 = @cls_cmeth_returns[cci_cm_405].split(";")
+            cmidx_cm_405 = 0
+            while cmidx_cm_405 < cmnames_cm_405.length
+              if cmnames_cm_405[cmidx_cm_405] == mname && cmidx_cm_405 < cmreturns_cm_405.length
+                return cmreturns_cm_405[cmidx_cm_405]
+              end
+              cmidx_cm_405 = cmidx_cm_405 + 1
+            end
+          end
+        end
+      end
+      if @current_class_idx >= 0 && @current_method_has_self == 0
+        cmnames_cm_405r = @cls_cmeth_names[@current_class_idx].split(";")
+        cmreturns_cm_405r = @cls_cmeth_returns[@current_class_idx].split(";")
+        cmidx_cm_405r = 0
+        while cmidx_cm_405r < cmnames_cm_405r.length
+          if cmnames_cm_405r[cmidx_cm_405r] == mname && cmidx_cm_405r < cmreturns_cm_405r.length
+            return cmreturns_cm_405r[cmidx_cm_405r]
+          end
+          cmidx_cm_405r = cmidx_cm_405r + 1
+        end
+      end
     end
 
     # Method name-based type inference
@@ -10836,6 +10879,53 @@ class Compiler
                 end
                 all_ptypes_286[midx_286] = ptypes_286.join(",")
                 @cls_meth_ptypes[cls_owner_286] = all_ptypes_286.join("|")
+              end
+            end
+          end
+        end
+        # Issue #405: bare call inside a `def self.X` body resolves
+        # to a sibling cmeth on the same class/module. Widen the
+        # sibling's ptypes from this call site's args. Mirrors the
+        # explicit-`M.X(args)` widening branch below but keyed off
+        # @current_method_name's `<Class>_cls_<m>` marker (set by
+        # infer_function_body_call_types / infer_class_body_call_types
+        # before walking each cmeth body) since recv is absent here.
+        if @current_method_name != ""
+          marker_405 = @current_method_name.index("_cls_")
+          if marker_405 != nil && marker_405 >= 0
+            owning_405 = @current_method_name[0, marker_405]
+            cci_405 = find_class_idx(owning_405)
+            if cci_405 >= 0
+              cmnames_405 = @cls_cmeth_names[cci_405].split(";")
+              cmidx_405 = 0
+              while cmidx_405 < cmnames_405.length
+                if cmnames_405[cmidx_405] == mname
+                  args_id_405 = @nd_arguments[nid]
+                  if args_id_405 >= 0
+                    arg_ids_405 = get_args(args_id_405)
+                    cmpt_405 = cls_cmeth_ptypes_get(cci_405, cmidx_405)
+                    if cmpt_405.length > 0
+                      cmpn_405 = cls_cmeth_pnames_get(cci_405, cmidx_405)
+                      widen_ptypes_from_args(arg_ids_405, cmpn_405, cmpt_405)
+                      cls_cmeth_ptypes_put(cci_405, cmidx_405, cmpt_405)
+                    end
+                  end
+                end
+                cmidx_405 = cmidx_405 + 1
+              end
+            end
+            if module_name_exists(owning_405) == 1
+              synth_405 = owning_405 + "_cls_" + mname
+              sib_mi_405m = find_method_idx(synth_405)
+              if sib_mi_405m >= 0
+                args_id_405m = @nd_arguments[nid]
+                if args_id_405m >= 0
+                  arg_ids_405m = get_args(args_id_405m)
+                  ptypes_405m = @meth_param_types[sib_mi_405m].split(",")
+                  pnames_405m = @meth_param_names[sib_mi_405m].split(",")
+                  widen_ptypes_from_args(arg_ids_405m, pnames_405m, ptypes_405m)
+                  @meth_param_types[sib_mi_405m] = ptypes_405m.join(",")
+                end
               end
             end
           end
@@ -24728,6 +24818,74 @@ class Compiler
           return self_arrow + sanitize_ivar(mname)
         end
         rk = rk + 1
+      end
+    end
+    # Issue #405: bare call inside a `def self.X` body resolves to a
+    # sibling class method on the same class/module. Without this,
+    # `def self.insert(t); rows_for(t)[1] = "x"; end` falls through
+    # to warn_unresolved_call and emits 0, while CRuby/JRuby/mruby
+    # treat it as `self.rows_for(t)`. Two emit-time signals reach
+    # this point: module cmeths set @current_method_name to the
+    # synthetic `<Mod>_cls_<m>` form (so the marker scan below
+    # succeeds); real-class cmeths set @current_class_idx + plain
+    # mname, with @current_method_has_self == 0 distinguishing them
+    # from instance methods (which would have already resolved
+    # above at the @current_class_idx >= 0 branch).
+    if @current_method_name != ""
+      cls_idx_marker_405 = @current_method_name.index("_cls_")
+      if cls_idx_marker_405 != nil && cls_idx_marker_405 >= 0
+        owning_405 = @current_method_name[0, cls_idx_marker_405]
+        # Real-class case via the marker (set by infer_*_call_types
+        # during inference; emission re-derives via the @current_class_idx
+        # arm below).
+        cci_405 = find_class_idx(owning_405)
+        if cci_405 >= 0
+          cmnames_405 = @cls_cmeth_names[cci_405].split(";")
+          cmidx_405 = 0
+          while cmidx_405 < cmnames_405.length
+            if cmnames_405[cmidx_405] == mname
+              ca_405 = compile_call_args(nid)
+              if ca_405 == ""
+                return "sp_" + owning_405 + "_cls_" + sanitize_name(mname) + "()"
+              end
+              return "sp_" + owning_405 + "_cls_" + sanitize_name(mname) + "(" + ca_405 + ")"
+            end
+            cmidx_405 = cmidx_405 + 1
+          end
+        end
+        # Module case: cmeth is stored as synthetic `<Mod>_cls_<m>`
+        # in @meth_*. find_method_idx already handles the lookup.
+        if module_name_exists(owning_405) == 1
+          synth_405 = owning_405 + "_cls_" + mname
+          mi_405 = find_method_idx(synth_405)
+          if mi_405 >= 0
+            ca_405m = compile_call_args(nid)
+            if ca_405m == ""
+              return "sp_" + sanitize_name(synth_405) + "()"
+            end
+            return "sp_" + sanitize_name(synth_405) + "(" + ca_405m + ")"
+          end
+        end
+      end
+    end
+    # Real-class cmeth emit path: emit_class_level_method sets
+    # @current_method_name to the bare mname (no `_cls_` marker)
+    # and @current_method_has_self to 0, distinguishing it from
+    # instance methods (which set has_self = 1). Resolve sibling
+    # cmeths against @cls_cmeth_names directly.
+    if @current_class_idx >= 0 && @current_method_has_self == 0
+      cmnames_405r = @cls_cmeth_names[@current_class_idx].split(";")
+      cmidx_405r = 0
+      while cmidx_405r < cmnames_405r.length
+        if cmnames_405r[cmidx_405r] == mname
+          ca_405r = compile_call_args(nid)
+          owning_405r = @cls_names[@current_class_idx]
+          if ca_405r == ""
+            return "sp_" + owning_405r + "_cls_" + sanitize_name(mname) + "()"
+          end
+          return "sp_" + owning_405r + "_cls_" + sanitize_name(mname) + "(" + ca_405r + ")"
+        end
+        cmidx_405r = cmidx_405r + 1
       end
     end
     # Unresolved bare-name call (`foobar(0)`, `foobar`). CRuby would
