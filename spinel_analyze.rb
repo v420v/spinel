@@ -2303,6 +2303,20 @@ class Compiler
         @needs_rb_value = 1
         return "poly_array"
       end
+      # Hash literals as elements (`[{n: 3}, {n: 1}]`): each
+      # element is a heap-allocated hash pointer. Spinel has no
+      # typed `<hash>_ptr_array` slot, so box via poly_array;
+      # sp_box_hash_to_poly is called on each push and the
+      # poly-builtin dispatch on `arr[i]` recovers the hash.
+      # Without this arm, the array's inferred type fell back to
+      # `int_array` (the bottom of this function), and
+      # `sp_IntArray_push` was called with a hash pointer —
+      # int-from-pointer C-compile error.
+      if is_hash_type(et) == 1
+        @needs_gc = 1
+        @needs_rb_value = 1
+        return "poly_array"
+      end
       # Check if elements have mixed types
       k = 1
       while k < elems.length
@@ -5944,6 +5958,15 @@ class Compiler
       val_t = infer_type(@nd_expression[nid])
       register_cvar(qname, val_t)
       try_fold_cvar_init(qname, @nd_expression[nid])
+    end
+    # `@@x op= val` / `@@x ||= val` / `@@x &&= val` — same
+    # storage as plain `@@x = ...`. Register the cvar so the
+    # static decl pass emits a slot, and seed its type from the
+    # rhs (or default int for `||=`/`&&=` reading nil).
+    if t == "ClassVariableOperatorWriteNode" || t == "ClassVariableOrWriteNode" || t == "ClassVariableAndWriteNode"
+      qname = cvar_qname(class_idx, @nd_name[nid])
+      val_t = infer_type(@nd_expression[nid])
+      register_cvar(qname, val_t)
     end
     cs = []
     push_child_ids(nid, cs)
