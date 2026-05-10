@@ -2405,6 +2405,18 @@ class Compiler
   end
 
   def infer_hash_val_type(nid)
+    rt = infer_hash_val_type_raw(nid)
+    # Issue #415: every observed hash variant must flag its template
+    # need so emit_hash_runtime instantiates the typedef + helpers.
+    # Without this the `{ sym: @ivar }` shape — where the value's
+    # concrete type is only resolved on a later inference iteration
+    # via the value cache — emits `sp_SymStrHash *` references with
+    # no matching typedef in the translation unit.
+    mark_hash_needs(rt)
+    rt
+  end
+
+  def infer_hash_val_type_raw(nid)
     elems = parse_id_list(@nd_elements[nid])
     if elems.length > 0
       eid = elems[0]
