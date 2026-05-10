@@ -17,19 +17,28 @@
 #
 # Coverage: shape rather than exact-string assertions, since the
 # output depends on the system clock + local-time offset. We
-# assert that both calls return a string of plausible length and
-# that strftime honours its format (a `%Y` slot produces a
-# 4-digit year).
+# assert that both calls return a string of the expected length
+# and that the surrounding format characters land in the right
+# positions.
+#
+# The runtime computes the offset via mktime(gmtime(s)) - s rather
+# than strftime's %z, so the format is stable across libcs --
+# previous attempts relied on POSIX %z (±HHMM) but Windows MSVCRT
+# emits the timezone *name* instead, blowing past any reasonable
+# length cap.
 
 t = Time.now
 iso = t.iso8601
 
-# iso8601 produces "YYYY-MM-DDTHH:MM:SS+HH:MM" or "...-HH:MM" or "...Z".
-# A correctly-typed string has length 25 (offset form) or 20 (Z form).
-puts iso.length >= 19 && iso.length <= 32 ? "iso-len-ok" : "iso-len-bad"
+# iso8601 produces exactly "YYYY-MM-DDTHH:MM:SS[+-]HH:MM":
+# 19 chars for the date+time prefix + 6 chars for the offset = 25.
+puts iso.length == 25 ? "iso-len-ok" : "iso-len-bad"
 
-# The 5th character is "-" (year separator).
-puts iso[4] == "-" ? "iso-shape-ok" : "iso-shape-bad"
+# Per-position shape: dashes at 4/7, T at 10, colons at 13/16,
+# sign at 19, colon at 22.
+puts iso[4] == "-" && iso[7] == "-" && iso[10] == "T" &&
+     iso[13] == ":" && iso[16] == ":" &&
+     (iso[19] == "+" || iso[19] == "-") && iso[22] == ":" ? "iso-shape-ok" : "iso-shape-bad"
 
 # strftime: a fixed-format that survives clock variation.
 ymd = t.strftime("%Y-%m-%d")

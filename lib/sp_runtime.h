@@ -258,31 +258,44 @@ static const char *sp_time_strftime(sp_Time t, const char *fmt) {
   return sp_str_dup_external(buf);
 }
 
-/* Issue #414: Time#iso8601 — RFC 3339 style "%Y-%m-%dT%H:%M:%S%:z".
-   strftime's %z gives the offset as ±HHMM, so we splice in the colon
-   manually to match CRuby's iso8601 output. Sub-second precision is
-   intentionally omitted: CRuby's iso8601 also drops it unless the
-   caller passes a precision arg, which Phase 1 doesn't support. */
+/* Issue #414: Time#iso8601 — RFC 3339 style. Format the date+time
+   prefix with strftime, then compute the UTC offset manually via
+   `mktime(gmtime(s)) - s` rather than relying on strftime's %z.
+   The original implementation used %z, which is POSIX-defined as
+   ±HHMM but Windows MSVCRT instead emits the timezone *name*
+   (e.g. "Coordinated Universal Time") — long, locale-sensitive,
+   and unsuitable for an iso8601 string. Computing the offset
+   from the gmtime/mktime difference gives the same answer on
+   every libc we target.
+   Sub-second precision is intentionally omitted: CRuby's iso8601
+   also drops it unless the caller passes a precision arg, which
+   Phase 1 doesn't support. */
 static const char *sp_time_iso8601(sp_Time t) {
   char buf[64];
   time_t s = (time_t)t.tv_sec;
   struct tm *lt = localtime(&s);
   if (lt == NULL) return SPL("");
-  size_t n = strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S%z", lt);
-  if (n == 0) return SPL("");
-  /* Insert a colon between the offset's hour and minute halves
-     (e.g. "-0400" -> "-04:00"). strftime %z always emits 5 chars at
-     the tail; if it's missing for some libc, leave the buffer alone. */
-  if (n >= 5 && (buf[n - 5] == '+' || buf[n - 5] == '-')) {
-    char m1 = buf[n - 2], m2 = buf[n - 1];
-    buf[n - 2] = ':';
-    buf[n - 1] = m1;
-    buf[n] = m2;
-    buf[n + 1] = 0;
-    n++;
-  } else {
-    buf[n] = 0;
-  }
+  size_t n = strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%S", lt);
+  if (n == 0 || n + 6 >= sizeof(buf)) return SPL("");
+  /* Compute UTC offset portably: re-interpret gmtime's broken-down
+     value as if it were local-time via mktime, then the difference
+     from the original epoch is the offset in seconds. mktime mutates
+     tm_isdst, so use a fresh copy. */
+  struct tm gm = *gmtime(&s);
+  gm.tm_isdst = -1;
+  time_t gm_as_if_local = mktime(&gm);
+  long offset_sec = (long)(s - gm_as_if_local);
+  char sign = offset_sec >= 0 ? '+' : '-';
+  long abs_off = offset_sec < 0 ? -offset_sec : offset_sec;
+  int oh = (int)(abs_off / 3600);
+  int om = (int)((abs_off / 60) % 60);
+  buf[n++] = sign;
+  buf[n++] = (char)('0' + (oh / 10));
+  buf[n++] = (char)('0' + (oh % 10));
+  buf[n++] = ':';
+  buf[n++] = (char)('0' + (om / 10));
+  buf[n++] = (char)('0' + (om % 10));
+  buf[n] = 0;
   return sp_str_dup_external(buf);
 }
 
