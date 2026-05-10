@@ -12410,42 +12410,18 @@ class Compiler
         declare_var(pnames[j], pt)
         j = j + 1
       end
-      # Also declare locals for better return type inference
+      # Also declare locals for better return type inference.
+      # Route through refine_method_body_locals so the same
+      # multi-pass refinement precompute_all_scope_decls runs at
+      # end-of-analyze applies here too — without it #412's
+      # int_array -> ptr_array upgrade (and #411's nil ->
+      # nullable_pointer promotion) only land at scope-decl emit
+      # time, after `infer_body_return` has already pinned the
+      # function's return type at the unrefined value.
       if @meth_body_ids[i] >= 0
         lnames = "".split(",")
         ltypes = "".split(",")
-        scan_locals(@meth_body_ids[i], lnames, ltypes, pnames)
-        lk = 0
-        while lk < lnames.length
-          declare_var(lnames[lk], ltypes[lk])
-          lk = lk + 1
-        end
-        # Second pass: upgrade nil/int types with better information
-        lnames2 = "".split(",")
-        ltypes2 = "".split(",")
-        scan_locals(@meth_body_ids[i], lnames2, ltypes2, pnames)
-        lk = 0
-        while lk < lnames2.length
-          mk = 0
-          while mk < lnames.length
-            if lnames[mk] == lnames2[lk]
-              if ltypes[mk] == "int" || ltypes[mk] == "nil"
-                if ltypes2[lk] != "int" && ltypes2[lk] != "nil"
-                  ltypes[mk] = ltypes2[lk]
-                  set_var_type(lnames[mk], ltypes2[lk])
-                end
-              elsif (ltypes2[lk] == "str_poly_hash" || ltypes2[lk] == "sym_poly_hash") && ltypes[mk] != ltypes2[lk]
-                # The 2nd pass discovered the iterated value is
-                # poly (each-rebuild over a poly_hash whose source
-                # type wasn't known on the 1st pass). Upgrade.
-                ltypes[mk] = ltypes2[lk]
-                set_var_type(lnames[mk], ltypes2[lk])
-              end
-            end
-            mk = mk + 1
-          end
-          lk = lk + 1
-        end
+        refine_method_body_locals(@meth_body_ids[i], lnames, ltypes, pnames)
       end
       rt = infer_body_return(@meth_body_ids[i])
       @meth_return_types[i] = rt
@@ -19792,6 +19768,19 @@ class Compiler
             end
             set_var_type(lnames[k], ltypes[k])
           elsif (ltypes2[j] == "str_poly_hash" || ltypes2[j] == "sym_poly_hash") && ltypes[k] != ltypes2[j]
+            ltypes[k] = ltypes2[j]
+            set_var_type(lnames[k], ltypes2[j])
+          # Issue #412: pass 1 typed `results` as int_array (from
+          # the empty `[]` literal). Pass 2's `<<` push observation,
+          # with the rhs local now in scope, refined the type to
+          # str_array / float_array / sym_array / *_ptr_array. Without
+          # this branch the refined type is dropped and codegen emits
+          # `sp_IntArray *` against a body that pushes typed pointers,
+          # tripping the cc step at the push site.
+          elsif ltypes[k] == "int_array" && ltypes2[j] != "int_array" &&
+                (ltypes2[j] == "str_array" || ltypes2[j] == "float_array" ||
+                 ltypes2[j] == "sym_array" || is_ptr_array_type(ltypes2[j]) == 1 ||
+                 ltypes2[j] == "poly_array")
             ltypes[k] = ltypes2[j]
             set_var_type(lnames[k], ltypes2[j])
           end
