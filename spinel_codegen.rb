@@ -23637,6 +23637,30 @@ class Compiler
       emit("  sp_StrStrHash_set(" + rc + ", " + idx + ", " + val + ");")
       return
     end
+    # Issue #413: user-class `def []=(key, value)`. The recv is a
+    # typed instance (`obj_<C>`); dispatch to the class's `_aset`
+    # method, with arg boxing matching the method's declared
+    # param types (a `value` param widened to poly takes the rhs
+    # box, a typed param takes it raw).
+    if is_obj_type(rt) == 1
+      bt_aset = base_type(rt)
+      cname_aset = bt_aset[4, bt_aset.length - 4]
+      ci_aset = find_class_idx(cname_aset)
+      if ci_aset >= 0
+        owner_aset = find_method_owner(ci_aset, "[]=")
+        if owner_aset != ""
+          owner_ci_aset = find_class_idx(owner_aset)
+          midx_aset = cls_find_method_direct(owner_ci_aset, "[]=")
+          if midx_aset >= 0
+            ca_aset = compile_typed_call_args(nid, owner_ci_aset, midx_aset, 0)
+            recv_arg_aset = owner_aset == cname_aset ? rc : "(sp_" + owner_aset + " *)" + rc
+            tail_aset = ca_aset != "" ? ", " + ca_aset : ""
+            emit("  sp_" + owner_aset + "__aset(" + recv_arg_aset + tail_aset + ");")
+            return
+          end
+        end
+      end
+    end
   end
 
   # `arr[start, len] = src` where arr is a poly-typed slot (sp_RbVal).
