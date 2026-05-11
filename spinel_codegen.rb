@@ -14905,6 +14905,50 @@ class Compiler
         @needs_rb_value = 1
         return "sp_StrPolyHash_values(" + rc + ")"
       end
+      # Issue #426: Hash#merge on str_poly_hash. Returns a fresh
+      # str_poly_hash carrying both sides' entries. The arg's hash
+      # variant determines how its values get boxed into the poly
+      # slot: a str_poly_hash arg drops in directly; str_str_hash
+      # / str_int_hash arg's values get boxed to sp_RbVal via an
+      # inline copy loop.
+      if mname == "merge"
+        args_id = @nd_arguments[nid]
+        if args_id >= 0
+          aargs = get_args(args_id)
+          if aargs.length == 1
+            arg_t = infer_type(aargs[0])
+            @needs_str_poly_hash = 1
+            @needs_rb_value = 1
+            if arg_t == "str_poly_hash"
+              return "sp_StrPolyHash_merge(" + rc + ", " + compile_arg0(nid) + ")"
+            elsif arg_t == "str_str_hash"
+              tmp = new_temp
+              src = new_temp
+              ii = new_temp
+              @needs_str_str_hash = 1
+              emit("  sp_StrStrHash *" + src + " = " + compile_arg0(nid) + ";")
+              emit("  sp_StrPolyHash *" + tmp + " = sp_StrPolyHash_new();")
+              emit("  for (mrb_int " + ii + " = 0; " + ii + " < " + rc + "->len; " + ii + "++)")
+              emit("    sp_StrPolyHash_set(" + tmp + ", " + rc + "->order[" + ii + "], sp_StrPolyHash_get(" + rc + ", " + rc + "->order[" + ii + "]));")
+              emit("  for (mrb_int " + ii + " = 0; " + ii + " < " + src + "->len; " + ii + "++)")
+              emit("    sp_StrPolyHash_set(" + tmp + ", " + src + "->order[" + ii + "], sp_box_str(sp_StrStrHash_get(" + src + ", " + src + "->order[" + ii + "])));")
+              return tmp
+            elsif arg_t == "str_int_hash"
+              tmp = new_temp
+              src = new_temp
+              ii = new_temp
+              @needs_str_int_hash = 1
+              emit("  sp_StrIntHash *" + src + " = " + compile_arg0(nid) + ";")
+              emit("  sp_StrPolyHash *" + tmp + " = sp_StrPolyHash_new();")
+              emit("  for (mrb_int " + ii + " = 0; " + ii + " < " + rc + "->len; " + ii + "++)")
+              emit("    sp_StrPolyHash_set(" + tmp + ", " + rc + "->order[" + ii + "], sp_StrPolyHash_get(" + rc + ", " + rc + "->order[" + ii + "]));")
+              emit("  for (mrb_int " + ii + " = 0; " + ii + " < " + src + "->len; " + ii + "++)")
+              emit("    sp_StrPolyHash_set(" + tmp + ", " + src + "->order[" + ii + "], sp_box_int(sp_StrIntHash_get(" + src + ", " + src + "->order[" + ii + "])));")
+              return tmp
+            end
+          end
+        end
+      end
     end
     if recv_type == "poly_poly_hash"
       args_id_ph = @nd_arguments[nid]
