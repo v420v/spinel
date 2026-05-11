@@ -3143,6 +3143,47 @@ class Compiler
     ""
   end
 
+  # Issue #407: does any user class declare `mname` as an
+  # instance method? Used by the hardcoded name-based inference
+  # arms below to defer when the recv's type isn't pinned yet
+  # but a user-class definition exists that could win at runtime.
+  # Falling through to infer_recv_method_type lets the
+  # cls_method_return path pick up the user's return type while
+  # still terminating at "int" if no obj_<C> resolution lands.
+  def any_user_class_defines_imeth(mname)
+    ck = 0
+    while ck < @cls_names.length
+      names_407 = @cls_meth_names[ck].split(";")
+      kk = 0
+      while kk < names_407.length
+        if names_407[kk] == mname
+          return 1
+        end
+        kk = kk + 1
+      end
+      ck = ck + 1
+    end
+    0
+  end
+
+  # Issue #407: recv is plausibly a user-class instance at runtime
+  # even when its current inferred type is "int" or "" (because the
+  # var-type table hasn't been populated yet during the iterative
+  # inference loop). Returns 1 for LocalVariableReadNode /
+  # CallNode / InstanceVariableReadNode whose actual runtime type
+  # is obj_<C>. False for literal nodes (IntegerNode, StringNode,
+  # etc.) where the recv is statically a primitive.
+  def recv_could_be_obj(recv)
+    if recv < 0
+      return 0
+    end
+    t_407rc = @nd_type[recv]
+    if t_407rc == "IntegerNode" || t_407rc == "StringNode" || t_407rc == "FloatNode" || t_407rc == "SymbolNode" || t_407rc == "TrueNode" || t_407rc == "FalseNode" || t_407rc == "NilNode" || t_407rc == "ArrayNode" || t_407rc == "HashNode" || t_407rc == "RangeNode"
+      return 0
+    end
+    1
+  end
+
   def infer_method_name_type(nid, mname, recv)
     # Issue #407: when recv is a class/module constant ref whose
     # class/module defines a class method of the given name, defer
@@ -3155,6 +3196,25 @@ class Compiler
     # use site. Return "" so the caller falls through to
     # infer_constant_recv_type, which already does the
     # cls_cmethod_return_inherited / `<Mod>_cls_<m>` lookup.
+    #
+    # Symmetric instance-method case: when recv is a statically
+    # typed obj_<C> instance and C (or any ancestor) defines an
+    # instance method named mname, defer to infer_recv_method_type
+    # so its cls_method_return path returns the user's type
+    # instead of the hardcoded Object#... default. Mirrors the
+    # cmeth defer above; both target the imeth shape Ori called
+    # out (`Item#hash` shadowed by Object#hash returning int).
+    if recv >= 0
+      rt_407i = infer_type(recv)
+      if is_obj_type(rt_407i) == 1
+        bt_407i = base_type(rt_407i)
+        cname_407i = bt_407i[4, bt_407i.length - 4]
+        ci_407i = find_class_idx(cname_407i)
+        if ci_407i >= 0 && cls_find_method(ci_407i, mname) >= 0
+          return ""
+        end
+      end
+    end
     if recv >= 0 && (@nd_type[recv] == "ConstantReadNode" || @nd_type[recv] == "ConstantPathNode")
       rcname_407 = constructor_class_name(recv)
       if rcname_407 != ""
@@ -3170,9 +3230,15 @@ class Compiler
       end
     end
     if mname == "length"
+      if recv_could_be_obj(recv) == 1 && any_user_class_defines_imeth(mname) == 1
+        return ""
+      end
       return "int"
     end
     if mname == "to_s"
+      if recv_could_be_obj(recv) == 1 && any_user_class_defines_imeth(mname) == 1
+        return ""
+      end
       return "string"
     end
     if mname == "inspect"
@@ -3221,9 +3287,15 @@ class Compiler
       end
     end
     if mname == "to_i"
+      if recv_could_be_obj(recv) == 1 && any_user_class_defines_imeth(mname) == 1
+        return ""
+      end
       return "int"
     end
     if mname == "to_f"
+      if recv_could_be_obj(recv) == 1 && any_user_class_defines_imeth(mname) == 1
+        return ""
+      end
       return "float"
     end
     # Issue #414: Time#iso8601 and Time#strftime — both return a
@@ -3342,6 +3414,9 @@ class Compiler
       end
     end
     if mname == "hash"
+      if recv_could_be_obj(recv) == 1 && any_user_class_defines_imeth(mname) == 1
+        return ""
+      end
       return "int"
     end
     if mname == "strip"
@@ -3653,9 +3728,15 @@ class Compiler
       return "int"
     end
     if mname == "count"
+      if recv_could_be_obj(recv) == 1 && any_user_class_defines_imeth(mname) == 1
+        return ""
+      end
       return "int"
     end
     if mname == "size"
+      if recv_could_be_obj(recv) == 1 && any_user_class_defines_imeth(mname) == 1
+        return ""
+      end
       return "int"
     end
     if mname == "index" || mname == "find_index" || mname == "rindex"
