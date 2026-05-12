@@ -12519,19 +12519,43 @@ class Compiler
  # the IntArray default (from `[]`) promotes to the correct
  # element-typed array when the push args are non-int.
       push_alias_iname = ""
+      push_alias_owner_ci = -1
       if (mname == "push" || mname == "<<") && @current_class_idx >= 0 && recv >= 0
+        getter_mname_x = ""
         if @nd_type[recv] == "CallNode" && @nd_receiver[recv] < 0
-          getter_mname = @nd_name[recv]
-          push_alias_iname = method_returns_ivar_in_class(@current_class_idx, getter_mname)
+          getter_mname_x = @nd_name[recv]
         end
         if @nd_type[recv] == "CallNode" && @nd_receiver[recv] >= 0 && @nd_type[@nd_receiver[recv]] == "SelfNode"
-          getter_mname_s = @nd_name[recv]
-          push_alias_iname = method_returns_ivar_in_class(@current_class_idx, getter_mname_s)
+          getter_mname_x = @nd_name[recv]
+        end
+        if getter_mname_x != ""
+ # Walk the parent chain so a getter defined on a parent
+ # class (Rails-style `def errors; @errors = [] if
+ # @errors.nil?; @errors; end` on Base) is matched when the
+ # push happens from a subclass method. Without the walk
+ # (#430 only inspected @current_class_idx) the parent's
+ # ivar stays IntArray and the subclass's String push fails
+ # C compile (#451).
+          search_ci = @current_class_idx
+          while search_ci >= 0
+            iname_try = method_returns_ivar_in_class(search_ci, getter_mname_x)
+            if iname_try != ""
+              push_alias_iname = iname_try
+              push_alias_owner_ci = search_ci
+              break
+            end
+            parent_name = @cls_parents[search_ci]
+            if parent_name == ""
+              search_ci = -1
+            else
+              search_ci = find_class_idx(parent_name)
+            end
+          end
         end
       end
-      if (mname == "push" || mname == "<<") && @current_class_idx >= 0 && push_alias_iname != ""
+      if (mname == "push" || mname == "<<") && push_alias_owner_ci >= 0 && push_alias_iname != ""
         iname = push_alias_iname
-        cur_t = cls_ivar_type(@current_class_idx, iname)
+        cur_t = cls_ivar_type(push_alias_owner_ci, iname)
         if cur_t == "int_array"
           args_id = @nd_arguments[nid]
           if args_id >= 0
@@ -12540,7 +12564,7 @@ class Compiler
               et = infer_type(ai[0])
               promoted = empty_array_promotion_for([et])
               if promoted != "" && promoted != cur_t
-                replace_ivar_type(@current_class_idx, iname, promoted)
+                replace_ivar_type(push_alias_owner_ci, iname, promoted)
                 if promoted == "str_array"
                   @needs_str_array = 1
                 elsif promoted == "float_array"
