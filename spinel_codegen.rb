@@ -16220,10 +16220,10 @@ class Compiler
     if recv_type == "int_str_hash"
       @needs_int_str_hash = 1
       if mname == "[]"
-        return "sp_IntStrHash_get(" + rc + ", " + compile_arg0(nid) + ")"
+        return "sp_IntStrHash_get(" + rc + ", " + compile_arg0_as_int(nid) + ")"
       end
       if mname == "has_key?" || mname == "key?" || mname == "include?" || mname == "member?"
-        return "sp_IntStrHash_has_key(" + rc + ", " + compile_arg0(nid) + ")"
+        return "sp_IntStrHash_has_key(" + rc + ", " + compile_arg0_as_int(nid) + ")"
       end
       if mname == "length" || mname == "size" || (mname == "count" && @nd_block[nid] < 0 && @nd_arguments[nid] < 0)
         return "sp_IntStrHash_length(" + rc + ")"
@@ -16247,6 +16247,9 @@ class Compiler
         if args_id >= 0
           aargs = get_args(args_id)
           key = compile_expr(aargs[0])
+          if infer_type(aargs[0]) == "poly"
+            key = "(" + key + ").v.i"
+          end
           if aargs.length >= 2
             defval = compile_expr(aargs[1])
             return "(sp_IntStrHash_has_key(" + rc + ", " + key + ") ? sp_IntStrHash_get(" + rc + ", " + key + ") : " + defval + ")"
