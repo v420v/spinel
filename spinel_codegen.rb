@@ -17148,6 +17148,17 @@ class Compiler
                 end
               end
             end
+            has_block_param_239 = (owner_pt.length > 0 && owner_pt.last == "proc") ? 1 : 0
+            if has_block_param_239 == 1
+              block_proc = block_forward_expr(nid)
+              if block_proc != ""
+                if ca != ""
+                  ca = ca + ", " + block_proc
+                else
+                  ca = block_proc
+                end
+              end
+            end
           end
           if ca != ""
             return "sp_" + owner_name + "_cls_" + sanitize_name(mname) + "(" + ca + ")"
