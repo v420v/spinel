@@ -352,6 +352,12 @@ class Compiler
  # handler. nil means "no stack-alloc analysis ran for this body" —
  # treat all locals as heap.
     @stack_local_set = "".split(",")
+ # Per-method int_array param escape signatures (built by
+ # compute_int_array_param_escape_sigs at start of generate_code).
+ # Hash str→str: method name → comma-separated per-param flags.
+ # Empty until the pre-pass runs; downstream lookups treat an empty
+ # hash as "no signature available" (conservative — escape).
+    @int_array_param_escape_sigs = {}
  # Set during the arity-0 instance_eval trampoline inlining so
  # receiverless calls in the spliced block body dispatch against
  # the rebound self (the .instance_eval receiver) instead of the
@@ -6203,6 +6209,11 @@ class Compiler
     if @needs_class_parents == 1 || @needs_class_ancestors == 1 || @needs_class_for_poly == 1
       @needs_class_table = 1
     end
+ # Compute the per-method int_array param escape signatures so
+ # declare_method_locals' stack-alloc detection can replace the
+ # hand-curated callee whitelist with a derived one. Runs once,
+ # before any method body emit.
+    compute_int_array_param_escape_sigs
     emit_sym_runtime
     emit_ffi_externs
  # Emit program-specific regexp patterns
@@ -9365,7 +9376,9 @@ class Compiler
         aargs = get_args(args_id)
         ai = 0
         while ai < aargs.length
-          arg_ctx = "arg:" + mname
+ # Encode the arg position so stack_ctx_is_safe can look up
+ # the callee's per-param escape signature.
+          arg_ctx = "arg:" + mname + ":" + ai.to_s
           if local_int_array_escapes(aargs[ai], lname, arg_ctx) == 1
             return 1
           end
@@ -9459,10 +9472,19 @@ class Compiler
       end
       return 0
     end
- # Argument to whitelisted user method: safe.
+ # Argument to a user method: safe iff the callee's escape
+ # signature reports this position as non-escaping. Context
+ # format: "arg:<mname>:<pos>".
     if ctx.length > 4 && ctx[0, 4] == "arg:"
-      mname = ctx[4, ctx.length - 4]
-      if stack_ctx_safe_arg_method(mname) == 1
+      rest = ctx[4, ctx.length - 4]
+      sep = rest.rindex(":")
+      if sep == nil
+        return 0
+      end
+      mname = rest[0, sep]
+      pos_s = rest[sep + 1, rest.length - sep - 1]
+      pos = pos_s.to_i
+      if stack_ctx_safe_arg_method(mname, pos) == 1
         return 1
       end
       return 0
@@ -9541,16 +9563,230 @@ class Compiler
     0
   end
 
- # Whitelist of user methods known not to let an IntArray parameter
- # escape (i.e. the callee only mutates the param via push / set
- # etc. and doesn't store the pointer anywhere reachable after
- # return). Hand-curated for now; a future pass could derive this
- # from a transitive escape signature on each method body.
-  def stack_ctx_safe_arg_method(mname)
-    if mname == "push_child_ids"
-      return 1
+ # Returns 1 if `mname`'s int_array parameter at `pos` is known not
+ # to escape via this callee (i.e. the callee only mutates the
+ # param via push / set / read ops and doesn't store the pointer
+ # anywhere reachable after return). Consults the per-method
+ # escape signatures computed by compute_int_array_param_escape_sigs.
+ # When the same method name appears across multiple classes, the
+ # signature is the worst case (any class escaping the param marks
+ # the slot as escaping).
+  def stack_ctx_safe_arg_method(mname, pos)
+    if !@int_array_param_escape_sigs.key?(mname)
+      return 0
     end
-    0
+    sig = @int_array_param_escape_sigs[mname]
+    flags = sig.split(",")
+    if pos < 0 || pos >= flags.length
+      return 0
+    end
+    flags[pos] == "0" ? 1 : 0
+  end
+
+ # ---- Transitive escape analysis for int_array params ----
+ #
+ # Builds @int_array_param_escape_sigs, a string keyed by method
+ # name. The value is a comma-separated per-param flag:
+ #   "0" — int_array param doesn't escape via this method body
+ #   "1" — int_array param escapes (return, ivar/gvar/cvar write,
+ #         passed to a callee whose corresponding param escapes,
+ #         captured by closure)
+ #   "_" — non-int_array param (irrelevant for this analysis)
+ #
+ # Algorithm: start optimistic (all int_array params marked "0"),
+ # iteratively walk each method body re-evaluating param escape
+ # using current sigs for callee lookups. When new escapes are
+ # discovered, flip them to "1" and re-iterate. Terminates at
+ # fixed point (typically within a small number of iterations).
+ #
+ # Same-named methods across classes merge by worst case: if any
+ # class's M#foo escapes its int_array param at position k, then
+ # the sig for "foo" reports "1" at position k. This is
+ # conservative — call sites that resolve to a different M#foo
+ # variant pessimistically assume the worst signature.
+  def compute_int_array_param_escape_sigs
+    init_int_array_param_sigs_for_top_level
+    init_int_array_param_sigs_for_classes
+    iter = 0
+    while iter < 12
+      changed = update_int_array_param_sigs_pass
+      if changed == 0
+        return
+      end
+      iter = iter + 1
+    end
+  end
+
+  def init_int_array_param_sigs_for_top_level
+    mi = 0
+    while mi < @meth_names.length
+      flags = compute_init_flags_str(@meth_param_types[mi])
+      merge_param_sig(@meth_names[mi], flags)
+      mi = mi + 1
+    end
+  end
+
+  def init_int_array_param_sigs_for_classes
+    ci = 0
+    while ci < @cls_names.length
+      all_p_types = @cls_meth_ptypes[ci].split("|")
+      mnames = @cls_meth_names[ci].split(";")
+      mj = 0
+      while mj < mnames.length
+        ptypes_s = ""
+        if mj < all_p_types.length
+          ptypes_s = all_p_types[mj]
+        end
+        flags = compute_init_flags_str(ptypes_s)
+        merge_param_sig(mnames[mj], flags)
+        mj = mj + 1
+      end
+      ci = ci + 1
+    end
+  end
+
+  def compute_init_flags_str(ptypes_str)
+    ptypes = ptypes_str.split(",")
+    parts = "".split(",")
+    pi = 0
+    while pi < ptypes.length
+      if ptypes[pi] == "int_array"
+        parts.push("0")
+      else
+        parts.push("_")
+      end
+      pi = pi + 1
+    end
+    parts.join(",")
+  end
+
+ # Merge `new_flags` into the existing sig for `mname`, taking the
+ # worst case per position ("1" wins over "0", and a missing slot
+ # becomes "_" only if both sides agree).
+  def merge_param_sig(mname, new_flags)
+    if !@int_array_param_escape_sigs.key?(mname)
+      @int_array_param_escape_sigs[mname] = new_flags
+      return
+    end
+    existing = @int_array_param_escape_sigs[mname]
+    a = existing.split(",")
+    b = new_flags.split(",")
+    n = a.length
+    if b.length > n
+      n = b.length
+    end
+    out = "".split(",")
+    k = 0
+    while k < n
+      av = "_"
+      bv = "_"
+      if k < a.length
+        av = a[k]
+      end
+      if k < b.length
+        bv = b[k]
+      end
+ # Worst case merge: "1" beats "0", "0" beats "_".
+      if av == "1" || bv == "1"
+        out.push("1")
+      elsif av == "0" || bv == "0"
+        out.push("0")
+      else
+        out.push("_")
+      end
+      k = k + 1
+    end
+    @int_array_param_escape_sigs[mname] = out.join(",")
+  end
+
+ # One iteration of the fixed-point update. Returns 1 if any sig
+ # changed, 0 otherwise.
+  def update_int_array_param_sigs_pass
+    changed = 0
+    mi = 0
+    while mi < @meth_names.length
+      bid = @meth_body_ids[mi]
+      if bid >= 0
+        if update_method_sig_for(@meth_names[mi], @meth_param_names[mi], @meth_param_types[mi], bid) == 1
+          changed = 1
+        end
+      end
+      mi = mi + 1
+    end
+    ci = 0
+    while ci < @cls_names.length
+      all_p_names = @cls_meth_params[ci].split("|")
+      all_p_types = @cls_meth_ptypes[ci].split("|")
+      bodies = @cls_meth_bodies[ci].split(";")
+      mnames = @cls_meth_names[ci].split(";")
+      mj = 0
+      while mj < mnames.length
+        pn = ""
+        pt = ""
+        bid = -1
+        if mj < all_p_names.length
+          pn = all_p_names[mj]
+        end
+        if mj < all_p_types.length
+          pt = all_p_types[mj]
+        end
+        if mj < bodies.length
+          bid = bodies[mj].to_i
+        end
+        if bid >= 0
+          if update_method_sig_for(mnames[mj], pn, pt, bid) == 1
+            changed = 1
+          end
+        end
+        mj = mj + 1
+      end
+      ci = ci + 1
+    end
+    changed
+  end
+
+  def update_method_sig_for(mname, pnames_str, ptypes_str, bid)
+    pnames = pnames_str.split(",")
+    ptypes = ptypes_str.split(",")
+    new_flags = "".split(",")
+    pi = 0
+    while pi < pnames.length
+      if pi < ptypes.length && ptypes[pi] == "int_array"
+ # Reuse local_int_array_escapes treating the param as a
+ # local. Also check the implicit-return position (the param
+ # being the body's last expression).
+        if local_int_array_escapes(bid, pnames[pi], "stmt") == 1
+          new_flags.push("1")
+        elsif last_expr_references_local(bid, pnames[pi]) == 1
+          new_flags.push("1")
+        else
+          new_flags.push("0")
+        end
+      else
+        new_flags.push("_")
+      end
+      pi = pi + 1
+    end
+    nf = new_flags.join(",")
+    had = @int_array_param_escape_sigs.key?(mname)
+    existing = ""
+    if had
+      existing = @int_array_param_escape_sigs[mname]
+      if existing == nf
+        return 0
+      end
+    end
+ # Need to merge with existing (worst-case per position); the
+ # existing value may include flags merged from same-named methods
+ # in other classes. merge_param_sig handles that.
+    merge_param_sig(mname, nf)
+    if had
+      after = @int_array_param_escape_sigs[mname]
+      if existing == after
+        return 0
+      end
+    end
+    1
   end
 
  # Returns 1 if `nid` is an explicit literal value (not a placeholder or
