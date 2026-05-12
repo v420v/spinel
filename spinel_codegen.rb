@@ -346,6 +346,12 @@ class Compiler
     @in_yield_method = 0
     @current_method_yield_arity = 1
     @in_gc_scope = 0
+ # Set per method body in declare_method_locals to the list of
+ # int_array locals that escape analysis proved safe to stack-
+ # allocate. Read by the prologue emit and the LocalVariableWriteNode
+ # handler. nil means "no stack-alloc analysis ran for this body" —
+ # treat all locals as heap.
+    @stack_local_set = "".split(",")
  # Set during the arity-0 instance_eval trampoline inlining so
  # receiverless calls in the spliced block body dispatch against
  # the rebound self (the .instance_eval receiver) instead of the
@@ -9159,6 +9165,12 @@ class Compiler
       declare_var(lnames[j], ltypes[j])
       j = j + 1
     end
+ # Escape analysis: which int_array locals are safe to stack-alloc?
+ # The set is consulted by the prologue emit (skips SP_GC_ROOT,
+ # emits stack storage + cleanup attribute) and by the body's
+ # LocalVariableWriteNode handler (suppresses the `lname = []`
+ # re-init since the prologue already wrote the pointer).
+    @stack_local_set = detect_stack_alloc_int_arrays(bid, lnames, ltypes)
  # Emit declarations and GC rooting for pointer locals
     has_gc_locals = 0
     j = 0
@@ -9176,7 +9188,22 @@ class Compiler
     end
     j = 0
     while j < lnames.length
-      emit("  " + c_type(ltypes[j]) + " lv_" + lnames[j] + " = " + c_default_val(ltypes[j]) + ";")
+      if not_in(lnames[j], @stack_local_set) == 0
+ # Stack-allocated int_array local. The wrapper struct holds a
+ # leading 8-byte pad whose last byte gets set to 0xff by
+ # sp_IntArray_stack_init — that sentinel makes sp_gc_mark
+ # treat the embedded arr as an immutable static object, in
+ # case some callee registers our pointer as a GC root via
+ # SP_GC_ROOT(param). The cleanup attribute frees the data
+ # buffer on scope exit.
+        @needs_int_array = 1
+        @needs_gc = 1
+        sname = "_stk_" + lnames[j]
+        emit("  sp_IntArray_stack_wrap " + sname + " __attribute__((cleanup(sp_IntArray_stack_fin))) = {{0}};")
+        emit("  sp_IntArray * lv_" + lnames[j] + " = sp_IntArray_stack_init(&" + sname + ");")
+      else
+        emit("  " + c_type(ltypes[j]) + " lv_" + lnames[j] + " = " + c_default_val(ltypes[j]) + ";")
+      end
       j = j + 1
     end
     if has_gc_locals == 1
@@ -9190,10 +9217,289 @@ class Compiler
     j = 0
     while j < lnames.length
       if type_is_pointer(ltypes[j]) == 1
-        emit("  SP_GC_ROOT(lv_" + lnames[j] + ");")
+        if @stack_local_set != nil && not_in(lnames[j], @stack_local_set) == 0
+ # stack-allocated locals don't need GC roots — their struct
+ # lives on the C stack, the data buffer is freed at scope
+ # exit via the cleanup attribute (sp_IntArray_stack_fin).
+        else
+          emit("  SP_GC_ROOT(lv_" + lnames[j] + ");")
+        end
       end
       j = j + 1
     end
+  end
+
+ # ---- Escape analysis for stack-alloc'd int_array locals ----
+ #
+ # Detect locals whose static type is int_array and whose use pattern
+ # in the method body proves they never escape (returned, stored to
+ # ivar/gvar/cvar, captured by closure, passed to unknown user
+ # method). Such locals can be stack-allocated, skipping the
+ # sp_gc_alloc that would otherwise track them in the GC heap.
+ #
+ # Conservative scope for the first PR:
+ # - Local must have exactly one write, and that write's RHS must be
+ #   an empty ArrayNode `[]`.
+ # - Local must never appear inside a BlockNode body (no closure
+ #   capture).
+ # - Allowed receiver methods on the local: built-in IntArray ops
+ #   (length, size, push, <<, [], []=, each, empty?, pop, shift,
+ #   include?, to_a, dup, clear, sort, sort!, first, last,
+ #   reverse, reverse!, index, count, sum, min, max, any?, all?,
+ #   none?, find, find_index, map, select, reject, each_with_index,
+ #   each_with_object, reduce, inject).
+ # - Allowed positions for the local as a method argument: the
+ #   whitelist below (push_child_ids only for now). Any other
+ #   argument position fails analysis.
+ # - The local must NOT be the implicit return (the body's last
+ #   expression) or a ReturnNode expression.
+ #
+ # Returns the array of stack-allocatable local names.
+  def detect_stack_alloc_int_arrays(bid, lnames, ltypes)
+    safe = "".split(",")
+    if bid < 0
+      return safe
+    end
+    k = 0
+    while k < lnames.length
+      if ltypes[k] == "int_array"
+        if int_array_local_stackable_in(bid, lnames[k]) == 1
+          safe.push(lnames[k])
+        end
+      end
+      k = k + 1
+    end
+    safe
+  end
+
+  def int_array_local_stackable_in(bid, lname)
+ # Count writes + verify RHS shape.
+    write_info = "".split(",")
+    write_info.push("0")  # [0] = write_count
+    write_info.push("0")  # [1] = empty_array_writes
+    count_local_writes(bid, lname, write_info)
+    if write_info[0].to_i != 1
+      return 0
+    end
+    if write_info[1].to_i != 1
+      return 0
+    end
+ # Check the local doesn't escape.
+    if local_int_array_escapes(bid, lname, "stmt") == 1
+      return 0
+    end
+ # Check the local isn't the implicit return.
+    if last_expr_references_local(bid, lname) == 1
+      return 0
+    end
+    1
+  end
+
+ # Counts LocalVariableWriteNodes for `lname` in `nid` subtree.
+ # write_info[0] += total writes; write_info[1] += writes whose RHS is
+ # an empty ArrayNode literal.
+  def count_local_writes(nid, lname, write_info)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "LocalVariableWriteNode" && @nd_name[nid] == lname
+      write_info[0] = (write_info[0].to_i + 1).to_s
+      expr = @nd_expression[nid]
+      if expr >= 0 && is_empty_array_literal(expr) == 1
+        write_info[1] = (write_info[1].to_i + 1).to_s
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      count_local_writes(cs[k], lname, write_info)
+      k = k + 1
+    end
+  end
+
+ # True if the body's last expression (transitively, through
+ # ParenthesesNode / IfNode / etc.) references `lname` as a
+ # LocalVariableReadNode. Conservative: returns 1 if we can't tell.
+  def last_expr_references_local(bid, lname)
+    if bid < 0
+      return 0
+    end
+    stmts = get_stmts(bid)
+    if stmts.length == 0
+      return 0
+    end
+    last = stmts.last
+    if @nd_type[last] == "LocalVariableReadNode" && @nd_name[last] == lname
+      return 1
+    end
+    0
+  end
+
+ # Returns 1 if any LocalVariableReadNode named `lname` inside `nid`
+ # is in an escape-causing context, 0 otherwise. `ctx` describes the
+ # parent context the recursion is currently visiting.
+  def local_int_array_escapes(nid, lname, ctx)
+    if nid < 0
+      return 0
+    end
+    t = @nd_type[nid]
+    if t == "LocalVariableReadNode" && @nd_name[nid] == lname
+      if stack_ctx_is_safe(ctx) == 1
+        return 0
+      end
+      return 1
+    end
+ # CallNode: split context for receiver vs args, check method name.
+    if t == "CallNode"
+      mname = @nd_name[nid]
+      recv = @nd_receiver[nid]
+      if recv >= 0
+        recv_ctx = "recv:" + mname
+        if local_int_array_escapes(recv, lname, recv_ctx) == 1
+          return 1
+        end
+      end
+      args_id = @nd_arguments[nid]
+      if args_id >= 0
+        aargs = get_args(args_id)
+        ai = 0
+        while ai < aargs.length
+          arg_ctx = "arg:" + mname
+          if local_int_array_escapes(aargs[ai], lname, arg_ctx) == 1
+            return 1
+          end
+          ai = ai + 1
+        end
+      end
+ # Conservative: any LVR(lname) inside a block escapes (closure
+ # capture concern). The block walks with a context tag that
+ # rejects every read.
+      blk = @nd_block[nid]
+      if blk >= 0
+        if local_int_array_escapes(blk, lname, "block_body") == 1
+          return 1
+        end
+      end
+      return 0
+    end
+ # ReturnNode: returning the local escapes.
+    if t == "ReturnNode"
+      expr = @nd_expression[nid]
+      if expr >= 0 && @nd_type[expr] == "LocalVariableReadNode" && @nd_name[expr] == lname
+        return 1
+      end
+      if expr >= 0
+        return local_int_array_escapes(expr, lname, "return_inner")
+      end
+      return 0
+    end
+ # Write nodes that escape if RHS is our local.
+    if t == "InstanceVariableWriteNode" || t == "ClassVariableWriteNode" || t == "GlobalVariableWriteNode"
+      expr = @nd_expression[nid]
+      if expr >= 0 && @nd_type[expr] == "LocalVariableReadNode" && @nd_name[expr] == lname
+        return 1
+      end
+      if expr >= 0
+        return local_int_array_escapes(expr, lname, "store_inner")
+      end
+      return 0
+    end
+ # LocalVariableWriteNode: rhs being our LVR means another local
+ # captured the alias. Conservative: treat as escape.
+    if t == "LocalVariableWriteNode"
+      if @nd_name[nid] != lname
+        expr = @nd_expression[nid]
+        if expr >= 0 && @nd_type[expr] == "LocalVariableReadNode" && @nd_name[expr] == lname
+          return 1
+        end
+        if expr >= 0
+          return local_int_array_escapes(expr, lname, "store_inner")
+        end
+        return 0
+      end
+ # Self-write (lname = ...): only the RHS subtree is relevant.
+      expr = @nd_expression[nid]
+      if expr >= 0
+        return local_int_array_escapes(expr, lname, "self_rhs")
+      end
+      return 0
+    end
+ # Generic recursion: descend into all child ids with the current ctx.
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      if local_int_array_escapes(cs[k], lname, ctx) == 1
+        return 1
+      end
+      k = k + 1
+    end
+    0
+  end
+
+ # Returns 1 if the given parent context is one in which a
+ # LocalVariableReadNode of an int_array local is *not* an escape.
+  def stack_ctx_is_safe(ctx)
+ # Receiver of a built-in IntArray operation: safe.
+    if ctx.length > 5 && ctx[0, 5] == "recv:"
+      mname = ctx[5, ctx.length - 5]
+      if stack_ctx_safe_recv_method(mname) == 1
+        return 1
+      end
+      return 0
+    end
+ # Argument to whitelisted user method: safe.
+    if ctx.length > 4 && ctx[0, 4] == "arg:"
+      mname = ctx[4, ctx.length - 4]
+      if stack_ctx_safe_arg_method(mname) == 1
+        return 1
+      end
+      return 0
+    end
+ # Any other context: not safe.
+    0
+  end
+
+  def stack_ctx_safe_recv_method(mname)
+ # Conservative safe list for first PR. Limited to ops that don't
+ # call sp_IntArray_set_slow / unshift / replace etc. — those grow
+ # via realloc and access the GC header preceding the struct, which
+ # would corrupt the stack frame for a stack-allocated array. Once
+ # the helpers learn to skip the sp_gc_hdr update when is_stack is
+ # set, []= / unshift / replace can be added back.
+    if mname == "length" || mname == "size" || mname == "empty?" || mname == "first" || mname == "last"
+      return 1
+    end
+    if mname == "push" || mname == "<<" || mname == "pop" || mname == "shift"
+      return 1
+    end
+    if mname == "[]" || mname == "at"
+      return 1
+    end
+    if mname == "include?" || mname == "index" || mname == "rindex"
+      return 1
+    end
+    if mname == "min" || mname == "max" || mname == "sum"
+      return 1
+    end
+    if mname == "any?" || mname == "all?" || mname == "none?" || mname == "count"
+      return 1
+    end
+    if mname == "clear"
+      return 1
+    end
+    0
+  end
+
+ # Whitelist of user methods known not to escape an IntArray param.
+ # For now: just `push_child_ids` (the Compiler internal helper that
+ # only pushes ints into the given accumulator).
+  def stack_ctx_safe_arg_method(mname)
+    if mname == "push_child_ids"
+      return 1
+    end
+    0
   end
 
  # Returns 1 if `nid` is an explicit literal value (not a placeholder or
@@ -20560,6 +20866,20 @@ class Compiler
       end
       vref = fiber_var_ref(lname)
       vt = find_var_type(lname)
+ # Stack-allocated int_array local: the prologue already
+ # initialized the struct via sp_IntArray_stack_init. A
+ # `lname = []` write is a re-init, which our escape analyzer
+ # rules out (must have exactly one write). Skip the emit to
+ # avoid clobbering the stack-init pointer with a fresh heap
+ # alloc. Conservative: only matches when the RHS is the empty
+ # array literal; anything else escapes from our analysis
+ # criteria and falls through to the normal path.
+      if @stack_local_set != nil && not_in(lname, @stack_local_set) == 0
+        expr_sa = @nd_expression[nid]
+        if expr_sa >= 0 && @nd_type[expr_sa] == "ArrayNode" && is_empty_array_literal(expr_sa) == 1
+          return
+        end
+      end
  # Empty array literal: create the correct array type. Returning
  # early here also preserves the scope's already-promoted type
  # , #85) — the fall-through path below would clobber
