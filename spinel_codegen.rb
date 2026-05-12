@@ -17703,6 +17703,31 @@ class Compiler
       @needs_rb_value = 1
       return "poly"
     end
+ # Built-in string methods that compile_poly_method_call also
+ # lowers via a SP_TAG_STR arm — their result temp needs to be
+ # at least string-typed so the per-tag dispatch assignment
+ # doesn't try to store const char * into a mrb_int slot. If a
+ # user class also defines the method with a different return
+ # type, the per-class loop below escalates to "poly".
+    if mname == "gsub" || mname == "sub"
+      ci_s = 0
+      diverges = 0
+      while ci_s < @cls_names.length
+        if cls_find_method_direct(ci_s, mname) >= 0
+          urt = cls_method_return(ci_s, mname)
+          if urt != "" && urt != "string"
+            diverges = 1
+            ci_s = @cls_names.length
+          end
+        end
+        ci_s = ci_s + 1
+      end
+      if diverges == 1
+        @needs_rb_value = 1
+        return "poly"
+      end
+      return "string"
+    end
  # Setters: mname ends with "=" and at least one class has an
  # attr_writer for the bare name. Return type is the ivar type
  # (Ruby returns the rhs from `x = v`); without this, the result
@@ -17953,6 +17978,33 @@ class Compiler
       bit = "((" + recv_tmp + ".v.i >> (" + a0_int + ")) & 1)"
       brhs = is_poly_ret == 1 ? "sp_box_int(" + bit + ")" : bit
       emit("  if (" + recv_tmp + ".tag == SP_TAG_INT) " + tmp + " = " + brhs + ";")
+    end
+ # SP_TAG_STR arm for string methods that have a concrete
+ # str-recv lowering. `v.gsub(/re/, repl)` where v is poly
+ # (e.g. v came from `poly_hash[k]`) needs a per-tag dispatch
+ # arm — otherwise the poly recv falls through to the
+ # SP_TAG_OBJ block, which has no String-method handler, and
+ # the result temp stays at its default (mrb_int 0). The
+ # caller's downstream assignment to a const char * slot then
+ # fails C compile.
+    if mname == "gsub" || mname == "sub"
+      args_id_gs = @nd_arguments[nid]
+      if args_id_gs >= 0
+        a_gs = get_args(args_id_gs)
+        if a_gs.length >= 2
+          rpat_gs = regex_pat_c_expr(a_gs[0])
+          fn_gs = mname == "gsub" ? "sp_re_gsub" : "sp_re_sub"
+          str_fn_gs = mname == "gsub" ? "sp_str_gsub" : "sp_str_sub"
+          rep_gs = compile_expr(a_gs[1])
+          if rpat_gs != ""
+            call_gs = fn_gs + "(" + rpat_gs + ", " + recv_tmp + ".v.s, " + rep_gs + ")"
+          else
+            call_gs = str_fn_gs + "(" + recv_tmp + ".v.s, " + compile_expr(a_gs[0]) + ", " + rep_gs + ")"
+          end
+          str_rhs_gs = is_poly_ret == 1 ? "sp_box_str(" + call_gs + ")" : call_gs
+          emit("  if (" + recv_tmp + ".tag == SP_TAG_STR) " + tmp + " = " + str_rhs_gs + ";")
+        end
+      end
     end
     emit("  if (" + recv_tmp + ".tag == SP_TAG_OBJ) {")
  # User-class dispatch
