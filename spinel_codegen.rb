@@ -13043,10 +13043,7 @@ class Compiler
  # "" for zero args; pad with "0" so the array has at least
  # one slot (the proc fn's `_unused` fallback expects args[0]
  # to be addressable).
-          ca = compile_call_args(nid)
-          if ca == ""
-            ca = "0"
-          end
+          ca = compile_proc_call_args(nid)
           return "sp_proc_call(lv_" + rname + ", (mrb_int[]){" + ca + "})"
         end
       end
@@ -13067,10 +13064,7 @@ class Compiler
     end
     rt = infer_type(recv)
     if rt == "proc"
-      ca = compile_call_args(nid)
-      if ca == ""
-        ca = "0"
-      end
+      ca = compile_proc_call_args(nid)
       rc = compile_expr_gc_rooted(recv)
       return "sp_proc_call(" + rc + ", (mrb_int[]){" + ca + "})"
     end
@@ -20028,6 +20022,33 @@ class Compiler
         result = result + ", "
       end
       result = result + compile_expr(arg_ids[k])
+      k = k + 1
+    end
+    result
+  end
+
+  def compile_proc_call_args(nid)
+    args_id = @nd_arguments[nid]
+    if args_id < 0
+      return "0"
+    end
+    arg_ids = get_args(args_id)
+    if arg_ids.length == 0
+      return "0"
+    end
+    result = ""
+    k = 0
+    while k < arg_ids.length
+      if k > 0
+        result = result + ", "
+      end
+      val = compile_expr(arg_ids[k])
+      at = infer_type(arg_ids[k])
+      if type_is_pointer(at) == 1
+        result = result + "(mrb_int)(uintptr_t)(" + val + ")"
+      else
+        result = result + val
+      end
       k = k + 1
     end
     result
