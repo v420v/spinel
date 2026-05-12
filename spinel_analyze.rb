@@ -10877,6 +10877,22 @@ class Compiler
             while pk < pnames_j.length
               if pk < ptypes_j.length
                 new_t = scan_param_body_write_unify(bid_j, pnames_j[pk], ptypes_j[pk])
+ # `def []=(name, value)` style: the body dispatches on
+ # `name` and writes `value` into ivars of differing
+ # types (e.g. `@id = value` AND `@name = value`, with
+ # @id mrb_int and @name const char*). Without widening
+ # the param to poly, the C emitter pins lv_value at the
+ # first-observed type and rejects the other ivar's
+ # assignment. Sniff for >1 distinct ivar slot type
+ # observed as the RHS-is-pname target, and promote to
+ # "poly" when found.
+                if new_t != "poly" && mnames[mj] == "[]="
+                  ivt_set = "".split(",")
+                  collect_param_ivar_write_slot_types(bid_j, pnames_j[pk], ci, ivt_set)
+                  if ivt_set.length >= 2
+                    new_t = "poly"
+                  end
+                end
                 if new_t != ptypes_j[pk]
                   ptypes_j[pk] = new_t
                   inner_changed = 1
@@ -10897,6 +10913,37 @@ class Compiler
         @cls_meth_ptypes_version = @cls_meth_ptypes_version + 1
       end
       ci = ci + 1
+    end
+  end
+
+ # Walk `nid` looking for `InstanceVariableWriteNode` whose RHS is
+ # a `LocalVariableReadNode` named `pname`, and accumulate each
+ # written-to ivar's declared slot type into `ivt_set` (unique).
+ # Used by widen_param_types_from_body_writes to detect
+ # `def []=(_, value); case ... when :a then @a = value;
+ # when :b then @b = value; end` shapes where the param flows
+ # into ivars of differing types — the param then needs to widen
+ # to poly so each ivar-write arm can unbox/cast to its slot type.
+  def collect_param_ivar_write_slot_types(nid, pname, ci, ivt_set)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "InstanceVariableWriteNode"
+      rhs = @nd_expression[nid]
+      if rhs >= 0 && @nd_type[rhs] == "LocalVariableReadNode" && @nd_name[rhs] == pname
+        iname = @nd_name[nid]
+        slot_t = cls_ivar_type(ci, iname)
+        if slot_t != "" && not_in(slot_t, ivt_set) == 1
+          ivt_set.push(slot_t)
+        end
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      collect_param_ivar_write_slot_types(cs[k], pname, ci, ivt_set)
+      k = k + 1
     end
   end
 
