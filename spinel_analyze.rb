@@ -13504,6 +13504,24 @@ class Compiler
       end
       return
     end
+    if @nd_type[nid] == "UnlessNode"
+ # `unless cond; ...; end` — same shape as IfNode but the
+ # then-branch fires when the predicate is false. body holds
+ # the then-statements, else_clause holds the else block.
+ # Without this arm, `unless cond; return {hash}; end; nil`
+ # only registered the trailing nil as the function's return
+ # path, mistyping the declared return as mrb_int and failing
+ # C compile on the hash-returning path (#449).
+      body = @nd_body[nid]
+      if body >= 0
+        collect_return_types_nid(body, types)
+      end
+      ec = @nd_else_clause[nid]
+      if ec >= 0
+        collect_return_types(ec, types)
+      end
+      return
+    end
     if @nd_type[nid] == "ElseNode"
       body = @nd_body[nid]
       if body >= 0
