@@ -13059,6 +13059,15 @@ class Compiler
         return "sp_proc_call(" + compile_expr(recv) + ", (mrb_int[]){" + ca_anon + "})"
       end
     end
+    rt = infer_type(recv)
+    if rt == "proc"
+      ca = compile_call_args(nid)
+      if ca == ""
+        ca = "0"
+      end
+      rc = compile_expr_gc_rooted(recv)
+      return "sp_proc_call(" + rc + ", (mrb_int[]){" + ca + "})"
+    end
     ""
   end
 
@@ -18676,6 +18685,15 @@ class Compiler
       polyc = "sp_PolyArray_length((sp_PolyArray *)" + recv_tmp + ".v.p)"
       polyrhs = is_poly_ret == 1 ? "sp_box_int(" + polyc + ")" : polyc
       emit("    if (" + recv_tmp + ".cls_id == SP_BUILTIN_POLY_ARRAY) " + result_tmp + " = " + polyrhs + ";")
+    end
+    if mname == "call"
+      ca = (arg_compiled.length > 0) ? arg_compiled.join(", ") : ""
+      if ca == ""
+        ca = "0"
+      end
+      pc = "sp_proc_call((sp_Proc *)" + recv_tmp + ".v.p, (mrb_int[]){" + ca + "})"
+      prhs = is_poly_ret == 1 ? "sp_box_int(" + pc + ")" : pc
+      emit("    if (" + recv_tmp + ".cls_id == SP_BUILTIN_PROC) " + result_tmp + " = " + prhs + ";")
     end
   end
 
