@@ -25777,6 +25777,46 @@ class Compiler
         emit("  else if (" + cur_h + ".cls_id == SP_BUILTIN_STR_POLY_HASH) sp_StrPolyHash_set((sp_StrPolyHash *)" + cur_h + ".v.p, " + idx + ", " + vbox_tmp + ");")
         return
       end
+ # Poly index (sp_RbVal): the key's concrete type isn't known
+ # statically, so the dispatch must read the key's tag at
+ # runtime. Surfaces in `merged[k] = v` inside an `each`
+ # iteration over a poly-recv hash (real-blog Main.run's
+ # request[:params].each forwards both k and v as poly). Emit:
+ #
+ # - SP_TAG_STR keys: route to Str*Hash setters via .v.s
+ # - SP_TAG_SYM keys: route to Sym*Hash setters via .v.i
+ # - other key tags fall through to the Array arms below
+ #   (which unbox via .v.i)
+      if idx_t_poly == "poly"
+        @needs_rb_value = 1
+        @needs_str_int_hash = 1
+        @needs_str_str_hash = 1
+        @needs_str_poly_hash = 1
+        vbox = val
+        if val_t_poly != "poly"
+          vbox = box_value_to_poly(val_t_poly, val)
+        end
+        vbox_tmp = new_temp
+        emit("  sp_RbVal " + vbox_tmp + " = " + vbox + ";")
+        cur_p = new_temp
+        emit("  sp_RbVal " + cur_p + " = " + rc + ";")
+ # String-tagged key + Str*Hash recv. The `(" + idx + ").v.s`
+ # cast extracts the const char * payload.
+        emit("  if ((" + idx + ").tag == SP_TAG_STR && " + cur_p + ".cls_id == SP_BUILTIN_STR_INT_HASH) sp_StrIntHash_set((sp_StrIntHash *)" + cur_p + ".v.p, (" + idx + ").v.s, " + vbox_tmp + ".v.i);")
+        emit("  else if ((" + idx + ").tag == SP_TAG_STR && " + cur_p + ".cls_id == SP_BUILTIN_STR_STR_HASH) sp_StrStrHash_set((sp_StrStrHash *)" + cur_p + ".v.p, (" + idx + ").v.s, " + vbox_tmp + ".v.s);")
+        emit("  else if ((" + idx + ").tag == SP_TAG_STR && " + cur_p + ".cls_id == SP_BUILTIN_STR_POLY_HASH) sp_StrPolyHash_set((sp_StrPolyHash *)" + cur_p + ".v.p, (" + idx + ").v.s, " + vbox_tmp + ");")
+ # Symbol-tagged key + Sym*Hash recv. sp_SymPolyHash is in
+ # sp_runtime.h unconditionally; the sym_int_hash / sym_str_hash
+ # variants are emit-gated and may not have typedefs, so only
+ # SymPolyHash is dispatched here.
+        emit("  else if ((" + idx + ").tag == SP_TAG_SYM && " + cur_p + ".cls_id == SP_BUILTIN_SYM_POLY_HASH) sp_SymPolyHash_set((sp_SymPolyHash *)" + cur_p + ".v.p, (sp_sym)(" + idx + ").v.i, " + vbox_tmp + ");")
+ # Int-tagged key + Array storage. Fall through to the existing
+ # Array arms by using `(" + idx + ").v.i` as the index.
+        emit("  else if ((" + idx + ").tag == SP_TAG_INT && " + cur_p + ".cls_id == SP_BUILTIN_POLY_ARRAY) sp_PolyArray_set((sp_PolyArray *)" + cur_p + ".v.p, (" + idx + ").v.i, " + vbox_tmp + ");")
+        emit("  else if ((" + idx + ").tag == SP_TAG_INT && " + cur_p + ".cls_id == SP_BUILTIN_PTR_ARRAY) sp_PtrArray_set((sp_PtrArray *)" + cur_p + ".v.p, (" + idx + ").v.i, " + vbox_tmp + ".v.p);")
+        emit("  else if ((" + idx + ").tag == SP_TAG_INT && " + cur_p + ".cls_id == SP_BUILTIN_INT_ARRAY) sp_IntArray_set((sp_IntArray *)" + cur_p + ".v.p, (" + idx + ").v.i, " + vbox_tmp + ".v.i);")
+        return
+      end
  # Slot is sp_RbVal — runtime cls_id determines which storage
  # the underlying pointer points at. Optcarrot's `@fetch[a] =
  # method(:peek_X)` lands here when @fetch was widened to poly
