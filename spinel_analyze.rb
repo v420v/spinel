@@ -3749,6 +3749,25 @@ class Compiler
     if mname == "fetch"
       if recv >= 0
         rt = infer_type(recv)
+ # int-leaf hash with string default — Ruby's `params.fetch
+ # "k", ""` idiom. The leaf int is convertible to string via
+ # sp_int_to_s, so surface the result as string; codegen-side
+ # emits the conversion in the get arm. Limited to int-leaf
+ # variants and string-typed defaults; broader (poly leaf,
+ # hash default, etc.) widening cascades through downstream
+ # `is_a?(Hash)` narrowing in real-blog params and is deferred.
+        if rt == "str_int_hash" || rt == "sym_int_hash"
+          fargs_id_f = @nd_arguments[nid]
+          if fargs_id_f >= 0
+            fargs_f = get_args(fargs_id_f)
+            if fargs_f.length >= 2
+              def_at_f = infer_type(fargs_f[1])
+              if def_at_f == "string" || def_at_f == "mutable_str"
+                return "string"
+              end
+            end
+          end
+        end
         if rt == "str_str_hash" || rt == "sym_str_hash" || rt == "int_str_hash"
           return "string"
         end

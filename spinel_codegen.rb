@@ -15922,7 +15922,14 @@ class Compiler
           aargs = get_args(args_id)
           key = compile_expr(aargs[0])
           if aargs.length >= 2
+            def_at_f = infer_type(aargs[1])
             defval = compile_expr(aargs[1])
+ # int-leaf + string default: convert get to string via
+ # sp_int_to_s so both arms agree on `const char *`. Mirrors
+ # the analyze-side return-type widening to "string".
+            if def_at_f == "string" || def_at_f == "mutable_str"
+              return "(sp_SymIntHash_has_key(" + rc + ", " + key + ") ? sp_int_to_s(sp_SymIntHash_get(" + rc + ", " + key + ")) : " + defval + ")"
+            end
             return "(sp_SymIntHash_has_key(" + rc + ", " + key + ") ? sp_SymIntHash_get(" + rc + ", " + key + ") : " + defval + ")"
           end
           return "sp_SymIntHash_get((sp_SymIntHash *)(" + rc + "), " + key + ")"
@@ -16208,7 +16215,14 @@ class Compiler
           aargs = get_args(args_id)
           key = compile_expr_as_string(aargs[0])
           if aargs.length >= 2
+            def_at_f = infer_type(aargs[1])
             defval = compile_expr(aargs[1])
+ # int-leaf + string default: convert get to string via
+ # sp_int_to_s so the ternary's two arms agree on
+ # `const char *`. Mirrors the analyze-side return widening.
+            if def_at_f == "string" || def_at_f == "mutable_str"
+              return "(sp_StrIntHash_has_key(" + rc + ", " + key + ") ? sp_int_to_s(sp_StrIntHash_get(" + rc + ", " + key + ")) : " + defval + ")"
+            end
             return "(sp_StrIntHash_has_key(" + rc + ", " + key + ") ? sp_StrIntHash_get(" + rc + ", " + key + ") : " + defval + ")"
           end
           return "sp_StrIntHash_get(" + rc + ", " + key + ")"
