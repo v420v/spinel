@@ -19819,15 +19819,50 @@ class Compiler
  # isn't default-padded with "0" (the actual proc is appended by the
  # caller after this returns).
     args_id = @nd_arguments[nid]
-    arg_ids = []
+    raw_arg_ids = []
     if args_id >= 0
-      arg_ids = get_args(args_id)
+      raw_arg_ids = get_args(args_id)
     end
     all_defaults = @cls_meth_defaults[target_ci].split("|")
     ptypes = cls_meth_ptypes_get(target_ci, target_midx)
+    pnames_t = cls_meth_pnames_get(target_ci, target_midx)
     defaults = "".split(",")
     if target_midx < all_defaults.length
       defaults = all_defaults[target_midx].split(",")
+    end
+ # Pull out kwargs (KeywordHashNode) from the positional stream
+ # so the loop below can map `key: value` to the matching named
+ # param. Without this, a trailing `head(204, content_type: "x")`
+ # call-site widening would land the whole keyword hash on the
+ # next positional slot (ptype[1]) and emit garbage for the
+ # actual content_type kwarg slot.
+    arg_ids = []
+    kw_name_to_arg = "".split(",")
+    kw_name_keys  = "".split(",")
+    kak = 0
+    while kak < raw_arg_ids.length
+      if @nd_type[raw_arg_ids[kak]] == "KeywordHashNode"
+        kelems = parse_id_list(@nd_elements[raw_arg_ids[kak]])
+        kei = 0
+        while kei < kelems.length
+          if @nd_type[kelems[kei]] == "AssocNode"
+            kkey = @nd_key[kelems[kei]]
+            kval = @nd_expression[kelems[kei]]
+            if kkey >= 0 && kval >= 0 && @nd_type[kkey] == "SymbolNode"
+              knm = @nd_content[kkey]
+              if knm == ""
+                knm = @nd_name[kkey]
+              end
+              kw_name_keys.push(knm)
+              kw_name_to_arg.push(kval.to_s)
+            end
+          end
+          kei = kei + 1
+        end
+      else
+        arg_ids.push(raw_arg_ids[kak])
+      end
+      kak = kak + 1
     end
  # Drop the trailing slots the caller will fill explicitly (the
  # &block slot when block-forwarding) — otherwise a surplus
@@ -19846,6 +19881,26 @@ class Compiler
         pk = pk + 1
       end
       ptypes = kept
+    end
+ # Resolve each named param against the kwarg map by injecting
+ # the matched kwarg's value-id into arg_ids[slot] so the loop's
+ # positional path picks it up. Same effect as
+ # compile_call_args_with_defaults's kwarg routing.
+    if kw_name_keys.length > 0
+      pkk = 0
+      while pkk < pnames_t.length
+        kwi = 0
+        while kwi < kw_name_keys.length
+          if kw_name_keys[kwi] == pnames_t[pkk]
+            while arg_ids.length <= pkk
+              arg_ids.push(-1)
+            end
+            arg_ids[pkk] = kw_name_to_arg[kwi].to_i
+          end
+          kwi = kwi + 1
+        end
+        pkk = pkk + 1
+      end
     end
     total = ptypes.length
     if arg_ids.length > total
@@ -19888,7 +19943,7 @@ class Compiler
       if k > 0
         result = result + ", "
       end
-      if k < arg_ids.length
+      if k < arg_ids.length && arg_ids[k] >= 0
         at = infer_type(arg_ids[k])
         if k < ptypes.length
           pt = ptypes[k]

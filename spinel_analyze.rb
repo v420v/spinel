@@ -7608,6 +7608,16 @@ class Compiler
               types[k] = new_type + "?"
               @cls_ivar_types[ci] = types.join(";")
               @cls_ivar_types_version = @cls_ivar_types_version + 1
+ # Same base, one nullable: keep / adopt the nullable form
+ # rather than collapsing to poly. `@x = "hi"` (string) +
+ # `@x = some_string_or_nil` (string?) is one storage shape
+ # — `const char *` with NULL as the nil sentinel.
+            elsif base_type(old) == base_type(new_type) && is_nullable_pointer_type(old) == 1
+              if is_nullable_type(new_type) == 1 && is_nullable_type(old) == 0
+                types[k] = new_type
+                @cls_ivar_types[ci] = types.join(";")
+                @cls_ivar_types_version = @cls_ivar_types_version + 1
+              end
             else
               types[k] = "poly"
               @cls_ivar_types[ci] = types.join(";")
@@ -9965,14 +9975,14 @@ class Compiler
               inh_arg_ids = get_args(inh_args_id)
               inh_ptypes = cls_meth_ptypes_get(inh_owner_ci, inh_midx)
               if inh_ptypes.length > 0
-                inh_k = 0
-                while inh_k < inh_arg_ids.length
-                  inh_at = infer_type(inh_arg_ids[inh_k])
-                  if inh_k < inh_ptypes.length
-                    inh_ptypes[inh_k] = unify_call_types(inh_ptypes[inh_k], inh_at, inh_arg_ids[inh_k])
-                  end
-                  inh_k = inh_k + 1
-                end
+ # Route through widen_ptypes_from_args so a trailing
+ # KeywordHashNode lands on the matching named kwarg slot
+ # rather than the next positional. Without this, `head(204,
+ # content_type: "x")` from a child class widened
+ # `content_type`'s slot with the *whole keyword hash*'s
+ # type (sym_str_hash) and left it un-pinned to "string".
+                inh_pnames = cls_meth_pnames_get(inh_owner_ci, inh_midx)
+                widen_ptypes_from_args(inh_arg_ids, inh_pnames, inh_ptypes)
                 cls_meth_ptypes_put(inh_owner_ci, inh_midx, inh_ptypes)
               end
             end
@@ -12588,6 +12598,49 @@ class Compiler
  # widen the slot to poly. Mirror the update_ivar_type /
  # unify_call_types normalization.
           distinct = drop_stale_unqualified_obj_obs(distinct)
+ # Collapse nullable-and-non-nullable variants of the same
+ # base type to a single (nullable) entry. `@x = "hi"` (string)
+ # in initialize + `@x = some_nullable_string_param` in a
+ # setter are semantically the same shape — both store a
+ # string, the second one optionally nil. Counting them as 2
+ # distinct observations widens the ivar to poly even though
+ # the slot can stay `const char *` with a NULL sentinel.
+ # Without this, callers that read the slot through an attr_
+ # reader then forward into another method's typed param see a
+ # poly value and degrade every downstream slot.
+          collapsed = "".split(",")
+          ck = 0
+          while ck < distinct.length
+            cur = distinct[ck]
+            cur_base = base_type(cur)
+            cm = 0
+            seen = -1
+            while cm < collapsed.length
+              if base_type(collapsed[cm]) == cur_base
+                seen = cm
+                cm = collapsed.length
+              else
+                cm = cm + 1
+              end
+            end
+            if seen < 0
+              collapsed.push(cur)
+            else
+ # Prefer the nullable form so subsequent reads keep the
+ # null-check semantics callers may have relied on.
+              if is_nullable_type(cur) == 1 && is_nullable_type(collapsed[seen]) == 0
+                collapsed[seen] = cur
+              end
+            end
+            ck = ck + 1
+          end
+          distinct = collapsed
+          if distinct.length == 1 && types[ivk] != distinct[0]
+            if base_type(types[ivk]) == base_type(distinct[0])
+              types[ivk] = distinct[0]
+              changed = 1
+            end
+          end
           if distinct.length >= 2
  # When every observed type is itself an array AND the
  # current type is already `poly_array` (set by an earlier
