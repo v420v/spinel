@@ -16357,6 +16357,14 @@ class Compiler
             if def_at_f == "string" || def_at_f == "mutable_str"
               return "(sp_StrIntHash_has_key(" + rc + ", " + key + ") ? sp_int_to_s(sp_StrIntHash_get(" + rc + ", " + key + ")) : " + defval + ")"
             end
+ # int-leaf + hash default (`fetch "k", {}`): no shared
+ # primitive type, so box both arms to sp_RbVal. analyze surfaces
+ # the call's static type as poly so the caller's slot widens.
+            if is_hash_type(def_at_f) == 1
+              @needs_rb_value = 1
+              boxed_def = box_value_to_poly(def_at_f, defval)
+              return "(sp_StrIntHash_has_key(" + rc + ", " + key + ") ? sp_box_int(sp_StrIntHash_get(" + rc + ", " + key + ")) : " + boxed_def + ")"
+            end
             return "(sp_StrIntHash_has_key(" + rc + ", " + key + ") ? sp_StrIntHash_get(" + rc + ", " + key + ") : " + defval + ")"
           end
           return "sp_StrIntHash_get(" + rc + ", " + key + ")"
