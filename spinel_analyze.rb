@@ -9631,6 +9631,18 @@ class Compiler
       if old_pt == "float"
         return "float"
       end
+ # Literal `0` against a pointer-typed slot: C's null pointer
+ # constant. The literal narrows nothing; preserve the existing
+ # pointer type as nullable instead of collapsing to poly.
+ # Mirrors the `at == "nil"` branch above for the integer-zero
+ # spelling Ruby callers reach for when passing "no value" to
+ # an FFI / pointer slot.
+      if arg_is_literal == 1 && arg_id >= 0 && @nd_type[arg_id] == "IntegerNode" && @nd_value[arg_id].to_i == 0 && is_nullable_pointer_type(old_pt) == 1
+        if is_nullable_type(old_pt) == 1
+          return old_pt
+        end
+        return old_pt + "?"
+      end
  # Literal int into a non-numeric concrete type: genuine poly.
       if arg_is_literal == 1
         @needs_rb_value = 1
@@ -10996,6 +11008,73 @@ class Compiler
       end
       mi = mi + 1
     end
+ # Real-class cmeths live in @cls_cmeth_*, not @meth_*. A
+ # `def self.column_bool(stmt, idx)` inside `class Db` whose
+ # body forwards `stmt` to a `void *`-slotted callee needs the
+ # same back-propagation as the module-class case. Mirror the
+ # @meth_* walk over each registered class's cmeth table.
+    cci_cs = 0
+    while cci_cs < @cls_names.length
+      cmnames_cs = @cls_cmeth_names[cci_cs].split(";")
+      cmbodies_cs = @cls_cmeth_bodies[cci_cs].split(";")
+      cls_changed_cs = 0
+      cmj_cs = 0
+      while cmj_cs < cmnames_cs.length
+        bid_cm_cs = -1
+        if cmj_cs < cmbodies_cs.length
+          bid_cm_cs = cmbodies_cs[cmj_cs].to_i
+        end
+        if bid_cm_cs >= 0
+          pnames_cm_cs = cls_cmeth_pnames_get(cci_cs, cmj_cs)
+          ptypes_cm_cs = cls_cmeth_ptypes_get(cci_cs, cmj_cs)
+          m_changed_cs = 0
+          saved_scope_cm_cs = @current_lexical_scope
+          @current_lexical_scope = @cls_names[cci_cs]
+          pk_cs = 0
+          while pk_cs < pnames_cm_cs.length
+            if pk_cs < ptypes_cm_cs.length && ptypes_cm_cs[pk_cs] == "int"
+              obs_cs = "".split(",")
+              collect_param_callee_slots(bid_cm_cs, pnames_cm_cs[pk_cs], obs_cs)
+              agreed_cs = ""
+              disagree_cs = 0
+              kk_cs = 0
+              while kk_cs < obs_cs.length
+                tab_cs = obs_cs[kk_cs].index("\t")
+                if tab_cs >= 0
+                  cn_cs = obs_cs[kk_cs][0, tab_cs]
+                  pos_s_cs = obs_cs[kk_cs][tab_cs + 1, obs_cs[kk_cs].length - tab_cs - 1]
+                  pos_cs = pos_s_cs.to_i
+                  ct_cs = callee_slot_type(cn_cs, pos_cs)
+                  if ct_cs == "ptr" || is_obj_type(ct_cs) == 1
+                    if agreed_cs == ""
+                      agreed_cs = ct_cs
+                    elsif agreed_cs != ct_cs
+                      disagree_cs = 1
+                    end
+                  end
+                end
+                kk_cs = kk_cs + 1
+              end
+              if agreed_cs != "" && disagree_cs == 0
+                ptypes_cm_cs[pk_cs] = agreed_cs
+                m_changed_cs = 1
+              end
+            end
+            pk_cs = pk_cs + 1
+          end
+          @current_lexical_scope = saved_scope_cm_cs
+          if m_changed_cs == 1
+            cls_cmeth_ptypes_put(cci_cs, cmj_cs, ptypes_cm_cs)
+            cls_changed_cs = 1
+          end
+        end
+        cmj_cs = cmj_cs + 1
+      end
+      if cls_changed_cs == 1
+        @cls_cmeth_ptypes_version = @cls_cmeth_ptypes_version + 1
+      end
+      cci_cs = cci_cs + 1
+    end
   end
 
  # Resolve `callee_name` (a bare-call mname or a `<Mod>_cls_<m>`
@@ -11020,6 +11099,24 @@ class Compiler
         spts = @meth_param_types[smi].split(",")
         if pos < spts.length
           return spts[pos]
+        end
+      end
+ # Real-class sibling cmeth: stored in @cls_cmeth_* (not the
+ # synthetic top-level @meth_*). A bare call from one
+ # `def self.foo` to a peer `def self.bar` inside `class X`
+ # resolves here.
+      sci = find_class_idx(@current_lexical_scope)
+      if sci >= 0
+        sc_cmnames = @cls_cmeth_names[sci].split(";")
+        smj = 0
+        while smj < sc_cmnames.length
+          if sc_cmnames[smj] == callee_name
+            sc_pts = cls_cmeth_ptypes_get(sci, smj)
+            if pos < sc_pts.length
+              return sc_pts[pos]
+            end
+          end
+          smj = smj + 1
         end
       end
     end
