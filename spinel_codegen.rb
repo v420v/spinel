@@ -7139,7 +7139,12 @@ class Compiler
     emitted = 0
     while j < @module_acc_keys.length
       consts = @module_acc_consts[j]
-      if consts != "" && consts != "?" && consts.split(";").length > 1
+ # Emit the sentinel slot whenever the accessor resolved to
+ # one or more concrete constants. Even the single-candidate
+ # case needs the slot: assignments write to it
+ # (sp_module_<Mod>_<acc> = sentinel) and reads from `.nil?`
+ # / `.is_a?` need to compare against 0 (unassigned).
+      if consts != "" && consts != "?"
         key = @module_acc_keys[j]
  # key shape is "<Mod>.<accessor>"; turn the dot into an
  # underscore for the C identifier.
@@ -11710,6 +11715,15 @@ class Compiler
                 end
                 k = k + 1
               end
+            end
+ # `.nil?` on a module-accessor slot resolved to one (or more)
+ # class candidates: the call should ask whether the slot is
+ # assigned, not dispatch a class method on the candidate
+ # class. The slot's int sentinel is 0 when unassigned (no
+ # module_sentinel maps to 0). Same shape for 0+ candidate
+ # cases since both reduce to "is the slot set?".
+            if mname == "nil?"
+              return "(sp_module_" + mod_name + "_" + sanitize_name(inner_mname) + " == 0)"
             end
             if cands.length == 1
               return "sp_" + cands[0] + "_cls_" + sanitize_name(mname) + "(" + arg_strs + ")"
@@ -17376,6 +17390,16 @@ class Compiler
       if mname == "!="
         rhs_ne = compile_arg0(nid)
         return "(!sp_class_eq(" + rc + ", " + rhs_ne + "))"
+      end
+ # `<class_value_slot>.nil?` — sp_Class's nil sentinel is
+ # cls_id == -1 (matches sp_class_superclass's root return and
+ # the default value emitted for unassigned `attr_accessor`
+ # class slots). Without this arm the call falls through to the
+ # constant-receiver dispatch which would emit
+ # `sp_<Klass>_cls_nil_p()` against whatever concrete class the
+ # slot was statically resolved to — an undeclared function.
+      if mname == "nil?"
+        return "((" + rc + ").cls_id == -1)"
       end
  # class hierarchy queries.
  # .superclass -> sp_class_superclass(c) (returns sp_Class{-1} for root)
@@ -23105,20 +23129,17 @@ class Compiler
     end
 
  # `Module.accessor = X` write.
- # Stage 1 (1 candidate): no emit; reads fold to that constant.
- # Stage 2 (2+ candidates): emit `slot = SP_MOD_<X>;` so the
- # read site's sentinel switch picks the right branch.
+ # Write the sentinel for the assigned module class. Both
+ # single-candidate and multi-candidate cases need this — the
+ # `.nil?` reader compares the slot against 0 to detect
+ # un-assigned, so the writer must stamp the sentinel even when
+ # the resolver only saw one candidate.
     if mname.length > 1 && mname[mname.length - 1] == "=" && recv >= 0 && @nd_type[recv] == "ConstantReadNode"
       mod_name = @nd_name[recv]
       if module_name_exists(mod_name) == 1
         accessor = mname[0, mname.length - 1]
         rconsts = module_acc_resolved(mod_name, accessor)
         if rconsts != "" && rconsts != "?"
-          cands = rconsts.split(";")
-          if cands.length == 1
-            return
-          end
- # Stage 2: write the sentinel for the assigned module.
           args_id2 = @nd_arguments[nid]
           if args_id2 >= 0
             ai = get_args(args_id2)
