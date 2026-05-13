@@ -17994,6 +17994,18 @@ class Compiler
       @needs_rb_value = 1
       return "poly"
     end
+ # `fetch` on a poly recv: runtime cls_id picks between user-class
+ # `fetch` arms and built-in Hash-variant arms (StrIntHash /
+ # StrStrHash / StrPolyHash). Each arm's value type differs (int /
+ # string / poly) so the result temp must be sp_RbVal — without
+ # widening, the temp's static C type comes from the first user
+ # class's `fetch` return (e.g. const char *) and the int-valued
+ # Hash arm's `sp_box_int(...)` rhs fails to compile against it.
+ # Sibling to `[]` widening above; same rationale.
+    if mname == "fetch"
+      @needs_rb_value = 1
+      return "poly"
+    end
  # Built-in string methods that compile_poly_method_call also
  # lowers via a SP_TAG_STR arm — their result temp needs to be
  # at least string-typed so the per-tag dispatch assignment
@@ -18380,12 +18392,42 @@ class Compiler
           this_rt = cls_method_return(owner_idx, mname)
           rhs = box_val_to_poly(call_expr, this_rt)
         end
+ # Suppress user-class arms whose param-slot types are
+ # incompatible with the dispatch-site arg types — when the
+ # box/unbox logic above can't bridge them. E.g. `sub.fetch(
+ # "title", "")` dispatched at a site where `sub` may be a
+ # FlashLike whose `fetch(key, default)` has `key: mrb_int`
+ # (committed by sym-only direct callers) — the String "title"
+ # can't be cast to `mrb_int` without a runtime sym lookup, and
+ # the receiver in any source-level-valid path is a Hash, never
+ # FlashLike, so the arm is unreachable at runtime. Parallels
+ # the `narrowed_int_idx` skip below.
+        arm_incompat = 0
+        pk_chk = 0
+        while pk_chk < arm_ptypes.length && pk_chk < arg_compiled.length && pk_chk < arg_types.length
+          at_b = base_type(arg_types[pk_chk])
+          pt_b = base_type(arm_ptypes[pk_chk])
+          if at_b != "" && pt_b != "" && at_b != "poly" && pt_b != "poly" && at_b != pt_b
+ # int/symbol/bool all lower to mrb_int — compatible.
+            if (at_b == "int" && pt_b == "symbol") || (at_b == "symbol" && pt_b == "int") ||
+               (at_b == "int" && pt_b == "bool")   || (at_b == "bool"   && pt_b == "int")
+ # compatible
+            else
+              arm_incompat = 1
+            end
+          end
+          pk_chk = pk_chk + 1
+        end
  # Narrowed `[]` arms (Approach 2): suppress user-class arms
  # whose `[]` doesn't return int — the dead-code emit would
  # otherwise assign e.g. a string to the now-mrb_int result
  # temp and fail the C compile. The runtime can't reach these
  # arms anyway because the observation set narrowed past them.
-        if narrowed_int_idx == 1 && cls_method_return(owner_idx, mname) != "int"
+        if arm_incompat == 1
+ # skip — runtime can't reach this arm in a source-level-valid
+ # path because the dispatch-site arg types preclude the user
+ # class as the actual receiver.
+        elsif narrowed_int_idx == 1 && cls_method_return(owner_idx, mname) != "int"
  # skip
         else
           emit("    if (" + recv_tmp + ".cls_id == " + cls_id_for_user_internal(i).to_s + ") " + tmp + " = " + rhs + ";")
@@ -18497,6 +18539,34 @@ class Compiler
           emit("    if (" + recv_tmp + ".cls_id == SP_BUILTIN_STR_STR_HASH) " + result_tmp + " = sp_box_str(sp_StrStrHash_get((sp_StrStrHash *)" + recv_tmp + ".v.p, " + arg_compiled[0] + "));")
           emit("    if (" + recv_tmp + ".cls_id == SP_BUILTIN_STR_POLY_HASH) " + result_tmp + " = sp_StrPolyHash_get((sp_StrPolyHash *)" + recv_tmp + ".v.p, " + arg_compiled[0] + ");")
         end
+      end
+    end
+ # `fetch` arms — parallel to `[]` above for the (key, default)
+ # form. Each Str*-Hash variant tests has_key first, returns the
+ # boxed value on hit, or the boxed default on miss. Sibling to
+ # #456 (which added Hash arms to poly-recv `[]` / `[]=`); without
+ # this, `sub.fetch("k", "d")` on a poly recv that resolves to a
+ # Hash variant at runtime matches no arm and silently returns
+ # the temp's nil default — even though the Hash holds the key.
+ # Sym-keyed variants are deferred for the same `@needs`-gating
+ # reason as `[]`.
+    if mname == "fetch" && arg_compiled.length >= 1
+      key_t = arg_types.length > 0 ? arg_types[0] : ""
+      if (key_t == "string" || key_t == "mutable_str") && is_poly_ret == 1
+        key_c = arg_compiled[0]
+        def_box = "sp_box_nil()"
+        if arg_compiled.length >= 2
+          def_t = arg_types.length >= 2 ? arg_types[1] : ""
+          def_c = arg_compiled[1]
+          if def_t == "poly" || def_t == ""
+            def_box = def_c
+          else
+            def_box = box_value_to_poly(def_t, def_c)
+          end
+        end
+        emit("    if (" + recv_tmp + ".cls_id == SP_BUILTIN_STR_INT_HASH) " + result_tmp + " = sp_StrIntHash_has_key((sp_StrIntHash *)" + recv_tmp + ".v.p, " + key_c + ") ? sp_box_int(sp_StrIntHash_get((sp_StrIntHash *)" + recv_tmp + ".v.p, " + key_c + ")) : " + def_box + ";")
+        emit("    if (" + recv_tmp + ".cls_id == SP_BUILTIN_STR_STR_HASH) " + result_tmp + " = sp_StrStrHash_has_key((sp_StrStrHash *)" + recv_tmp + ".v.p, " + key_c + ") ? sp_box_str(sp_StrStrHash_get((sp_StrStrHash *)" + recv_tmp + ".v.p, " + key_c + ")) : " + def_box + ";")
+        emit("    if (" + recv_tmp + ".cls_id == SP_BUILTIN_STR_POLY_HASH) " + result_tmp + " = sp_StrPolyHash_has_key((sp_StrPolyHash *)" + recv_tmp + ".v.p, " + key_c + ") ? sp_StrPolyHash_get((sp_StrPolyHash *)" + recv_tmp + ".v.p, " + key_c + ") : " + def_box + ";")
       end
     end
  # `dup` arms — Hash#dup on a poly recv whose runtime storage is
