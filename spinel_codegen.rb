@@ -13011,6 +13011,20 @@ class Compiler
           return "sp_proc_call(lv_" + rname + ", (mrb_int[]){" + ca + "})"
         end
       end
+
+ # Anonymous-proc-receiver dispatch — `proc { ... }.call`, or any
+ # expression chain whose inferred type is `proc` (e.g.
+ # `factory().call`). The LocalVariableReadNode branch above handles
+ # the named-proc case directly; this generic branch compiles the
+ # receiver expression and feeds it to sp_proc_call, using the same
+ # arg-array packing convention.
+      if infer_type(recv) == "proc"
+        ca_anon = compile_call_args(nid)
+        if ca_anon == ""
+          ca_anon = "0"
+        end
+        return "sp_proc_call(" + compile_expr(recv) + ", (mrb_int[]){" + ca_anon + "})"
+      end
     end
     ""
   end
