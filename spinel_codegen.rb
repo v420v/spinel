@@ -2328,6 +2328,49 @@ class Compiler
       end
       return t1
     end
+    if t == "ReturnNode"
+ # `return X` evaluated in expression position — same shape as
+ # collect_return_types' ReturnNode arm in spinel_analyze.rb.
+ # Without this case the universal `"int"` fallback fires; in
+ # practice that's demoted by unify_return_type's int-as-sentinel
+ # logic when paired with a concrete type from collect_return_types,
+ # but returning the actual arg type makes infer_type semantically
+ # correct and resilient to future sentinel-handling changes.
+ # `return a, b` materializes as a fixed-arity tuple; bare `return`
+ # contributes "nil" matching CRuby.
+      args_id = @nd_arguments[nid]
+      if args_id >= 0
+        arg_ids = get_args(args_id)
+        if arg_ids.length == 1
+          return infer_type(arg_ids[0])
+        end
+        if arg_ids.length > 1
+          return tuple_type_from_elems(arg_ids)
+        end
+      end
+      return "nil"
+    end
+    if t == "BeginNode"
+ # Method bodies that end in `def f; X; rescue; Y; end` need
+ # the method's inferred return type to unify both branches.
+ # Without this arm spinel falls back to int (the default), and
+ # string-returning rescue bodies fail C compilation when the
+ # ret_tmp slot's type doesn't match the value being assigned.
+      types_b = "".split(",")
+      bodies_b = begin_node_arm_bodies(nid)
+      bi = 0
+      while bi < bodies_b.length
+        bstmts = get_stmts(bodies_b[bi])
+        if bstmts.length > 0
+          types_b.push(infer_type(bstmts.last))
+        end
+        bi = bi + 1
+      end
+      if types_b.length > 0
+        return unify_return_type(types_b)
+      end
+      return "void"
+    end
     if t == "LocalVariableReadNode"
       vt = find_var_type(@nd_name[nid])
       if vt != ""
@@ -6033,6 +6076,29 @@ class Compiler
 
 
 
+
+ # Returns the body-stmt-list IDs for each arm of a BeginNode (the
+ # begin body followed by each rescue clause's body in chain order),
+ # filtering out missing bodies (negative IDs). Used by the
+ # `infer_type` BeginNode arm for last-stmt type unification.
+ # `[]` (not `"".split(",")`) is the int_array init idiom in this
+ # codebase — see the @nd_* parallel arrays in `initialize`.
+  def begin_node_arm_bodies(nid)
+    out = []
+    bid = @nd_body[nid]
+    if bid >= 0
+      out.push(bid)
+    end
+    rc = @nd_rescue_clause[nid]
+    while rc >= 0
+      rb = @nd_body[rc]
+      if rb >= 0
+        out.push(rb)
+      end
+      rc = @nd_subsequent[rc]
+    end
+    out
+  end
 
   def unify_return_type(types)
     result = ""
