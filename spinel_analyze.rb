@@ -3808,16 +3808,6 @@ class Compiler
               if def_at_f == "string" || def_at_f == "mutable_str"
                 return "string"
               end
- # Hash-typed default (`fetch "k", {}`). Sequel to the
- # string-default case above: the two ternary arms are int (from
- # the get) and a hash pointer (from the default literal), with
- # no shared primitive type. Box both to sp_RbVal and surface
- # the call's result as poly. Limited to the int-leaf hash
- # variants for now; broader receivers can extend the pattern.
-              if is_hash_type(def_at_f) == 1
-                @needs_rb_value = 1
-                return "poly"
-              end
             end
           end
         end
