@@ -11221,6 +11221,137 @@ class Compiler
     end
   end
 
+ # LV counterpart of infer_param_type_from_callee_slot. Walks
+ # each method body's LV table and, for each hash-typed LV
+ # forwarded to a callee whose matching slot has widened to a
+ # poly variant of the same key family, widens the LV.
+ #
+ # Real-blog shape:
+ #
+ #   def parse_request(env, stdin)
+ #     params = {}                         # initial str_int_hash
+ #     parse_form_into(query, params)      # callee widened to str_poly_hash
+ #                                         # via narrow_param_hash_types_from_body_writes
+ #     ...
+ #   end
+ #
+ # Pre-fix `params` stayed str_int_hash and the call passed
+ # sp_StrIntHash * into a sp_StrPolyHash * slot, warning. Plus
+ # 4 downstream `iv_X = lv_params` cascade warnings. With this
+ # pass, params widens up the chain.
+  def infer_lv_types_from_callee_arg_slots
+ # Top-level + module class methods (@meth_*).
+    mi_lv = 0
+    while mi_lv < @meth_names.length
+      bid_lv = @meth_body_ids[mi_lv]
+      if bid_lv >= 0
+        sn_lv = @nd_scope_names[bid_lv].split("|", -1)
+        st_lv = @nd_scope_types[bid_lv].split("|", -1)
+        changed_lv = 0
+        saved_scope_lv = @current_lexical_scope
+        mname_lv = @meth_names[mi_lv]
+        cls_marker_lv = mname_lv.index("_cls_")
+        if cls_marker_lv != nil && cls_marker_lv >= 0
+          @current_lexical_scope = mname_lv[0, cls_marker_lv]
+        end
+        lvi = 0
+        while lvi < sn_lv.length
+          if lvi < st_lv.length && is_hash_type(st_lv[lvi]) == 1 && st_lv[lvi].include?("poly") == false
+            obs_lv = "".split(",")
+            collect_param_callee_slots(bid_lv, sn_lv[lvi], obs_lv)
+            cur_kt_lv = hash_key_part(st_lv[lvi])
+            agreed_lv = ""
+            disagree_lv = 0
+            kk_lv = 0
+            while kk_lv < obs_lv.length
+              tab_lv = obs_lv[kk_lv].index("\t")
+              if tab_lv >= 0
+                cn_lv = obs_lv[kk_lv][0, tab_lv]
+                pos_lv = obs_lv[kk_lv][tab_lv + 1, obs_lv[kk_lv].length - tab_lv - 1].to_i
+                ct_lv = callee_slot_type(cn_lv, pos_lv)
+                if is_hash_type(ct_lv) == 1 && ct_lv.include?("poly") && hash_key_part(ct_lv) == cur_kt_lv
+                  if agreed_lv == ""
+                    agreed_lv = ct_lv
+                  elsif agreed_lv != ct_lv
+                    disagree_lv = 1
+                  end
+                end
+              end
+              kk_lv = kk_lv + 1
+            end
+            if agreed_lv != "" && disagree_lv == 0
+              st_lv[lvi] = agreed_lv
+              changed_lv = 1
+            end
+          end
+          lvi = lvi + 1
+        end
+        @current_lexical_scope = saved_scope_lv
+        if changed_lv == 1
+          @nd_scope_types[bid_lv] = st_lv.join("|")
+        end
+      end
+      mi_lv = mi_lv + 1
+    end
+ # Class instance methods (@cls_meth_*) and real-class cmeths
+ # (@cls_cmeth_*) share the @nd_scope_names indirection; the
+ # per-(class, cmeth) tables from Task b also need updating.
+ # For brevity we update only the per-bid table here; the
+ # per-(ci, cmj) Task b tables are populated by a separate
+ # pass earlier in the inference loop and use these same scope
+ # entries, so the widening propagates on the next iteration.
+    ci_lv = 0
+    while ci_lv < @cls_names.length
+      bodies_lv = @cls_meth_bodies[ci_lv].split(";")
+      bj_lv = 0
+      while bj_lv < bodies_lv.length
+        bid_im = bodies_lv[bj_lv].to_i
+        if bid_im >= 0
+          sn_im = @nd_scope_names[bid_im].split("|", -1)
+          st_im = @nd_scope_types[bid_im].split("|", -1)
+          changed_im = 0
+          lvii = 0
+          while lvii < sn_im.length
+            if lvii < st_im.length && is_hash_type(st_im[lvii]) == 1 && st_im[lvii].include?("poly") == false
+              obs_im = "".split(",")
+              collect_param_callee_slots(bid_im, sn_im[lvii], obs_im)
+              cur_kt_im = hash_key_part(st_im[lvii])
+              agreed_im = ""
+              disagree_im = 0
+              kki = 0
+              while kki < obs_im.length
+                tab_im = obs_im[kki].index("\t")
+                if tab_im >= 0
+                  cn_im = obs_im[kki][0, tab_im]
+                  pos_im = obs_im[kki][tab_im + 1, obs_im[kki].length - tab_im - 1].to_i
+                  ct_im = callee_slot_type(cn_im, pos_im)
+                  if is_hash_type(ct_im) == 1 && ct_im.include?("poly") && hash_key_part(ct_im) == cur_kt_im
+                    if agreed_im == ""
+                      agreed_im = ct_im
+                    elsif agreed_im != ct_im
+                      disagree_im = 1
+                    end
+                  end
+                end
+                kki = kki + 1
+              end
+              if agreed_im != "" && disagree_im == 0
+                st_im[lvii] = agreed_im
+                changed_im = 1
+              end
+            end
+            lvii = lvii + 1
+          end
+          if changed_im == 1
+            @nd_scope_types[bid_im] = st_im.join("|")
+          end
+        end
+        bj_lv = bj_lv + 1
+      end
+      ci_lv = ci_lv + 1
+    end
+  end
+
  # Resolve `callee_name` (a bare-call mname or a `<Mod>_cls_<m>`
  # synthetic) to its param-types array and return the slot at
  # `pos`, or "" if unresolvable. Used by
@@ -21404,6 +21535,59 @@ class Compiler
       end
       j = j + 1
     end
+ # Pass 5: callee-arg-slot back-prop. For each hash-typed LV
+ # forwarded to a callee whose matching slot has widened to a
+ # poly variant (via narrow_param_hash_types_from_body_writes),
+ # widen the caller's LV. Same shape as infer_param_type_from_
+ # callee_slot but applied here at the LV layer so the refined
+ # type sticks through subsequent refine_method_body_locals
+ # invocations (return-type recompute, etc.). Surfaces in real-
+ # blog's parse_request -> parse_form_into chain where the
+ # caller's `params = {}` literal should widen alongside the
+ # callee's body-widened `into : str_poly_hash`.
+    saved_scope_p5 = @current_lexical_scope
+ # Derive the lexical scope from @current_method_name (set by
+ # the caller, typically precompute_all_scope_decls) so the
+ # sibling-cmeth synth lookup `<Scope>_cls_<callee>` resolves.
+    if @current_method_name != ""
+      cls_marker_p5 = @current_method_name.index("_cls_")
+      if cls_marker_p5 != nil && cls_marker_p5 >= 0
+        @current_lexical_scope = @current_method_name[0, cls_marker_p5]
+      end
+    end
+    j = 0
+    while j < lnames.length
+      if is_hash_type(ltypes[j]) == 1 && ltypes[j].include?("poly") == false
+        obs_p5 = "".split(",")
+        collect_param_callee_slots(bid, lnames[j], obs_p5)
+        cur_kt_p5 = hash_key_part(ltypes[j])
+        agreed_p5 = ""
+        disagree_p5 = 0
+        kk_p5 = 0
+        while kk_p5 < obs_p5.length
+          tab_p5 = obs_p5[kk_p5].index("\t")
+          if tab_p5 >= 0
+            cn_p5 = obs_p5[kk_p5][0, tab_p5]
+            pos_p5 = obs_p5[kk_p5][tab_p5 + 1, obs_p5[kk_p5].length - tab_p5 - 1].to_i
+            ct_p5 = callee_slot_type(cn_p5, pos_p5)
+            if is_hash_type(ct_p5) == 1 && ct_p5.include?("poly") && hash_key_part(ct_p5) == cur_kt_p5
+              if agreed_p5 == ""
+                agreed_p5 = ct_p5
+              elsif agreed_p5 != ct_p5
+                disagree_p5 = 1
+              end
+            end
+          end
+          kk_p5 = kk_p5 + 1
+        end
+        if agreed_p5 != "" && disagree_p5 == 0
+          ltypes[j] = agreed_p5
+          set_var_type(lnames[j], agreed_p5)
+        end
+      end
+      j = j + 1
+    end
+    @current_lexical_scope = saved_scope_p5
   end
 
  # Constant-initializer locals — block params introduced inside
