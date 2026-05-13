@@ -3811,6 +3811,16 @@ class Compiler
               if def_at_f == "string" || def_at_f == "mutable_str"
                 return "string"
               end
+ # Hash-typed default (`fetch "k", {}`). The two ternary arms
+ # are int (from the get) and a hash pointer (from the default
+ # literal) with no shared primitive type. Box both to
+ # sp_RbVal and surface the result as poly. The receiving LV
+ # slot widens to sp_RbVal via the refine pass's
+ # concrete-to-poly merge rule (below in this file).
+              if is_hash_type(def_at_f) == 1
+                @needs_rb_value = 1
+                return "poly"
+              end
             end
           end
         end
@@ -21649,6 +21659,15 @@ class Compiler
               ltypes[k] = lt[j]
               set_var_type(lnames[k], lt[j])
             end
+ # Pass N detected genuine polymorphism (writes from sites with
+ # incompatible types) that an earlier pass missed because an
+ # upstream local was still defaulted to int. Mirrors the rule
+ # in refine_method_body_locals; same reasoning.
+            if lt[j] == "poly" && ltypes[k] != "poly"
+              ltypes[k] = "poly"
+              set_var_type(lnames[k], "poly")
+              @needs_rb_value = 1
+            end
           end
           k = k + 1
         end
@@ -21957,6 +21976,21 @@ class Compiler
           elsif ltypes[k] == "str_int_hash" && ltypes2[j] == "str_str_hash"
             ltypes[k] = ltypes2[j]
             set_var_type(lnames[k], ltypes2[j])
+ # Pass 2 detected genuine polymorphism (the local is written
+ # from sites of incompatible types) that pass 1 missed because
+ # an upstream local was still defaulted to int. Example:
+ # `sub = if raw_sub.is_a?(Hash) then raw_sub else {} end` where
+ # raw_sub is poly (from `params.fetch "k", {}`): pass 1 typed
+ # the then-arm as int (raw_sub not yet in scope) so unify gave
+ # str_int_hash; pass 2 with raw_sub declared poly correctly
+ # unifies to poly. Without this rule the LV slot stays
+ # str_int_hash and codegen emits sp_StrIntHash * for a value
+ # that's actually sp_RbVal at runtime — incompatible-pointer
+ # assignment at the write site.
+          elsif ltypes2[j] == "poly" && ltypes[k] != "poly"
+            ltypes[k] = "poly"
+            set_var_type(lnames[k], "poly")
+            @needs_rb_value = 1
           end
         end
         k = k + 1
