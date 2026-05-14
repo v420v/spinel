@@ -8935,6 +8935,18 @@ class Compiler
     if spec == "ptr"
       return "ptr"
     end
+ # Spinel array specs for zero-copy bulk transfer. Spinel's
+ # FloatArray / IntArray storage is contiguous (`.data` field
+ # of type `mrb_float *` / `mrb_int *`) and matches `const
+ # double *` / `const int64_t *` directly. The caller is
+ # responsible for keeping the Array alive across the call —
+ # the GC-rooting that protects :str args extends naturally.
+    if spec == "float_array"
+      return "float_array"
+    end
+    if spec == "int_array"
+      return "int_array"
+    end
     if spec == "void"
       return "void"
     end

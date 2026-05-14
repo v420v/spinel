@@ -4464,6 +4464,13 @@ class Compiler
     if spec == "ptr"
       return "void *"
     end
+ # Spinel array specs (#474): pointer to underlying storage.
+    if spec == "float_array"
+      return "const double *"
+    end
+    if spec == "int_array"
+      return "const int64_t *"
+    end
     if spec == "void"
       return "void"
     end
@@ -4577,6 +4584,13 @@ class Compiler
         result = result + compile_expr(call_args[k])
       elsif spec == "ptr"
         result = result + "((void *)" + compile_expr(call_args[k]) + ")"
+      elsif spec == "float_array" || spec == "int_array"
+ # Zero-copy bulk transfer (#474). The Spinel Array's contiguous
+ # storage lives at `.data`; we hand the raw pointer to C with
+ # call-duration lifetime (same contract as `:str`). Cast hides
+ # the mrb_float/mrb_int -> double/int64_t typedef-vs-spelling
+ # mismatch (both widths match on every supported target).
+        result = result + "((" + ctype + ")(" + compile_expr(call_args[k]) + ")->data)"
       else
         result = result + "((" + ctype + ")(" + compile_expr(call_args[k]) + "))"
       end

@@ -82,11 +82,20 @@ Recognized type specs:
 | `:bool` | `int` | `bool` |
 | `:str` | `const char *` | `string` |
 | `:ptr` | `void *` | `ptr` |
+| `:float_array` | `const double *` | `Array<Float>` (`.data` pointer) |
+| `:int_array` | `const int64_t *` | `Array<Int>` (`.data` pointer) |
 | `:void` | `void` | `void` (return only) |
 
 All integer types collapse to `mrb_int` (int64) inside Spinel and are
 cast to the declared C type at the call boundary. Floats collapse to
 `double` the same way.
+
+`:float_array` / `:int_array` hand the C side a pointer to the Spinel
+Array's contiguous storage (`.data`). Length is **not** part of the
+spec — pass it as a separate `:size_t` arg, same way as `:str` +
+`strlen`. Lifetime is call-duration only: the GC may free the
+underlying Array after the call returns, so the C side must not
+stash the pointer (copy if it needs to).
 
 ### `ffi_const :NAME, <int>`
 
