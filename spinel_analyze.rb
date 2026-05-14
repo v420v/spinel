@@ -3253,6 +3253,15 @@ class Compiler
         end
       end
     end
+ # Bare calls inside an instance method can resolve to another
+ # user-defined method on self. Let the receiver-aware class method
+ # lookup later in infer_call_type answer those before the generic
+ # name-based builtins (`length` -> int, `to_s` -> string, ...).
+    if recv < 0 && @current_class_idx >= 0
+      if cls_find_method(@current_class_idx, mname) >= 0
+        return ""
+      end
+    end
     if mname == "length"
       if recv_could_be_obj(recv) == 1 && any_user_class_defines_imeth(mname) == 1
         return ""
