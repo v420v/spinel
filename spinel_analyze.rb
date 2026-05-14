@@ -166,6 +166,16 @@ class Compiler
  # dimension is semicolon-separated and parallel to
  # `@cls_ivar_names[ci]`.
     @cls_ivar_observed_types = "".split(",")
+ # Per-class set of ivar names that are read with a nil predicate
+ # somewhere in the program — `<ivar>.nil?`, `<ivar> == nil`,
+ # `<ivar> != nil`. Gates nil-scalar widening to poly so an ivar
+ # mixed-typed at the slot but never actually nil-checked stays at
+ # its scalar type (optcarrot's `@wave_length = nil` then arithmetic
+ # is the regression sentinel — without the gate, nil-write
+ # widening cascaded `@freq` / `@timer` / `@step` to poly and broke
+ # the int math emit). Populated by scan_ivar_nil_predicates before
+ # the iter loop; semicolon-joined names parallel to @cls_ivar_names.
+    @cls_ivar_nil_checked = "".split(",")
  # Memoization for `find_lv_ivar_alias_in_ast`. Keyed by
  # `"<class_idx>:<lv_name>"`, value is the resolved ivar name (or
  # `""` when the LV has multiple sources / non-ivar writes).
@@ -6880,6 +6890,7 @@ class Compiler
       sk3 = sk3 + 1
     end
     @cls_ivar_observed_types.push(obs_init)
+    @cls_ivar_nil_checked.push("")
  # Auto-generate initialize method for struct-derived classes
     if struct_fields.length > 0
       init_params = ""
@@ -7800,7 +7811,8 @@ class Compiler
  # `@m = method(:foo)` initially scans as int and a
  # refinement promotes it to `obj_Method` — no heterogeneity
  # to widen for).
-          if (old == "int" || old == "nil") && is_obj_type(new_type) == 1 && cls_ivar_definite_flag(ci, iname) == 1
+          if (nil_scalar_ivar_mix?(old, new_type) && cls_ivar_nil_checked?(ci, iname) == 1) ||
+             ((old == "int" || old == "nil") && is_obj_type(new_type) == 1 && cls_ivar_definite_flag(ci, iname) == 1)
             types[k] = "poly"
             @needs_rb_value = 1
             @cls_ivar_types[ci] = types.join(";")
@@ -8035,6 +8047,15 @@ class Compiler
     0
   end
 
+  def scalar_ivar_type?(t)
+    t == "int" || t == "float" || t == "bool" || t == "symbol"
+  end
+
+  def nil_scalar_ivar_mix?(old_type, new_type)
+    (old_type == "nil" && scalar_ivar_type?(new_type)) ||
+      (new_type == "nil" && scalar_ivar_type?(old_type))
+  end
+
   def cls_ivar_definite_flag(ci, iname)
     names = @cls_ivar_names[ci].split(";")
     flags = @cls_ivar_init_definite[ci].split(";")
@@ -8049,6 +8070,189 @@ class Compiler
       k = k + 1
     end
     0
+  end
+
+ # Returns 1 if the ivar is read with a nil predicate
+ # (`<ivar>.nil?`, `<ivar> == nil`, `<ivar> != nil`) somewhere in
+ # the program. The nil-scalar widening pass uses this to decide
+ # whether mixing nil and scalar writes is observable — if the
+ # ivar is never compared against nil, an `@x = nil` write can
+ # collapse into the scalar storage at runtime without breaking
+ # any user predicate, and we keep the cheaper int slot. Without
+ # this gate, the widening cascades into unrelated arithmetic
+ # (optcarrot's `@wave_length` → `@freq` chain was the
+ # regression that triggered the original revert).
+  def cls_ivar_nil_checked?(ci, iname)
+    if ci < 0 || ci >= @cls_ivar_nil_checked.length
+      return 0
+    end
+    if @cls_ivar_nil_checked[ci] == ""
+      return 0
+    end
+    names = @cls_ivar_nil_checked[ci].split(";")
+    k = 0
+    while k < names.length
+      if names[k] == iname
+        return 1
+      end
+      k = k + 1
+    end
+    0
+  end
+
+  def mark_ivar_nil_checked(ci, iname)
+    if ci < 0 || ci >= @cls_ivar_nil_checked.length
+      return
+    end
+    if cls_ivar_nil_checked?(ci, iname) == 1
+      return
+    end
+    if @cls_ivar_nil_checked[ci] == ""
+      @cls_ivar_nil_checked[ci] = iname
+    else
+      @cls_ivar_nil_checked[ci] = @cls_ivar_nil_checked[ci] + ";" + iname
+    end
+  end
+
+ # Pre-pass that walks the whole program once and marks every
+ # `(ci, ivar_name)` where `<ivar>` is observed inside a nil
+ # predicate read site. Tracks `@current_class_idx` through the
+ # walk so a `@x.nil?` inside `class A` marks A's slot, not the
+ # toplevel one. Toplevel ivar nil-checks (outside any class)
+ # don't need a class flag — the toplevel_ivar tables don't share
+ # the scalar-widening path that needs gating, so we just early-
+ # return when @current_class_idx is -1.
+  def scan_ivar_nil_predicates(nid)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "ClassNode"
+      cname_id = @nd_constant_path[nid]
+      cname = ""
+      if cname_id >= 0
+        cname = const_ref_flat_name(cname_id)
+      end
+      if @current_lexical_scope != ""
+        cname = @current_lexical_scope + "_" + cname
+      end
+      cci = find_class_idx(cname)
+      saved_ci = @current_class_idx
+      saved_scope = @current_lexical_scope
+      if cci >= 0
+        @current_class_idx = cci
+      end
+      @current_lexical_scope = cname
+      body = @nd_body[nid]
+      if body >= 0
+        scan_ivar_nil_predicates(body)
+      end
+      @current_class_idx = saved_ci
+      @current_lexical_scope = saved_scope
+      return
+    end
+    if t == "ModuleNode"
+      mname_id = @nd_constant_path[nid]
+      mname = ""
+      if mname_id >= 0
+        mname = const_ref_flat_name(mname_id)
+      end
+      if @current_lexical_scope != ""
+        mname = @current_lexical_scope + "_" + mname
+      end
+      saved_scope = @current_lexical_scope
+      @current_lexical_scope = mname
+      body = @nd_body[nid]
+      if body >= 0
+        scan_ivar_nil_predicates(body)
+      end
+      @current_lexical_scope = saved_scope
+      return
+    end
+    if t == "CallNode"
+      mname = @nd_name[nid]
+      recv = @nd_receiver[nid]
+ # `@x.nil?`
+      if mname == "nil?" && recv >= 0 && @nd_type[recv] == "InstanceVariableReadNode"
+        if @current_class_idx >= 0
+          mark_ivar_nil_checked(@current_class_idx, @nd_name[recv])
+        end
+      end
+ # `@x == nil` / `@x != nil` — Prism lowers these to CallNode
+ # with mname "==" / "!=" on the lhs receiver, single arg.
+      if mname == "==" || mname == "!="
+        args_id = @nd_arguments[nid]
+        if recv >= 0 && @nd_type[recv] == "InstanceVariableReadNode" && args_id >= 0
+          a_ids = get_args(args_id)
+          if a_ids.length == 1 && @nd_type[a_ids[0]] == "NilNode"
+            if @current_class_idx >= 0
+              mark_ivar_nil_checked(@current_class_idx, @nd_name[recv])
+            end
+          end
+        end
+ # `nil == @x` / `nil != @x` — mirror form
+        if recv >= 0 && @nd_type[recv] == "NilNode" && args_id >= 0
+          a_ids = get_args(args_id)
+          if a_ids.length == 1 && @nd_type[a_ids[0]] == "InstanceVariableReadNode"
+            if @current_class_idx >= 0
+              mark_ivar_nil_checked(@current_class_idx, @nd_name[a_ids[0]])
+            end
+          end
+        end
+      end
+    end
+ # Recurse through common child slots. Mirrors scan_ivars_children's
+ # walking shape so the same set of node kinds is covered.
+    if t == "DefNode"
+      body = @nd_body[nid]
+      if body >= 0
+        scan_ivar_nil_predicates(body)
+      end
+      return
+    end
+    if @nd_body[nid] >= 0
+      scan_ivar_nil_predicates(@nd_body[nid])
+    end
+    if @nd_type[nid] == "StatementsNode"
+      stmts = get_stmts(nid)
+      k = 0
+      while k < stmts.length
+        scan_ivar_nil_predicates(stmts[k])
+        k = k + 1
+      end
+    end
+    if @nd_expression[nid] >= 0
+      scan_ivar_nil_predicates(@nd_expression[nid])
+    end
+    if @nd_predicate[nid] >= 0
+      scan_ivar_nil_predicates(@nd_predicate[nid])
+    end
+    if @nd_subsequent[nid] >= 0
+      scan_ivar_nil_predicates(@nd_subsequent[nid])
+    end
+    if @nd_else_clause[nid] >= 0
+      scan_ivar_nil_predicates(@nd_else_clause[nid])
+    end
+    if @nd_receiver[nid] >= 0
+      scan_ivar_nil_predicates(@nd_receiver[nid])
+    end
+    if @nd_arguments[nid] >= 0
+      args = get_args(@nd_arguments[nid])
+      k = 0
+      while k < args.length
+        scan_ivar_nil_predicates(args[k])
+        k = k + 1
+      end
+    end
+    if @nd_left[nid] >= 0
+      scan_ivar_nil_predicates(@nd_left[nid])
+    end
+    if @nd_right[nid] >= 0
+      scan_ivar_nil_predicates(@nd_right[nid])
+    end
+    if @nd_block[nid] >= 0
+      scan_ivar_nil_predicates(@nd_block[nid])
+    end
   end
 
   def scan_ivars(ci, nid)
@@ -9509,6 +9713,7 @@ class Compiler
     @cls_ivar_types.push("obj_Method;int")
     @cls_ivar_init_definite.push("1;1")
     @cls_ivar_observed_types.push("obj_Method;int")
+    @cls_ivar_nil_checked.push("")
     @cls_meth_names.push("initialize")
     @cls_meth_params.push("self_obj,fn_ptr")
     @cls_meth_ptypes.push("obj_Method,int")
@@ -9541,6 +9746,7 @@ class Compiler
     @cls_ivar_types.push("")
     @cls_ivar_init_definite.push("")
     @cls_ivar_observed_types.push("")
+    @cls_ivar_nil_checked.push("")
     @cls_meth_names.push("")
     @cls_meth_params.push("")
     @cls_meth_ptypes.push("")
@@ -11017,7 +11223,14 @@ class Compiler
                           if ij < ivar_types.length
                             if ivar_names[ij] == iname
                               if ptypes[pi] != ""
-                                ivar_types[ij] = unify_call_types(ivar_types[ij], ptypes[pi], -1)
+                                old_t = ivar_types[ij]
+                                new_t = ptypes[pi]
+                                if nil_scalar_ivar_mix?(old_t, new_t) && cls_ivar_nil_checked?(i, iname) == 1
+                                  ivar_types[ij] = "poly"
+                                  @needs_rb_value = 1
+                                else
+                                  ivar_types[ij] = unify_call_types(old_t, new_t, -1)
+                                end
                               end
                             end
                           end
@@ -13800,7 +14013,20 @@ class Compiler
               update_ivar_type(@current_class_idx, chain_inames[ci_idx], at)
               ci_idx = ci_idx + 1
             end
-          elsif at != "int" && at != "nil"
+          elsif at == "nil"
+ # Plain `@x = nil` literal. Pre-gate (the original PR #495
+ # behavior) routed every nil write through update_ivar_type and
+ # cascaded scalar-mixed slots to poly, breaking optcarrot's
+ # `@wave_length = nil` + `@wave_length = 0 if @wave_length` +
+ # int arithmetic chain. Only widen now if the ivar is actually
+ # tested via a nil predicate (`<ivar>.nil?` / `== nil` / `!= nil`)
+ # somewhere in the program — that's the signal that the user
+ # depends on the nil-vs-scalar distinction.
+            if scalar_ivar_type?(cls_ivar_type(@current_class_idx, iname)) &&
+                cls_ivar_nil_checked?(@current_class_idx, iname) == 1
+              update_ivar_type(@current_class_idx, iname, at)
+            end
+          elsif at != "int" || cls_ivar_type(@current_class_idx, iname) == "nil"
             update_ivar_type(@current_class_idx, iname, at)
           end
         end
@@ -17016,6 +17242,13 @@ class Compiler
  # treat its inputs as read-only.
   def analyze_phase
     collect_all
+ # Pre-pass: which ivars are actually read with a nil predicate?
+ # Gates the scan_writer_calls nil-scalar widening so an ivar
+ # mixed-typed at the slot but never tested with `.nil?` /
+ # `== nil` stays at its scalar type instead of cascading to
+ # poly. Walks once; the resulting @cls_ivar_nil_checked set is
+ # then consulted by scan_writer_calls inside the iter loop.
+    scan_ivar_nil_predicates(@root_id)
     infer_main_call_types
     infer_function_body_call_types
     infer_class_body_call_types
