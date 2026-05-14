@@ -96,6 +96,30 @@ static mrb_int sp_int_clamp(mrb_int v,mrb_int lo,mrb_int hi){return v<lo?lo:v>hi
 static mrb_int sp_int_sqrt(mrb_int n){if(n<0)return 0;if(n<2)return n;mrb_int x=n,y=(x+1)/2;while(y<x){x=y;y=(x+n/x)/2;}return x;}
 static inline char *sp_str_alloc_raw(size_t total_with_null);  /* fwd decl */
 static const char*sp_int_chr(mrb_int n){char*s=sp_str_alloc_raw(2);s[0]=(char)n;s[1]=0;return s;}
+
+/* Forward decls so sp_str_to_i_strict can use them. */
+static void sp_raise_cls(const char *cls, const char *msg);
+static const char *sp_sprintf(const char *fmt, ...);
+
+/* CRuby's `Integer(s)` raises ArgumentError for unparseable input
+   (empty string, leading/trailing junk, all-whitespace). The bare
+   `(mrb_int)strtoll(s, NULL, 10)` spinel previously emitted silently
+   returned 0 instead, which made `Integer(s) rescue 0` always take
+   the main branch. This helper matches CRuby semantics: skips
+   leading/trailing whitespace, requires at least one valid digit,
+   rejects trailing junk. Accepts an optional leading `+` / `-`. */
+static mrb_int sp_str_to_i_strict(const char *s) {
+  if (!s) sp_raise_cls("ArgumentError", "invalid value for Integer(): nil");
+  const char *p = s;
+  while (isspace((unsigned char)*p)) p++;
+  if (*p == '\0') sp_raise_cls("ArgumentError", sp_sprintf("invalid value for Integer(): \"%s\"", s));
+  char *endptr;
+  long long v = strtoll(p, &endptr, 10);
+  if (endptr == p) sp_raise_cls("ArgumentError", sp_sprintf("invalid value for Integer(): \"%s\"", s));
+  while (isspace((unsigned char)*endptr)) endptr++;
+  if (*endptr != '\0') sp_raise_cls("ArgumentError", sp_sprintf("invalid value for Integer(): \"%s\"", s));
+  return (mrb_int)v;
+}
 typedef struct{mrb_int first;mrb_int last;}sp_Range;
 static sp_Range sp_range_new(mrb_int f,mrb_int l){sp_Range r;r.first=f;r.last=l;return r;}
 
@@ -856,6 +880,17 @@ static const char *sp_re_match_post = NULL;
 typedef struct{const char**data;mrb_int len;}sp_Argv;
 static sp_Argv sp_argv;
 
+/* Mark active in-flight exception messages. Most raises pass string
+   literals (rodata, marker byte ≠ 0xfe → no-op for sp_mark_string),
+   but raises that build messages dynamically via sp_sprintf (e.g.
+   sp_str_to_i_strict's `"invalid value for Integer(): \"%s\""`)
+   hand a heap-allocated string to sp_raise_cls. Without marking, a
+   GC cycle between the raise and the rescue handler reading the
+   message would sweep the message and leave sp_exc_msg[i] dangling.
+   The helper itself is defined further down (after sp_exc_msg /
+   sp_exc_top are declared); only the prototype lives here. */
+static void sp_mark_in_flight_exceptions(void);
+
 /* Mark the regex globals as live during GC. Each holds a pointer to a
    string allocated via sp_str_alloc_raw on the str-heap; without this
    sp_str_sweep would reap them on the next collect, leaving dangling
@@ -869,6 +904,7 @@ static void sp_re_mark_globals(void) {
   sp_mark_string(sp_re_match_pre);
   sp_mark_string(sp_re_match_post);
   for (mrb_int i = 0; i < sp_argv.len; i++) sp_mark_string(sp_argv.data[i]);
+  sp_mark_in_flight_exceptions();
 }
 
 static void sp_re_set_captures(const char *str, int *caps, int ncaps) {
@@ -1363,6 +1399,7 @@ static const char *sp_exc_cls[SP_EXC_STACK_MAX];
 static volatile const char *sp_last_exc_cls = sp_str_empty;
 static void sp_raise_cls(const char *cls, const char *msg) { if (sp_exc_top > 0) { sp_exc_msg[sp_exc_top-1] = msg; sp_exc_cls[sp_exc_top-1] = cls; sp_last_exc_cls = cls; longjmp(sp_exc_stack[sp_exc_top-1], 1); } fprintf(stderr, "unhandled exception: %s\n", msg); exit(1); }
 static void sp_raise(const char *msg) { sp_raise_cls("RuntimeError", msg); }
+static void sp_mark_in_flight_exceptions(void) { for (int i = 0; i < sp_exc_top; i++) sp_mark_string(sp_exc_msg[i]); }
 
 /* Cross-TU bridge for sp_bigint.c (compiled as a separate translation
    unit; can't see static helpers in this header). Defined non-static

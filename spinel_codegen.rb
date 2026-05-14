@@ -12428,6 +12428,7 @@ class Compiler
       return "\"" + @current_method_name + "\""
     end
     if mname == "Integer"
+      @needs_setjmp = 1
       args_id = @nd_arguments[nid]
       if args_id >= 0
         arg_ids = get_args(args_id)
@@ -12440,23 +12441,26 @@ class Compiler
             if lt == "string" or lt == "argv"
  # Bind the left-hand expression to a temp so it's evaluated
  # only once, and so GCC's nonnull analysis can see that the
- # strtoll call sits in the truthy branch of the same test.
+ # strict parse call sits in the truthy branch of the same
+ # test. The `tmp ? ... : default` short-circuit means the
+ # raise inside sp_str_to_i_strict only fires for non-nil
+ # invalid strings — a nil ARGV[0] takes the default path.
               lc = compile_expr(@nd_left[a0])
               rc2 = compile_expr(@nd_right[a0])
               tmp = new_temp
               if rt == "int"
-                return "({ const char *" + tmp + " = " + lc + "; " + tmp + " ? (mrb_int)strtoll(" + tmp + ", NULL, 10) : " + rc2 + "; })"
+                return "({ const char *" + tmp + " = " + lc + "; " + tmp + " ? sp_str_to_i_strict(" + tmp + ") : " + rc2 + "; })"
               else
-                return "({ const char *" + tmp + " = " + lc + "; " + tmp + " ? (mrb_int)strtoll(" + tmp + ", NULL, 10) : (mrb_int)strtoll(" + rc2 + ", NULL, 10); })"
+                return "({ const char *" + tmp + " = " + lc + "; " + tmp + " ? sp_str_to_i_strict(" + tmp + ") : sp_str_to_i_strict(" + rc2 + "); })"
               end
             end
           end
           at = infer_type(a0)
           if at == "string"
-            return "(mrb_int)strtoll(" + compile_expr(a0) + ", NULL, 10)"
+            return "sp_str_to_i_strict(" + compile_expr(a0) + ")"
           end
           if at == "argv"
-            return "(mrb_int)strtoll(" + compile_expr(a0) + ", NULL, 10)"
+            return "sp_str_to_i_strict(" + compile_expr(a0) + ")"
           end
         end
       end
