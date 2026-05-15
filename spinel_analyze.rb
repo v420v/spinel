@@ -1019,6 +1019,33 @@ class Compiler
     0
   end
 
+ # True iff `call_nid` is `<recv_name>.<method_name>(...)` where the
+ # receiver is a bare ConstantReadNode (no nesting). Used to detect
+ # `Struct.new(:a, :b)` and `Data.define(:a, :b)` constant-assignment
+ # shapes that both lower to `collect_struct_class`.
+  def is_call_on_const(call_nid, recv_name, method_name)
+    if call_nid < 0
+      return 0
+    end
+    if @nd_type[call_nid] != "CallNode"
+      return 0
+    end
+    if @nd_name[call_nid] != method_name
+      return 0
+    end
+    sr = @nd_receiver[call_nid]
+    if sr < 0
+      return 0
+    end
+    if @nd_type[sr] != "ConstantReadNode"
+      return 0
+    end
+    if @nd_name[sr] != recv_name
+      return 0
+    end
+    1
+  end
+
   def constructor_class_name(recv_nid)
     if recv_nid < 0
       return ""
@@ -6783,18 +6810,18 @@ class Compiler
     end
     expr_id = @nd_expression[nid]
     if expr_id >= 0
-      if @nd_type[expr_id] == "CallNode"
-        if @nd_name[expr_id] == "new"
-          sr = @nd_receiver[expr_id]
-          if sr >= 0
-            if @nd_type[sr] == "ConstantReadNode"
-              if @nd_name[sr] == "Struct"
-                collect_struct_class(cname, expr_id)
-                return
-              end
-            end
-          end
-        end
+ # `Foo = Struct.new(:a, :b)` and `Foo = Data.define(:a, :b)` share
+ # a structural contract: positional symbol args naming the fields.
+ # Data is keyword-init at runtime (`Foo.new(a: 1, b: 2)`), which
+ # the existing kwarg constructor path already matches by name.
+ # Routing both through `collect_struct_class` registers the
+ # synthetic class so codegen has a `sp_<Foo>` type to emit;
+ # without this the AST-emitted `obj_<Foo>` reference resolves to
+ # an undeclared struct, tripping clang `unknown type name
+ # 'sp_<Foo>'`.
+      if is_call_on_const(expr_id, "Struct", "new") == 1 || is_call_on_const(expr_id, "Data", "define") == 1
+        collect_struct_class(cname, expr_id)
+        return
       end
     end
     ct = "int"
