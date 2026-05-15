@@ -14442,9 +14442,16 @@ class Compiler
           if recv >= 0 && @nd_type[recv] == "StringNode" && @nd_content[recv] == "" && @nd_type[a[0]] == "StringNode"
             return "sp_StrArray_new()"
           end
+          if @nd_type[a[0]] == "NilNode"
+            return "sp_str_split_ws(" + rc + ")"
+          end
+          return "sp_str_split(" + rc + ", " + compile_expr(a[0]) + ")"
         end
       end
-      return "sp_str_split(" + rc + ", " + compile_arg0(nid) + ")"
+ # No-arg split (`s.split`) is Ruby's whitespace-split idiom.
+ # Issue #507: prior fallback emitted `sp_str_split(s, 0)` and
+ # crashed at strlen(NULL).
+      return "sp_str_split_ws(" + rc + ")"
     end
     if mname == "lines"
       @needs_str_array = 1
