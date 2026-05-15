@@ -6531,6 +6531,7 @@ class Compiler
     emit_raw("static sp_IntArray*sp_SymStrHash_keys(sp_SymStrHash*h){sp_IntArray*a=sp_IntArray_new();for(mrb_int i=0;i<h->len;i++)sp_IntArray_push(a,(mrb_int)h->order[i]);return a;}")
     emit_raw("static sp_StrArray*sp_SymStrHash_values(sp_SymStrHash*h){sp_StrArray*a=sp_StrArray_new();for(mrb_int i=0;i<h->len;i++)sp_StrArray_push(a,sp_SymStrHash_get(h,h->order[i]));return a;}")
     emit_raw("static sp_SymStrHash*sp_SymStrHash_dup(sp_SymStrHash*h){sp_SymStrHash*r=sp_SymStrHash_new();for(mrb_int i=0;i<h->len;i++)sp_SymStrHash_set(r,h->order[i],sp_SymStrHash_get(h,h->order[i]));return r;}")
+    emit_raw("static sp_SymStrHash*sp_SymStrHash_merge(sp_SymStrHash*a,sp_SymStrHash*b){sp_SymStrHash*r=sp_SymStrHash_new();for(mrb_int i=0;i<a->len;i++)sp_SymStrHash_set(r,a->order[i],sp_SymStrHash_get(a,a->order[i]));for(mrb_int i=0;i<b->len;i++)sp_SymStrHash_set(r,b->order[i],sp_SymStrHash_get(b,b->order[i]));return r;}")
     emit_raw("")
   end
 
@@ -16441,6 +16442,18 @@ class Compiler
         @needs_str_array = 1
         return "sp_SymStrHash_values(" + rc + ")"
       end
+ # Hash methods previously absent from sym_str_hash dispatch
+ # (issue #510). Helpers are emitted at codegen startup
+ # alongside the existing sp_SymStrHash_* set.
+      if mname == "merge"
+        return "sp_SymStrHash_merge(" + rc + ", " + compile_arg0(nid) + ")"
+      end
+      if mname == "dup" || mname == "clone"
+        return "sp_SymStrHash_dup(" + rc + ")"
+      end
+      if mname == "delete"
+        return "(sp_SymStrHash_delete(" + rc + ", " + compile_arg0(nid) + "), 0)"
+      end
     end
     if recv_type == "sym_poly_hash"
       if mname == "[]"
@@ -16493,6 +16506,31 @@ class Compiler
             end
           end
         end
+      end
+ # fetch / dup / delete -- issue #510. fetch is inlined as
+ # has_key+get with optional default; dup and delete route to
+ # the runtime helpers (sp_SymPolyHash_dup, sp_SymPolyHash_delete).
+ # The default value is boxed to sp_RbVal so the ternary's two
+ # arms agree on type (sp_SymPolyHash_get returns sp_RbVal).
+      if mname == "fetch"
+        args_id_f = @nd_arguments[nid]
+        if args_id_f >= 0
+          aargs_f = get_args(args_id_f)
+          if aargs_f.length >= 1
+            key_f = compile_expr(aargs_f[0])
+            if aargs_f.length >= 2
+              defval_f = box_expr_to_poly(aargs_f[1])
+              return "(sp_SymPolyHash_has_key(" + rc + ", " + key_f + ") ? sp_SymPolyHash_get(" + rc + ", " + key_f + ") : (" + defval_f + "))"
+            end
+            return "sp_SymPolyHash_get(" + rc + ", " + key_f + ")"
+          end
+        end
+      end
+      if mname == "dup" || mname == "clone"
+        return "sp_SymPolyHash_dup(" + rc + ")"
+      end
+      if mname == "delete"
+        return "(sp_SymPolyHash_delete(" + rc + ", " + compile_arg0(nid) + "), sp_box_nil())"
       end
     end
     if recv_type == "str_poly_hash"

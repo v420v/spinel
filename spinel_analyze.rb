@@ -3916,6 +3916,13 @@ class Compiler
         if rt == "str_str_hash" || rt == "sym_str_hash" || rt == "int_str_hash"
           return "string"
         end
+ # Hash with poly-typed values (str_poly_hash, sym_poly_hash) —
+ # fetch's value type is sp_RbVal regardless of the default arg
+ # (the get arm returns poly). Issue #510.
+        if rt == "str_poly_hash" || rt == "sym_poly_hash" || rt == "poly_poly_hash"
+          @needs_rb_value = 1
+          return "poly"
+        end
  # Poly recv: runtime can be any user class (with `def fetch`)
  # OR any built-in Hash variant. The codegen-side dispatch
  # (`compile_poly_method_call` + `emit_poly_builtin_dispatch`)
