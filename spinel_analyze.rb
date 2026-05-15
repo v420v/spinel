@@ -2421,6 +2421,30 @@ class Compiler
         @needs_rb_value = 1
         return "poly_array"
       end
+ # `String.new` (and locals widened to mutable_str via `s = ""; s << ...`)
+ # produces sp_String* values. Lower an all-mutable_str literal to a
+ # mutable_str_ptr_array — a sp_PtrArray of sp_String* — so the generic
+ # `<X>_ptr_array` codegen path (length/push/pop/[]) works without
+ # truncating the pointer to int. Issue #519: previously fell through
+ # to the int_array default and `sp_IntArray_push(arr, sp_String_new(""))`
+ # failed the int-from-pointer check.
+      if et == "mutable_str"
+        all_same = 1
+        k = 1
+        while k < elems.length
+          if infer_type(elems[k]) != "mutable_str"
+            all_same = 0
+          end
+          k = k + 1
+        end
+        if all_same == 1
+          @needs_gc = 1
+          return "mutable_str_ptr_array"
+        end
+        @needs_gc = 1
+        @needs_rb_value = 1
+        return "poly_array"
+      end
  # Check if elements have mixed types
       k = 1
       while k < elems.length
