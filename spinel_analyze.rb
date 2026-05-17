@@ -4566,6 +4566,20 @@ class Compiler
       end
       return "int_array"
     end
+ # `with_index(off)` blockless on an iterable receiver: in CRuby
+ # the result is a fresh Enumerator yielding `[elem, idx]` pairs.
+ # spinel's codegen consumes `<source>.with_index.map { |e, i| }`
+ # by fusing the chain into a single loop with an idx counter, so
+ # the analyzer just needs to pass the receiver's element shape
+ # through to the downstream `.map` block param.
+    if mname == "with_index"
+      if recv >= 0 && @nd_block[nid] < 0
+        rt_wi = infer_type(recv)
+        if is_array_type(rt_wi) == 1 || is_ptr_array_type(rt_wi) == 1
+          return rt_wi
+        end
+      end
+    end
  # `each_cons(n)` / `each_slice(n)` blockless: returns an array of
  # sub-arrays of the same kind as the receiver. The chain-fusion
  # paths in codegen (compile_map_expr / compile_each_block for
@@ -22637,6 +22651,16 @@ class Compiler
                   end
                   if mname == "times" || mname == "upto" || mname == "downto"
                     types.push("int")
+ # `<source>.with_index(off).<consumer> { |elem, idx| }`:
+ # block param at bk=1 is the idx counter (int), not another
+ # element of the source. Without this, the same elem_type-
+ # of-array logic below would type idx as the source's
+ # element shape (e.g. int_array), and a downstream
+ # `[elem_expr, idx]` literal mixed-types check would widen
+ # the array to poly_array, breaking the chain-fusion
+ # consumer.
+                  elsif bk == 1 && @nd_receiver[nid] >= 0 && @nd_type[@nd_receiver[nid]] == "CallNode" && @nd_name[@nd_receiver[nid]] == "with_index" && @nd_block[@nd_receiver[nid]] < 0
+                    types.push("int")
                   elsif mname == "each" || mname == "each_pair" || mname == "map" || mname == "select" || mname == "filter" || mname == "reject" || mname == "find" || mname == "detect" || mname == "any?" || mname == "all?" || mname == "none?" || mname == "one?" || mname == "count" || mname == "min" || mname == "max" || mname == "sum" || mname == "min_by" || mname == "max_by" || mname == "sort_by" || mname == "flat_map" || mname == "filter_map" || mname == "cycle" || mname == "partition"
  # Element iteration: infer block param from collection type
                     if recv_type == "str_array"
@@ -24844,6 +24868,19 @@ class Compiler
     recv_t = "int"
     if recv >= 0
       recv_t = infer_type(recv)
+    end
+ # `<source>.with_index(off).<consumer> { |elem, idx| }` -- the
+ # block sees the source's element shape at pi=0 and the int idx
+ # counter at pi=1. The receiver chain here is `with_index(off)`
+ # whose blockless infer_type returns the source's array type, so
+ # pi=0 falls through to the normal elem_type_of_array path; only
+ # pi=1 needs the int override. Without this, pi=1 would inherit
+ # elem_type_of_array(recv_t) too and the idx local would get
+ # typed as a sub-array, cascading into `[expr, idx]` literal
+ # widening to poly_array in the chain fusion's downstream
+ # consumer.
+    if pi == 1 && recv >= 0 && @nd_type[recv] == "CallNode" && @nd_name[recv] == "with_index" && @nd_block[recv] < 0
+      return "int"
     end
     if mname == "each" || mname == "map" || mname == "flat_map" || mname == "filter" || mname == "select" || mname == "reject" || mname == "find" || mname == "detect" || mname == "find_index" || mname == "find_all" || mname == "count" || mname == "all?" || mname == "any?" || mname == "none?" || mname == "min_by" || mname == "max_by" || mname == "sort_by" || mname == "group_by" || mname == "partition" || mname == "uniq" || mname == "tally" || mname == "drop_while" || mname == "take_while" || mname == "filter_map"
  # Hash#each yields |k, v|. elem_type_of_array on a hash type

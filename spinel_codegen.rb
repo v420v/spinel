@@ -30730,22 +30730,42 @@ class Compiler
       pop_scope
       return tmp_arrn
     end
- # arr.each_cons(n).map { |pair| body } -- fuse into a single
- # loop. Block param may be `|pair|` (typed sub-array) or
- # `|(a, b, ...)|` (nested destructure into individual locals,
- # avoids the per-iteration window allocation). The outer .map's
- # accumulator type tracks `infer_type(body_last)`: scalar bodies
- # collect into the matching typed-array; array bodies collect
- # into sp_PtrArray. Mirrors the N.times.map fusion above.
-    if recv_n >= 0 && @nd_type[recv_n] == "CallNode" && @nd_name[recv_n] == "each_cons" && @nd_block[recv_n] < 0
+ # arr.each_cons(n)[.with_index(off)].map { ... } -- fuse the 2-
+ # or 3-step chain into a single C loop. Without `.with_index`
+ # the block sees `|pair|` (sub-array of recv's element type) or
+ # `|(a, b, ...)|` (destructured slots). With `.with_index` the
+ # block additionally sees a counter as the trailing param. The
+ # outer .map's accumulator type tracks `infer_type(body_last)`:
+ # scalar bodies collect into the matching typed-array; array
+ # bodies collect into sp_PtrArray.
+    ec_call_n = -1
+    ec_with_index = 0
+    ec_off_expr = "0"
+    if recv_n >= 0 && @nd_type[recv_n] == "CallNode" && @nd_name[recv_n] == "with_index" && @nd_block[recv_n] < 0
+      wi_inner_n = @nd_receiver[recv_n]
+      if wi_inner_n >= 0 && @nd_type[wi_inner_n] == "CallNode" && @nd_name[wi_inner_n] == "each_cons" && @nd_block[wi_inner_n] < 0
+        ec_call_n = wi_inner_n
+        ec_with_index = 1
+        wi_args_id = @nd_arguments[recv_n]
+        if wi_args_id >= 0
+          wi_aargs = get_args(wi_args_id)
+          if wi_aargs.length > 0
+            ec_off_expr = compile_arg0(recv_n)
+          end
+        end
+      end
+    elsif recv_n >= 0 && @nd_type[recv_n] == "CallNode" && @nd_name[recv_n] == "each_cons" && @nd_block[recv_n] < 0
+      ec_call_n = recv_n
+    end
+    if ec_call_n >= 0
       @needs_gc = 1
-      ec_inner_n = @nd_receiver[recv_n]
+      ec_inner_n = @nd_receiver[ec_call_n]
       ec_inner_t = infer_type(ec_inner_n)
       if is_array_type(ec_inner_t) == 1
         ec_inner_pfx = array_c_prefix(ec_inner_t)
         ec_elem_t = elem_type_of_array(ec_inner_t)
         ec_inner_rc = compile_expr_gc_rooted(ec_inner_n)
-        ec_n_expr = compile_arg0(recv_n)
+        ec_n_expr = compile_arg0(ec_call_n)
         ec_blk_n = @nd_block[nid]
  # Detect `|(a, b, ...)|` destructure: MultiTargetNode at the
  # first required slot. parse_id_list(@nd_targets[mt_id]) gives
@@ -30802,6 +30822,11 @@ class Compiler
         ec_i = new_temp
         ec_j = new_temp
         ec_len = new_temp
+        ec_idx_var = ""
+        if ec_with_index == 1
+          ec_idx_var = new_temp
+          emit("  mrb_int " + ec_idx_var + " = (" + ec_off_expr + ");")
+        end
         emit("  mrb_int " + ec_len + " = sp_" + ec_inner_pfx + "_length(" + ec_inner_rc + ");")
         emit("  for (mrb_int " + ec_i + " = 0; " + ec_i + " + " + ec_n_expr + " <= " + ec_len + "; " + ec_i + "++) {")
         push_scope
@@ -30828,6 +30853,14 @@ class Compiler
           emit("      sp_" + ec_inner_pfx + "_push(lv_" + ec_pair_bp + ", sp_" + ec_inner_pfx + "_get(" + ec_inner_rc + ", " + ec_i + " + " + ec_j + "));")
           declare_var(ec_pair_bp, ec_inner_t)
         end
+        if ec_with_index == 1
+          ec_idx_bp = get_block_param(nid, 1)
+          if ec_idx_bp == ""
+            ec_idx_bp = "_idx"
+          end
+          emit("    mrb_int lv_" + ec_idx_bp + " = " + ec_idx_var + ";")
+          declare_var(ec_idx_bp, "int")
+        end
         @indent = @indent + 1
         if ec_blk_n >= 0
           ec_body_n2 = @nd_body[ec_blk_n]
@@ -30849,6 +30882,9 @@ class Compiler
               emit("  sp_IntArray_push(" + ec_tmp_arr + ", " + ec_lastv + ");")
             end
           end
+        end
+        if ec_with_index == 1
+          emit("  " + ec_idx_var + "++;")
         end
         @indent = @indent - 1
         pop_scope
