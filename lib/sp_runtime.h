@@ -700,17 +700,17 @@ static sp_PtrArray*sp_PtrArray_new(void){return sp_PtrArray_new_scan(sp_gc_mark)
    crash at collection time. Skip per-element scanning; the array
    header itself is still GC-tracked. */
 static sp_PtrArray*sp_PtrArray_new_noscan(void){return sp_PtrArray_new_scan(NULL);}
-static inline void sp_PtrArray_push(sp_PtrArray*a,void*v){if(a->len>=a->cap){sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_gc_bytes-=sizeof(void*)*a->cap;h->size-=sizeof(void*)*a->cap;a->cap=a->cap*2+1;a->data=(void**)realloc(a->data,sizeof(void*)*a->cap);h->size+=sizeof(void*)*a->cap;sp_gc_bytes+=sizeof(void*)*a->cap;}a->data[a->len++]=v;}
+static inline void sp_PtrArray_push(sp_PtrArray*a,void*v){if(!a)return;if(a->len>=a->cap){sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_gc_bytes-=sizeof(void*)*a->cap;h->size-=sizeof(void*)*a->cap;a->cap=a->cap*2+1;a->data=(void**)realloc(a->data,sizeof(void*)*a->cap);h->size+=sizeof(void*)*a->cap;sp_gc_bytes+=sizeof(void*)*a->cap;}a->data[a->len++]=v;}
 /* Array#pop on a `<X>_ptr_array`. Returns NULL when empty
    (matches CRuby's nil for typed-element arrays since the slot
    can't carry nil). Issue #520: previously the dispatch on
    `int_array_ptr_array.pop` warned "cannot resolve call to
    'pop'" and emitted 0, silently leaving the array intact. */
-static inline void *sp_PtrArray_pop(sp_PtrArray*a){if(a->len==0)return NULL;return a->data[--a->len];}
-static inline void*sp_PtrArray_get(sp_PtrArray*a,mrb_int i){if(i<0)i+=a->len;return a->data[i];}
-static inline void sp_PtrArray_set(sp_PtrArray*a,mrb_int i,void*v){if(i<0)i+=a->len;a->data[i]=v;}
-static inline mrb_int sp_PtrArray_length(sp_PtrArray*a){return a->len;}
-static inline mrb_bool sp_PtrArray_empty(sp_PtrArray*a){return a->len==0;}
+static inline void *sp_PtrArray_pop(sp_PtrArray*a){if(!a||a->len==0)return NULL;return a->data[--a->len];}
+static inline void*sp_PtrArray_get(sp_PtrArray*a,mrb_int i){if(!a)return NULL;if(i<0)i+=a->len;if(i<0||i>=a->len)return NULL;return a->data[i];}
+static inline void sp_PtrArray_set(sp_PtrArray*a,mrb_int i,void*v){if(!a)return;if(i<0)i+=a->len;a->data[i]=v;}
+static inline mrb_int sp_PtrArray_length(sp_PtrArray*a){if(!a)return 0;return a->len;}
+static inline mrb_bool sp_PtrArray_empty(sp_PtrArray*a){if(!a)return TRUE;return a->len==0;}
 /* `Array#delete_at(i)` -- remove and return the element at index i.
    Negative indices count from the end. Returns NULL when i is out
    of range (matches CRuby's nil for typed-element arrays). Mirrors
