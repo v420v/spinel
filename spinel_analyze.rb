@@ -16196,7 +16196,7 @@ class Compiler
  # types skip this slot rather than reverting to the
  # raise-only "int" default.
               tag = ci.to_s + ":" + mi.to_s
-              if @unified_imeth_returns.index(tag) == nil
+              if @unified_imeth_returns.include?(tag) == false
                 @unified_imeth_returns.push(tag)
               end
               dci2 = 0
@@ -16210,7 +16210,7 @@ class Compiler
                       @cls_meth_returns[dci2] = d_returns2.join(";")
                       @cls_meth_return_cache = {}
                       dtag = dci2.to_s + ":" + dmidx2.to_s
-                      if @unified_imeth_returns.index(dtag) == nil
+                      if @unified_imeth_returns.include?(dtag) == false
                         @unified_imeth_returns.push(dtag)
                       end
                     end
@@ -16367,15 +16367,21 @@ class Compiler
  # and silently re-widen to poly. Same `@unified_imeth_returns`
  # marker the imeth-unify pass uses.
           imeth_tag = ci.to_s + ":" + j.to_s
-          if @unified_imeth_returns != nil && @unified_imeth_returns.index(imeth_tag) != nil
-            @current_method_name = saved_meth
-            j = j + 1
-            next
+ # NOTE: use `.include?` (consistent bool in CRuby + spinel)
+ # rather than `.index(...) != nil`. spinel's Array#index
+ # returns -1 for not-found while CRuby returns nil, so
+ # `!= nil` is always true in spinel and the guard
+ # would false-positive on every method. Issue #585.
+          skip_this = 0
+          if @unified_imeth_returns != nil && @unified_imeth_returns.include?(imeth_tag)
+            skip_this = 1
           end
-          if widen_check_with_scope(bid, cur_rt, pnames, ptypes) == 1
-            returns[j] = "poly"
-            changed = 1
-            @needs_rb_value = 1
+          if skip_this == 0
+            if widen_check_with_scope(bid, cur_rt, pnames, ptypes) == 1
+              returns[j] = "poly"
+              changed = 1
+              @needs_rb_value = 1
+            end
           end
           @current_method_name = saved_meth
         end
