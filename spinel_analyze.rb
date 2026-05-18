@@ -1541,17 +1541,27 @@ class Compiler
   end
 
  # Returns the literal source string when `nid` is a `Regexp.new("...")`
- # (or `Regexp.compile("...")`) call with a single StringNode argument,
- # "" otherwise. Lets `pattern = Regexp.new("foo")` fold into the same
- # static pattern table as `pattern = /foo/`, so `pattern.match?(s)`
- # dispatches through `sp_re_pat_<i>` instead of falling through to
- # unresolved-call. Dynamic-arg forms return "" and fall back.
+ # (or `Regexp.compile("...")`) call with exactly one StringNode
+ # argument, "" otherwise. Lets `pattern = Regexp.new("foo")` fold
+ # into the same static pattern table as `pattern = /foo/`, so
+ # `pattern.match?(s)` dispatches through `sp_re_pat_<i>` instead of
+ # falling through to unresolved-call. Dynamic-arg forms return ""
+ # and fall back.
+ #
+ # The arity check is strict (exactly 1 arg, no kwargs, no block) so
+ # `Regexp.new("foo", Regexp::IGNORECASE)` falls through to the loud
+ # `warn_unresolved_call` path instead of silently dropping the flag
+ # -- silent CRuby divergence on a supported method belongs in the
+ # bug bucket, not the quirk bucket.
   def regexp_new_literal_pattern(nid)
     if @nd_type[nid] != "CallNode"
       return ""
     end
     mn = @nd_name[nid]
     if mn != "new" && mn != "compile"
+      return ""
+    end
+    if @nd_block[nid] >= 0
       return ""
     end
     recv = @nd_receiver[nid]
@@ -1569,7 +1579,7 @@ class Compiler
       return ""
     end
     arg_ids = get_args(args_id)
-    if arg_ids.length == 0
+    if arg_ids.length != 1
       return ""
     end
     a0 = arg_ids[0]

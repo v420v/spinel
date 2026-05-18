@@ -1777,16 +1777,22 @@ class Compiler
  # Ruby's /m (dot-matches-newline) maps to MULTILINE|DOTALL = 6.
 
  # Returns the literal source string when `nid` is a `Regexp.new("...")`
- # (or `Regexp.compile("...")`) call with a single StringNode argument,
- # "" otherwise. Mirrors the helper in spinel_analyze.rb so codegen
- # `find_regexp_index` can resolve the call to the same static pattern
- # registered by scan_features.
+ # (or `Regexp.compile("...")`) call with exactly one StringNode
+ # argument, "" otherwise. Mirrors the helper in spinel_analyze.rb so
+ # codegen `find_regexp_index` can resolve the call to the same static
+ # pattern registered by scan_features.
+ #
+ # The arity check is strict: a flag-bearing 2-arg form falls through
+ # to unresolved-call so the divergence is visible instead of silent.
   def regexp_new_literal_pattern(nid)
     if @nd_type[nid] != "CallNode"
       return ""
     end
     mn = @nd_name[nid]
     if mn != "new" && mn != "compile"
+      return ""
+    end
+    if @nd_block[nid] >= 0
       return ""
     end
     recv = @nd_receiver[nid]
@@ -1804,7 +1810,7 @@ class Compiler
       return ""
     end
     arg_ids = get_args(args_id)
-    if arg_ids.length == 0
+    if arg_ids.length != 1
       return ""
     end
     a0 = arg_ids[0]
