@@ -11394,7 +11394,7 @@ class Compiler
                   compile_stmt(ws[i])
                   i = i + 1
                 end
-                emit("    " + tmp + " = " + compile_expr(ws.last) + ";")
+                emit("    " + tmp + " = " + box_when_arm_to_target(ws.last, rt) + ";")
               end
             end
           end
@@ -11426,7 +11426,7 @@ class Compiler
                   compile_stmt(ws[i])
                   i = i + 1
                 end
-                emit("    " + tmp + " = " + compile_expr(ws.last) + ";")
+                emit("    " + tmp + " = " + box_when_arm_to_target(ws.last, rt) + ";")
               end
             end
           end
@@ -11445,7 +11445,7 @@ class Compiler
               compile_stmt(es[i])
               i = i + 1
             end
-            emit("    " + tmp + " = " + compile_expr(es.last) + ";")
+            emit("    " + tmp + " = " + box_when_arm_to_target(es.last, rt) + ";")
           end
         end
       end
@@ -21103,6 +21103,23 @@ class Compiler
     end
  # Fallback: cast generic pointer.
     "(void *)(" + val + ").v.p"
+  end
+
+ # Compile a `when` / `else` arm's last expression and, when the
+ # case-expression's unified target type is `poly` (sp_RbVal) but
+ # the arm's static type is a typed pointer / scalar, route through
+ # `box_value_to_poly` so the assignment lands in the tagged-union
+ # slot. Without this, a `case ... when A.new; when B.new; end`
+ # whose unified result is poly emits raw `sp_A *` / `sp_B *`
+ # assignments into the sp_RbVal slot and fails C compile.
+ # Issue #580.
+  def box_when_arm_to_target(arm_nid, target_t)
+    arm_t = infer_type(arm_nid)
+    val = compile_expr(arm_nid)
+    if target_t == "poly" && arm_t != "" && arm_t != "poly" && arm_t != "void"
+      return box_value_to_poly(arm_t, val)
+    end
+    val
   end
 
   def box_value_to_poly(at, val)
