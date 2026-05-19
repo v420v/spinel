@@ -1350,6 +1350,9 @@ static char *resolve_requires(const char *source, const char *source_path) {
       sp_mark_path_included(canonical);
       content = read_file(full_path);
       if (!content) {
+        fprintf(stderr,
+                "warning: require_relative \"%s\" from %s could not be resolved (no such file: %s); the call is ignored\n",
+                rel_path, source_path, full_path);
         content = strdup("# require_relative not found");
       } else {
         /* Recursively resolve */
@@ -1436,6 +1439,9 @@ static char *resolve_plain_requires(char *source, const char *exe_path) {
       free(canonical);
       content = read_file(lib_path);
       if (!content) {
+        fprintf(stderr,
+                "warning: require \"%s\" could not be resolved (no %s.rb in %s); the call is ignored\n",
+                lib_name, lib_name, lib_dir);
         content = strdup("# require not resolved");
       } else {
         char *resolved = resolve_requires(content, lib_path);
