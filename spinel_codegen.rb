@@ -6770,6 +6770,13 @@ class Compiler
       @needs_method = 1
     end
     scan_for_container_typedef_usage(@root_id)
+ # `scan_for_container_typedef_usage` may have flagged
+ # @needs_poly_poly_hash via the `each`-on-poly arm; re-check
+ # the @needs_method implication so sp_Method's typedef +
+ # dispatch land before emit_class_methods.
+    if @needs_poly_poly_hash == 1
+      @needs_method = 1
+    end
  # Same shape for the class-hierarchy tables / helpers:
  # @needs_class_table / @needs_class_parents /
  # @needs_class_ancestors / @needs_class_for_poly are set
@@ -10446,6 +10453,35 @@ class Compiler
         end
       end
     end
+ # `recv.each { ... }` may lower to compile_each_block's
+ # rt == "poly" arm, which dispatches on cls_id across every
+ # built-in container variant -- including all 8 Hash variants
+ # (key-value pair iteration packs into a per-iteration PolyArray).
+ # Arm every hash typedef so the dispatch arm's `sp_StrIntHash *`
+ # etc. casts have a definition. Issue #603 -- pre-fix, the
+ # dispatch was emitted referencing `sp_SymStrHash` etc. but the
+ # typedef pass had already run with the flag still 0.
+ #
+ # The poly-vs-narrow distinction depends on the analyzer's
+ # final fixpointed param types, which `scan_for_container_typedef_usage`
+ # doesn't have scope-context to resolve here. Take the
+ # conservative route: any `each` call with a block flags all
+ # 8 hash typedefs. The bloat is bounded (only the typedef +
+ # the unconditional helpers, ~1KB of generated C) and only
+ # programs that contain `.each` calls are affected.
+    if @nd_type[nid] == "CallNode" && @nd_name[nid] == "each" && @nd_receiver[nid] >= 0 && @nd_block[nid] >= 0
+      @needs_str_int_hash = 1
+      @needs_str_str_hash = 1
+      @needs_int_str_hash = 1
+      @needs_sym_int_hash = 1
+      @needs_sym_str_hash = 1
+      @needs_str_poly_hash = 1
+      @needs_sym_poly_hash = 1
+      @needs_poly_poly_hash = 1
+      @needs_rb_value = 1
+      @needs_poly_array = 1
+      @needs_gc = 1
+    end
  # `recv.include?(arg)` on a poly-typed recv similarly emits
  # arms across all matching Array / Hash variants in
  # emit_poly_builtin_dispatch. Arm the sym-keyed hash typedefs
@@ -11626,8 +11662,18 @@ class Compiler
  # standard heap classes get `sp_<X> *`. compile_when_conds then
  # resolves `when ClassName` against the right shape.
           emit("  " + c_type(pred_type) + " " + ptmp + " = " + pred_val + ";")
+        elsif pred_type == "poly"
+ # Poly scrutinee -- `case x when Range; ...` against a sp_RbVal
+ # variable. Without this arm, the temp fell through to the
+ # `mrb_int` default below and `sp_class_for_poly(_t)` got an
+ # int instead of sp_RbVal. Issue #604: case/when bound to a
+ # local result temp split the result type from the scrutinee
+ # type; the result-temp (rt) is what new_temp/c_default_val
+ # uses, but the scrutinee temp must follow pred_type.
+          @needs_rb_value = 1
+          emit("  sp_RbVal " + ptmp + " = " + pred_val + ";")
         else
-          emit("  mrb_int " + ptmp + " = " + pred_val + ";")
+          emit("  " + c_type(pred_type) + " " + ptmp + " = " + pred_val + ";")
         end
         conds = parse_id_list(@nd_conditions[nid])
         k = 0
@@ -25781,6 +25827,13 @@ class Compiler
  # `case <poly_value> when ...` — keep the receiver tagged so
  # each when-arm can do tag-check + value-compare. .
       emit("  sp_RbVal " + tmp + " = " + pred_val + ";")
+    elsif pred_type == "range" || pred_type == "time" || pred_type == "float" || pred_type == "bool"
+ # Concrete non-int / non-string scrutinees follow the same
+ # `c_type(pred_type)` shape: `sp_Range` / `sp_Time` / `mrb_float`
+ # / `mrb_bool`. Pre-fix the `mrb_int` fallback below assigned a
+ # struct value to an int, tripping the C compiler. Issue #604
+ # sibling: a case as a function tail with a Range scrutinee.
+      emit("  " + c_type(pred_type) + " " + tmp + " = " + pred_val + ";")
     else
       emit("  mrb_int " + tmp + " = " + pred_val + ";")
     end
@@ -30693,6 +30746,24 @@ class Compiler
       emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_SYM_ARRAY) " + idx_tmp + "_len = sp_IntArray_length((sp_IntArray *)" + poly_tmp + ".v.p);")
       emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_PTR_ARRAY) " + idx_tmp + "_len = sp_PtrArray_length((sp_PtrArray *)" + poly_tmp + ".v.p);")
       emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_POLY_ARRAY) " + idx_tmp + "_len = sp_PolyArray_length((sp_PolyArray *)" + poly_tmp + ".v.p);")
+ # Hash variants -- each yields (key, value) pairs. Length is
+ # the hash's `len` field. Issue #603: pre-fix the dispatch only
+ # covered Range + 6 Array variants, so a poly receiver carrying
+ # a Hash silently iterated zero times. Mirror the array arms;
+ # per-iteration emit below packs the pair as a 2-element
+ # PolyArray so the existing array-splat logic at the block-param
+ # boundary delivers `|k, v|` correctly. The hash typedefs are
+ # armed by `scan_for_container_typedef_usage`'s `each` arm so
+ # the runtime emit pass produces every variant's typedef before
+ # this dispatch references them.
+      emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_STR_INT_HASH) " + idx_tmp + "_len = ((sp_StrIntHash *)" + poly_tmp + ".v.p)->len;")
+      emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_STR_STR_HASH) " + idx_tmp + "_len = ((sp_StrStrHash *)" + poly_tmp + ".v.p)->len;")
+      emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_INT_STR_HASH) " + idx_tmp + "_len = ((sp_IntStrHash *)" + poly_tmp + ".v.p)->len;")
+      emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_SYM_INT_HASH) " + idx_tmp + "_len = ((sp_SymIntHash *)" + poly_tmp + ".v.p)->len;")
+      emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_SYM_STR_HASH) " + idx_tmp + "_len = ((sp_SymStrHash *)" + poly_tmp + ".v.p)->len;")
+      emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_STR_POLY_HASH) " + idx_tmp + "_len = ((sp_StrPolyHash *)" + poly_tmp + ".v.p)->len;")
+      emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_SYM_POLY_HASH) " + idx_tmp + "_len = ((sp_SymPolyHash *)" + poly_tmp + ".v.p)->len;")
+      emit("    else if (" + poly_tmp + ".cls_id == SP_BUILTIN_POLY_POLY_HASH) " + idx_tmp + "_len = ((sp_PolyPolyHash *)" + poly_tmp + ".v.p)->len;")
       emit("    for (mrb_int " + idx_tmp + " = 0; " + idx_tmp + " < " + idx_tmp + "_len; " + idx_tmp + "++) {")
       emit("      sp_RbVal " + val_tmp + " = sp_box_nil();")
       emit("      if (" + poly_tmp + ".cls_id == SP_BUILTIN_RANGE) " + val_tmp + " = sp_box_int(((sp_Range *)" + poly_tmp + ".v.p)->first + " + idx_tmp + ");")
@@ -30702,6 +30773,21 @@ class Compiler
       emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_SYM_ARRAY) " + val_tmp + " = sp_box_sym((sp_sym)sp_IntArray_get((sp_IntArray *)" + poly_tmp + ".v.p, " + idx_tmp + "));")
       emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_PTR_ARRAY) { void *_pe = sp_PtrArray_get((sp_PtrArray *)" + poly_tmp + ".v.p, " + idx_tmp + "); " + val_tmp + " = sp_box_obj(_pe, sp_obj_cls_id_of(_pe)); }")
       emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_POLY_ARRAY) " + val_tmp + " = sp_PolyArray_get((sp_PolyArray *)" + poly_tmp + ".v.p, " + idx_tmp + ");")
+ # Hash per-iteration: pack the (key, value) pair as a
+ # 2-element PolyArray so the splat-on-2-arg-block logic below
+ # delivers `|k, v|`. For 1-arg block (`{ |pair| ... }`), bp1
+ # receives the boxed PolyArray, matching CRuby's behaviour.
+      @needs_poly_array = 1
+      @needs_rb_value = 1
+      @needs_gc = 1
+      emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_STR_INT_HASH) { sp_StrIntHash *_sh = (sp_StrIntHash *)" + poly_tmp + ".v.p; sp_PolyArray *_kv = sp_PolyArray_new(); sp_PolyArray_push(_kv, sp_box_str(_sh->order[" + idx_tmp + "])); sp_PolyArray_push(_kv, sp_box_int(sp_StrIntHash_get(_sh, _sh->order[" + idx_tmp + "]))); " + val_tmp + " = sp_box_obj(_kv, SP_BUILTIN_POLY_ARRAY); }")
+      emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_STR_STR_HASH) { sp_StrStrHash *_sh = (sp_StrStrHash *)" + poly_tmp + ".v.p; sp_PolyArray *_kv = sp_PolyArray_new(); sp_PolyArray_push(_kv, sp_box_str(_sh->order[" + idx_tmp + "])); sp_PolyArray_push(_kv, sp_box_str(sp_StrStrHash_get(_sh, _sh->order[" + idx_tmp + "]))); " + val_tmp + " = sp_box_obj(_kv, SP_BUILTIN_POLY_ARRAY); }")
+      emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_INT_STR_HASH) { sp_IntStrHash *_sh = (sp_IntStrHash *)" + poly_tmp + ".v.p; sp_PolyArray *_kv = sp_PolyArray_new(); sp_PolyArray_push(_kv, sp_box_int(_sh->order[" + idx_tmp + "])); sp_PolyArray_push(_kv, sp_box_str(sp_IntStrHash_get(_sh, _sh->order[" + idx_tmp + "]))); " + val_tmp + " = sp_box_obj(_kv, SP_BUILTIN_POLY_ARRAY); }")
+      emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_SYM_INT_HASH) { sp_SymIntHash *_sh = (sp_SymIntHash *)" + poly_tmp + ".v.p; sp_PolyArray *_kv = sp_PolyArray_new(); sp_PolyArray_push(_kv, sp_box_sym(_sh->order[" + idx_tmp + "])); sp_PolyArray_push(_kv, sp_box_int(sp_SymIntHash_get(_sh, _sh->order[" + idx_tmp + "]))); " + val_tmp + " = sp_box_obj(_kv, SP_BUILTIN_POLY_ARRAY); }")
+      emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_SYM_STR_HASH) { sp_SymStrHash *_sh = (sp_SymStrHash *)" + poly_tmp + ".v.p; sp_PolyArray *_kv = sp_PolyArray_new(); sp_PolyArray_push(_kv, sp_box_sym(_sh->order[" + idx_tmp + "])); sp_PolyArray_push(_kv, sp_box_str(sp_SymStrHash_get(_sh, _sh->order[" + idx_tmp + "]))); " + val_tmp + " = sp_box_obj(_kv, SP_BUILTIN_POLY_ARRAY); }")
+      emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_STR_POLY_HASH) { sp_StrPolyHash *_sh = (sp_StrPolyHash *)" + poly_tmp + ".v.p; sp_PolyArray *_kv = sp_PolyArray_new(); sp_PolyArray_push(_kv, sp_box_str(_sh->order[" + idx_tmp + "])); sp_PolyArray_push(_kv, sp_StrPolyHash_get(_sh, _sh->order[" + idx_tmp + "])); " + val_tmp + " = sp_box_obj(_kv, SP_BUILTIN_POLY_ARRAY); }")
+      emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_SYM_POLY_HASH) { sp_SymPolyHash *_sh = (sp_SymPolyHash *)" + poly_tmp + ".v.p; sp_PolyArray *_kv = sp_PolyArray_new(); sp_PolyArray_push(_kv, sp_box_sym(_sh->order[" + idx_tmp + "])); sp_PolyArray_push(_kv, sp_SymPolyHash_get(_sh, _sh->order[" + idx_tmp + "])); " + val_tmp + " = sp_box_obj(_kv, SP_BUILTIN_POLY_ARRAY); }")
+      emit("      else if (" + poly_tmp + ".cls_id == SP_BUILTIN_POLY_POLY_HASH) { sp_PolyPolyHash *_sh = (sp_PolyPolyHash *)" + poly_tmp + ".v.p; mrb_int _pk = _sh->order[" + idx_tmp + "]; sp_PolyArray *_kv = sp_PolyArray_new(); sp_PolyArray_push(_kv, _sh->keys[_pk]); sp_PolyArray_push(_kv, _sh->vals[_pk]); " + val_tmp + " = sp_box_obj(_kv, SP_BUILTIN_POLY_ARRAY); }")
       if has_bp == 1
         if bp2 != ""
  # Multi-param block over a poly receiver: CRuby auto-splats

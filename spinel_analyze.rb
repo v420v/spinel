@@ -18384,6 +18384,26 @@ class Compiler
           if rt == "int_str_hash"
             @needs_int_str_hash = 1
           end
+ # Poly receiver -- compile_each_block emits a cls_id dispatch
+ # table covering every hash variant. Flag all 8 hash typedefs
+ # so the runtime emit pass produces them (the dispatch arm
+ # references them by name unconditionally). Issue #603 --
+ # without this, an each() on a sp_RbVal-bound variable hit the
+ # arm but the casts (sp_StrIntHash *, etc.) failed at C compile
+ # because the typedef wasn't emitted.
+          if rt == "poly"
+            @needs_str_int_hash = 1
+            @needs_str_str_hash = 1
+            @needs_int_str_hash = 1
+            @needs_sym_int_hash = 1
+            @needs_sym_str_hash = 1
+            @needs_str_poly_hash = 1
+            @needs_sym_poly_hash = 1
+            @needs_poly_poly_hash = 1
+            @needs_rb_value = 1
+            @needs_poly_array = 1
+            @needs_gc = 1
+          end
         end
       end
     end
