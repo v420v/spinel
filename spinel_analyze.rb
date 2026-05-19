@@ -527,6 +527,11 @@ class Compiler
  # Module tracking: module_name -> body node id
     @module_names = "".split(",")
     @module_body_ids = []
+ # `@module_includes[mi]`: `;`-separated list of names the module
+ # introduced by row `mi` itself includes. Modules can re-open, so
+ # each row tracks its own block's `include` calls; const lookup
+ # walks every row matching the module name.
+    @module_includes = "".split(",")
  # Module-level singleton accessors :
  # `class << self; attr_accessor :foo; end` inside `module M`.
  # `@module_acc_consts[i]` is a `;`-separated list of distinct
@@ -1155,23 +1160,89 @@ class Compiler
  # body that was attached to the current class via `include M` should
  # resolve M::CONST. spinel's method table doesn't retain the
  # original-module lexical scope, so the chain walk above misses it.
-    if @current_class_idx >= 0 && @current_class_idx < @cls_includes.length
-      incs_str = @cls_includes[@current_class_idx]
-      if incs_str != ""
-        incs = incs_str.split(";")
-        ii = 0
-        while ii < incs.length
-          if incs[ii] != ""
-            cand_inc = incs[ii] + "_" + name
-            if const_namespace_exists(cand_inc) == 1
-              return cand_inc
-            end
-          end
-          ii = ii + 1
-        end
+ # Walk the chain transitively so `B include A; A include X; B body
+ # references bare N -> X::N` works even when B's directly-listed
+ # includes don't carry N themselves.
+    if @current_class_idx >= 0
+      found_inc = resolve_const_via_include_chain(@current_class_idx, name)
+      if found_inc != ""
+        return found_inc
       end
     end
     name
+  end
+
+ # Recursively walk @cls_includes from `class_idx`, trying each
+ # included module's namespace for a constant named `name`. Caps at
+ # depth 16 so a pathological include cycle bails instead of looping.
+ # Returns the qualified `<Mod>_<name>` form on a hit, or "" on miss.
+  def resolve_const_via_include_chain(class_idx, name, depth = 16)
+    if class_idx < 0 || class_idx >= @cls_includes.length
+      return ""
+    end
+    resolve_const_via_include_list(@cls_includes[class_idx], name, depth)
+  end
+
+ # Shared walker: for each entry in `incs_str`, check the joined
+ # `<Mod>_<name>` namespace, then recurse into that entry's own
+ # include chain (class-or-module). Handles the `B include A;
+ # A include X` -> X::N path without conflating the two parent
+ # tables.
+  def resolve_const_via_include_list(incs_str, name, depth)
+    if depth <= 0
+      return ""
+    end
+    if incs_str == ""
+      return ""
+    end
+    incs = incs_str.split(";")
+    ii = 0
+    while ii < incs.length
+      inc = incs[ii]
+      if inc != ""
+        cand = inc + "_" + name
+        if const_namespace_exists(cand) == 1
+          return cand
+        end
+        inc_cls = find_class_idx(inc)
+        if inc_cls >= 0
+          sub = resolve_const_via_include_list(@cls_includes[inc_cls], name, depth - 1)
+          if sub != ""
+            return sub
+          end
+        end
+        if module_name_exists(inc) == 1
+          sub = resolve_const_via_module_chain(inc, name, depth - 1)
+          if sub != ""
+            return sub
+          end
+        end
+      end
+      ii = ii + 1
+    end
+    ""
+  end
+
+ # Walk every @module_names slot matching `mod_name` (a module can
+ # re-open and each open is a separate row, so the includes recorded
+ # on each have to be tried independently). Routes through
+ # resolve_const_via_include_list so module-include and class-include
+ # share the same lookup recursion.
+  def resolve_const_via_module_chain(mod_name, name, depth)
+    if depth <= 0
+      return ""
+    end
+    mi = 0
+    while mi < @module_names.length
+      if @module_names[mi] == mod_name && mi < @module_includes.length
+        sub = resolve_const_via_include_list(@module_includes[mi], name, depth - 1)
+        if sub != ""
+          return sub
+        end
+      end
+      mi = mi + 1
+    end
+    ""
   end
 
   def resolve_const_ref_name(nid, depth = 32)
@@ -9699,10 +9770,56 @@ class Compiler
  # Store module info for include
     @module_names.push(mname)
     @module_body_ids.push(body)
+    @module_includes.push("")
+    mi_for_includes = @module_names.length - 1
     if body < 0
       return
     end
     body_stmts = get_stmts(body)
+
+ # Record `include X` directives appearing in this module's body so
+ # const lookup from a method body attached via the include chain
+ # can walk into X's nested namespace. Class-body includes go through
+ # `include_module_on_class`; this is the module-body counterpart.
+    body_stmts.each { |sid|
+      if @nd_type[sid] == "CallNode" && @nd_receiver[sid] < 0 && @nd_name[sid] == "include"
+        inc_args = @nd_arguments[sid]
+        if inc_args >= 0
+          inc_ids = get_args(inc_args)
+          ik = 0
+          while ik < inc_ids.length
+            inc_t = @nd_type[inc_ids[ik]]
+            if inc_t == "ConstantReadNode" || inc_t == "ConstantPathNode"
+              inc_name = const_ref_flat_name(inc_ids[ik])
+              if inc_name != ""
+                cur_incs = @module_includes[mi_for_includes]
+                already = 0
+                if cur_incs != ""
+                  parts = cur_incs.split(";")
+                  pk = 0
+                  while pk < parts.length
+                    if parts[pk] == inc_name
+                      already = 1
+                      pk = parts.length
+                    else
+                      pk = pk + 1
+                    end
+                  end
+                end
+                if already == 0
+                  if cur_incs == ""
+                    @module_includes[mi_for_includes] = inc_name
+                  else
+                    @module_includes[mi_for_includes] = cur_incs + ";" + inc_name
+                  end
+                end
+              end
+            end
+            ik = ik + 1
+          end
+        end
+      end
+    }
 
  # Match top-level collection order: modules first, then classes.
     body_stmts.each { |sid|
@@ -25225,6 +25342,7 @@ class Compiler
  # Modules
     buf = ir_emit_sa(buf, "@module_names", @module_names)
     buf = ir_emit_ia(buf, "@module_body_ids", @module_body_ids)
+    buf = ir_emit_sa(buf, "@module_includes", @module_includes)
     buf = ir_emit_sa(buf, "@module_acc_keys", @module_acc_keys)
     buf = ir_emit_sa(buf, "@module_acc_consts", @module_acc_consts)
 

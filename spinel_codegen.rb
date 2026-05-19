@@ -533,6 +533,7 @@ class Compiler
 
  # Module tracking: module_name -> body node id
     @module_names = "".split(",")
+    @module_includes = "".split(",")
     @module_body_ids = []
  # Module-level singleton accessors :
  # `class << self; attr_accessor :foo; end` inside `module M`.
@@ -1215,25 +1216,89 @@ class Compiler
  # retain the method's original module of definition, so a `CONST`
  # reference from a method that was attached via `include` falls
  # through the lexical chain above. Walk the including class's
- # `@cls_includes` and try each module's namespace -- matches the
- # method-attachment pass in reconcile_class_includes.
-    if @current_class_idx >= 0 && @current_class_idx < @cls_includes.length
-      incs_str = @cls_includes[@current_class_idx]
-      if incs_str != ""
-        incs = incs_str.split(";")
-        ii = 0
-        while ii < incs.length
-          if incs[ii] != ""
-            cand_inc = incs[ii] + "_" + name
-            if const_namespace_exists(cand_inc) == 1
-              return cand_inc
-            end
-          end
-          ii = ii + 1
-        end
+ # `@cls_includes` transitively so `B include A; A include X; method
+ # body in B references bare N -> X::N` resolves even when the
+ # directly-listed include doesn't carry N.
+    if @current_class_idx >= 0
+      found_inc = resolve_const_via_include_chain(@current_class_idx, name)
+      if found_inc != ""
+        return found_inc
       end
     end
     name
+  end
+
+ # Recursively walk @cls_includes from `class_idx`, trying each
+ # included module's namespace for a constant named `name`. Caps at
+ # depth 16 so a pathological include cycle bails instead of looping.
+ # Returns the qualified `<Mod>_<name>` form on a hit, or "" on miss.
+  def resolve_const_via_include_chain(class_idx, name, depth = 16)
+    if class_idx < 0 || class_idx >= @cls_includes.length
+      return ""
+    end
+    resolve_const_via_include_list(@cls_includes[class_idx], name, depth)
+  end
+
+ # Shared walker: for each entry in `incs_str`, check the joined
+ # `<Mod>_<name>` namespace, then recurse into that entry's own
+ # include chain (class-or-module). Handles the `B include A;
+ # A include X` -> X::N path without conflating the two parent
+ # tables.
+  def resolve_const_via_include_list(incs_str, name, depth)
+    if depth <= 0
+      return ""
+    end
+    if incs_str == ""
+      return ""
+    end
+    incs = incs_str.split(";")
+    ii = 0
+    while ii < incs.length
+      inc = incs[ii]
+      if inc != ""
+        cand = inc + "_" + name
+        if const_namespace_exists(cand) == 1
+          return cand
+        end
+        inc_cls = find_class_idx(inc)
+        if inc_cls >= 0
+          sub = resolve_const_via_include_list(@cls_includes[inc_cls], name, depth - 1)
+          if sub != ""
+            return sub
+          end
+        end
+        if module_name_exists(inc) == 1
+          sub = resolve_const_via_module_chain(inc, name, depth - 1)
+          if sub != ""
+            return sub
+          end
+        end
+      end
+      ii = ii + 1
+    end
+    ""
+  end
+
+ # Walk every @module_names slot matching `mod_name` (a module can
+ # re-open and each open is a separate row, so the includes recorded
+ # on each have to be tried independently). Routes through
+ # resolve_const_via_include_list so module-include and class-include
+ # share the same lookup recursion.
+  def resolve_const_via_module_chain(mod_name, name, depth)
+    if depth <= 0
+      return ""
+    end
+    mi = 0
+    while mi < @module_names.length
+      if @module_names[mi] == mod_name && mi < @module_includes.length
+        sub = resolve_const_via_include_list(@module_includes[mi], name, depth - 1)
+        if sub != ""
+          return sub
+        end
+      end
+      mi = mi + 1
+    end
+    ""
   end
 
   def resolve_const_ref_name(nid)
@@ -35163,6 +35228,8 @@ class Compiler
       @gvar_types = val
     elsif name == "@module_names"
       @module_names = val
+    elsif name == "@module_includes"
+      @module_includes = val
     elsif name == "@module_acc_keys"
       @module_acc_keys = val
     elsif name == "@module_acc_consts"
