@@ -5324,6 +5324,17 @@ class Compiler
     if ret_spec == "void"
       return "(" + result + ", (mrb_int)0)"
     end
+ # `:str` returns alias the FFI library's `const char *` storage.
+ # Without a copy, the Ruby side holds a pointer that may be freed
+ # / overwritten when the C library releases its context (or, with
+ # large arrays of FFI strings pinned at once, the GC scan walks
+ # alien memory and trips on alignment). sp_str_dup_external copies
+ # into the spinel string heap with the marker byte the GC scanner
+ # expects, severing the alias. Issue #626 (issue 3). NULL passes
+ # through (sp_str_dup_external returns NULL on NULL input).
+    if ret_spec == "str"
+      return "sp_str_dup_external(" + result + ")"
+    end
     result
   end
 
