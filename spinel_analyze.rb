@@ -27558,24 +27558,6 @@ class Compiler
  # codegen would otherwise compute itself.
   def refine_method_body_locals(bid, lnames, ltypes, params)
     scan_locals(bid, lnames, ltypes, params)
- # `--int-overflow=promote`: every int body local becomes bigint
- # before the refinement passes see it. Mirrors the same step in
- # refine_locals_multi_pass_full but applied to method bodies
- # (where the caller passes the lnames / ltypes through this
- # path instead of the multi-pass full one). Without this,
- # `def f(n); acc = 1; while ...; acc *= n; ...; acc; end` had
- # the body local `acc` stuck at int and the C compile failed
- # to return mrb_int from a sp_Bigint *-returning function.
-    if @int_overflow_mode == "promote"
-      pj = 0
-      while pj < lnames.length
-        if ltypes[pj] == "int"
-          ltypes[pj] = "bigint"
-          @needs_bigint = 1
-        end
-        pj = pj + 1
-      end
-    end
     j = 0
     while j < lnames.length
       declare_var(lnames[j], ltypes[j])
@@ -27699,6 +27681,23 @@ class Compiler
       j = j + 1
     end
     @current_lexical_scope = saved_scope_p5
+ # `--int-overflow=promote`: after all refinement passes have
+ # settled the real types, widen the still-int body locals to
+ # bigint. Placed at the end (mirroring refine_locals_multi_pass_
+ # full) so a local like `c = a + b` where a/b are strings stays
+ # "string" instead of being clobbered to bigint on pass 1 before
+ # the string types of a/b were visible in scope.
+    if @int_overflow_mode == "promote"
+      pj = 0
+      while pj < lnames.length
+        if ltypes[pj] == "int"
+          ltypes[pj] = "bigint"
+          set_var_type(lnames[pj], "bigint")
+          @needs_bigint = 1
+        end
+        pj = pj + 1
+      end
+    end
   end
 
  # Constant-initializer locals — block params introduced inside
