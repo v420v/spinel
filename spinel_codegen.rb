@@ -11926,6 +11926,13 @@ class Compiler
  # uses, but the scrutinee temp must follow pred_type.
           @needs_rb_value = 1
           emit("  sp_RbVal " + ptmp + " = " + pred_val + ";")
+        elsif pred_type == "bigint"
+ # promote-mode-widened scrutinee: when-arms compare against
+ # int literals / ranges, so unbox to mrb_int up front and
+ # treat the temp as int for the when dispatch.
+          @needs_bigint = 1
+          emit("  mrb_int " + ptmp + " = sp_bigint_to_int((sp_Bigint *)" + pred_val + ");")
+          pred_type = "int"
         else
           emit("  " + c_type(pred_type) + " " + ptmp + " = " + pred_val + ";")
         end
