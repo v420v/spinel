@@ -12367,6 +12367,22 @@ class Compiler
     "sp_system_args(" + arg_ids.length.to_s + ", (const char*[]){" + argv + "})"
   end
 
+ # Emit `lv_<bp> = <rhs>;` honoring promote-mode widening: if the
+ # block param's outer scope slot is bigint while the underlying
+ # iterator value is mrb_int, wrap through sp_bigint_new_int.
+ # Returns nothing — used for inline assignments inside emit_*
+ # block helpers where the LV is the function-level slot (not a
+ # block-scoped fresh decl).
+  def emit_block_lv_assign_int(bp, rhs_int_expr)
+    slot_t = find_var_type(bp)
+    if slot_t == "bigint"
+      @needs_bigint = 1
+      emit("    lv_" + bp + " = sp_bigint_new_int(" + rhs_int_expr + ");")
+    else
+      emit("    lv_" + bp + " = " + rhs_int_expr + ";")
+    end
+  end
+
  # Like compile_arg0, but unboxes the result to mrb_int when the
  # argument's static type is poly. Use at call sites that pass the
  # arg directly to a C function expecting `mrb_int` (sp_IntArray_get,
@@ -15666,7 +15682,13 @@ class Compiler
             emit("  for (mrb_int " + arrnew_iv + " = 0; " + arrnew_iv + " < " + arrnew_count + "; " + arrnew_iv + "++) {")
             @indent = @indent + 1
             if arrnew_bp != ""
-              emit("  lv_" + arrnew_bp + " = " + arrnew_iv + ";")
+              arrnew_bp_t = find_var_type(arrnew_bp)
+              if arrnew_bp_t == "bigint"
+                @needs_bigint = 1
+                emit("  lv_" + arrnew_bp + " = sp_bigint_new_int(" + arrnew_iv + ");")
+              else
+                emit("  lv_" + arrnew_bp + " = " + arrnew_iv + ";")
+              end
             end
             if arrnew_body >= 0
               arrnew_stmts2 = get_stmts(arrnew_body)
@@ -31462,7 +31484,7 @@ class Compiler
       emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < " + rc + "->len; " + tmp + "++) {")
       emit("    lv_" + bp1 + " = " + rc + "->order[" + tmp + "];")
       if bp2 != ""
-        emit("    lv_" + bp2 + " = sp_StrIntHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
+        emit_block_lv_assign_int(bp2, "sp_StrIntHash_get(" + rc + ", " + rc + "->order[" + tmp + "])")
       end
       @indent = @indent + 1
       push_scope
@@ -31481,7 +31503,7 @@ class Compiler
     if rt == "int_str_hash"
       tmp = new_temp
       emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < " + rc + "->len; " + tmp + "++) {")
-      emit("    lv_" + bp1 + " = " + rc + "->order[" + tmp + "];")
+      emit_block_lv_assign_int(bp1, rc + "->order[" + tmp + "]")
       if bp2 != ""
         emit("    lv_" + bp2 + " = sp_IntStrHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
       end
@@ -31525,7 +31547,7 @@ class Compiler
       emit("  for (mrb_int " + tmp + " = 0; " + tmp + " < " + rc + "->len; " + tmp + "++) {")
       emit("    lv_" + bp1 + " = " + rc + "->order[" + tmp + "];")
       if bp2 != ""
-        emit("    lv_" + bp2 + " = sp_SymIntHash_get(" + rc + ", " + rc + "->order[" + tmp + "]);")
+        emit_block_lv_assign_int(bp2, "sp_SymIntHash_get(" + rc + ", " + rc + "->order[" + tmp + "])")
       end
       @indent = @indent + 1
       push_scope
@@ -31626,15 +31648,23 @@ class Compiler
           end
         end
       end
+      bp_t_re = has_bp == 1 ? find_var_type(bp1) : ""
       if lit_range >= 0
         cmp = range_excl_end(lit_range) == 1 ? "<" : "<="
         lo = compile_expr(@nd_left[lit_range])
         hi = compile_expr(@nd_right[lit_range])
-        emit("  for (lv_" + bp1 + " = " + lo + "; lv_" + bp1 + " " + cmp + " " + hi + "; lv_" + bp1 + "++) {")
+        if bp_t_re == "bigint"
+          @needs_bigint = 1
+          rtmp_re = new_temp
+          emit("  for (mrb_int " + rtmp_re + " = " + lo + "; " + rtmp_re + " " + cmp + " " + hi + "; " + rtmp_re + "++) {")
+          emit("    lv_" + bp1 + " = sp_bigint_new_int(" + rtmp_re + ");")
+        else
+          emit("  for (lv_" + bp1 + " = " + lo + "; lv_" + bp1 + " " + cmp + " " + hi + "; lv_" + bp1 + "++) {")
+        end
         @indent = @indent + 1
         push_scope
         if has_bp == 1
-          declare_var(bp1, "int")
+          declare_var(bp1, bp_t_re == "bigint" ? "bigint" : "int")
         end
         redo_label = push_redo_label
         emit_redo_label(redo_label)
@@ -31647,11 +31677,18 @@ class Compiler
         tmp = new_temp
         tmp2 = new_temp
         emit("  sp_Range " + tmp2 + " = " + rc + ";")
-        emit("  for (lv_" + bp1 + " = " + tmp2 + ".first; lv_" + bp1 + " <= " + tmp2 + ".last; lv_" + bp1 + "++) {")
+        if bp_t_re == "bigint"
+          @needs_bigint = 1
+          rtmp_re2 = new_temp
+          emit("  for (mrb_int " + rtmp_re2 + " = " + tmp2 + ".first; " + rtmp_re2 + " <= " + tmp2 + ".last; " + rtmp_re2 + "++) {")
+          emit("    lv_" + bp1 + " = sp_bigint_new_int(" + rtmp_re2 + ");")
+        else
+          emit("  for (lv_" + bp1 + " = " + tmp2 + ".first; lv_" + bp1 + " <= " + tmp2 + ".last; lv_" + bp1 + "++) {")
+        end
         @indent = @indent + 1
         push_scope
         if has_bp == 1
-          declare_var(bp1, "int")
+          declare_var(bp1, bp_t_re == "bigint" ? "bigint" : "int")
         end
         redo_label = push_redo_label
         emit_redo_label(redo_label)
