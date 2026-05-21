@@ -20481,11 +20481,18 @@ class Compiler
     }
   end
 
- # Returns the literal type if `nid` is an AST literal expression,
- # else "". Mirrors the relevant arms of `infer_ivar_init_type`
- # but stays focused on the literal-node shapes we want to treat
- # as high-confidence (no transitive inference). Used by the
+ # Returns the literal type if `nid` is an AST literal expression
+ # or a constant whose initializer is one, else "". Used by the
  # method-arbitration definite-conflict check.
+ #
+ # Constants are immutable in Ruby, so a `BAD = "bad"` reference
+ # downstream is observationally equivalent to writing `"bad"`
+ # in place. Local variables are NOT included here -- they can be
+ # reassigned, scope-shadowed, and widened by inference, so the
+ # check would either need per-local literal-write tracking or
+ # risk false positives. Confirmed users of the indirection
+ # (`x = "bad"; method(x)`) fall through silently rather than
+ # erroring.
   def rbs_literal_expr_type(nid)
     if nid < 0
       return ""
@@ -20508,6 +20515,87 @@ class Compiler
     end
     if t == "NilNode"
       return "nil"
+    end
+    if t == "ConstantReadNode"
+      cname = resolve_const_read_name(@nd_name[nid])
+      ci = find_const_idx(cname)
+      if ci >= 0 && ci < @const_expr_ids.length
+        eid = @const_expr_ids[ci]
+        if eid >= 0
+ # Recurse so a `C = D` chain (constant pointing at another
+ # literal-init constant) still resolves through to the
+ # underlying AST literal.
+          return rbs_literal_expr_type(eid)
+        end
+      end
+    end
+    if t == "ConstantPathNode"
+      cpname = resolve_const_ref_name(nid)
+      if cpname != ""
+        ci = find_const_idx(cpname)
+        if ci >= 0 && ci < @const_expr_ids.length
+          eid = @const_expr_ids[ci]
+          if eid >= 0
+            return rbs_literal_expr_type(eid)
+          end
+        end
+      end
+    end
+ # Local variable whose declared / inferred type is a concrete
+ # scalar -- treat the read as "definite enough" for the conflict
+ # check. The walker pushes the body's precomputed locals before
+ # reaching here, so `find_var_type` resolves through to the
+ # scope-decl type. Skip poly / int (the int could be a placeholder
+ # from an unset attr-shaped local; the matching RBS would
+ # legitimately say int so the comparison resolves equal anyway).
+    if t == "LocalVariableReadNode"
+      vt = find_var_type(@nd_name[nid])
+      if vt == "string" || vt == "float" || vt == "bool" || vt == "symbol"
+        return vt
+      end
+    end
+ # Call whose body's implicit final expression is a literal
+ # (`def make; "bad"; end` → `make()` is observably "string"
+ # forever). The call's return is as "definite" as the literal
+ # inside its body. Only walks the body's last statement -- a
+ # full return-path scan would need to merge multiple return
+ # arms and check that ALL paths yield the same literal type.
+ # That refinement is straightforward but adds enough surface
+ # to be worth its own pass.
+    if t == "CallNode"
+      mname = @nd_name[nid]
+      recv = @nd_receiver[nid]
+      bid = -1
+      if recv < 0
+        mi = find_method_idx(mname)
+        if mi >= 0 && mi < @meth_body_ids.length
+          bid = @meth_body_ids[mi]
+        end
+      elsif @nd_type[recv] == "ConstantReadNode"
+        rcname = @nd_name[recv]
+        rci = find_class_idx(rcname)
+        if rci >= 0 && rci < @cls_cmeth_bodies.length
+          cmnames = @cls_cmeth_names[rci].split(";")
+          cmj = 0
+          while cmj < cmnames.length
+            if cmnames[cmj] == mname
+              cmbodies = @cls_cmeth_bodies[rci].split(";")
+              if cmj < cmbodies.length
+                bid = cmbodies[cmj].to_i
+              end
+              cmj = cmnames.length
+            else
+              cmj = cmj + 1
+            end
+          end
+        end
+      end
+      if bid >= 0
+        lit = rbs_body_implicit_return_literal(bid)
+        if lit != ""
+          return lit
+        end
+      end
     end
     ""
   end
