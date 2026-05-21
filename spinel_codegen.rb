@@ -11509,6 +11509,34 @@ class Compiler
       if disp_iow != ""
         return "(" + lhs_iow + " = " + disp_iow + ")"
       end
+ # promote-mode bigint ivar: route arithmetic/bitwise through
+ # sp_bigint_* helpers. Mirrors the compile_stmt InstanceVariable
+ # OperatorWriteNode arm but returning the new slot value as the
+ # expression's value.
+      if ivar_t_iow == "bigint"
+        @needs_bigint = 1
+        rhs_t_iow = infer_type(@nd_expression[nid])
+        rhs_big_iow = rhs_t_iow == "bigint" ? "(sp_Bigint *)(" + val_iow + ")" : "sp_bigint_new_int(" + val_iow + ")"
+        big_op_iow = ""
+        if op_iow == "+"
+          big_op_iow = "sp_bigint_add"
+        elsif op_iow == "-"
+          big_op_iow = "sp_bigint_sub"
+        elsif op_iow == "*"
+          big_op_iow = "sp_bigint_mul"
+        elsif op_iow == "/"
+          big_op_iow = "sp_bigint_div"
+        elsif op_iow == "%"
+          big_op_iow = "sp_bigint_mod"
+        end
+        if big_op_iow != ""
+          return "(" + lhs_iow + " = " + big_op_iow + "((sp_Bigint *)" + lhs_iow + ", " + rhs_big_iow + "))"
+        end
+        if op_iow == "&" || op_iow == "|" || op_iow == "^" || op_iow == "<<" || op_iow == ">>"
+          rhs_int_iow = rhs_t_iow == "bigint" ? "sp_bigint_to_int(" + rhs_big_iow + ")" : "(" + val_iow + ")"
+          return "(" + lhs_iow + " = sp_bigint_new_int(sp_bigint_to_int((sp_Bigint *)" + lhs_iow + ") " + op_iow + " " + rhs_int_iow + "))"
+        end
+      end
       return "(" + lhs_iow + " " + op_iow + "= " + val_iow + ")"
     end
     if t == "LocalVariableOrWriteNode"
@@ -14973,6 +15001,14 @@ class Compiler
       end
       if mname == "!="
         return "(sp_bigint_cmp(" + rc + ", " + arg + ") != 0)"
+      end
+ # Bitwise / shift on a bigint recv: unbox to mrb_int, apply
+ # native op, rebox. Only when the receiver is genuinely bigint
+ # (not poly widened to share this `lt == bigint` block via the
+ # arg-side bigint check above) — poly recv shifts dispatch
+ # through a different runtime path.
+      if (mname == "&" || mname == "|" || mname == "^" || mname == "<<" || mname == ">>") && infer_type(recv) == "bigint"
+        return "sp_bigint_new_int(sp_bigint_to_int(" + rc + ") " + mname + " sp_bigint_to_int(" + arg + "))"
       end
     end
  # Operators
