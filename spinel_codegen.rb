@@ -2165,15 +2165,30 @@ class Compiler
     pt_list = cls_cmeth_ptypes_get(ci, j)
     base_name = "sp_" + cname + "_cls_" + sanitize_name(mname)
     adapter_name = "sp_" + cname + "_" + sanitize_name(mname) + "_cls_method_adapter"
-    sig = c_type(rt) + " " + adapter_name + "(void *_unused"
+ # Method ABI is `(void *, mrb_int...)` regardless of the callee's
+ # actual param types. `--int-overflow=promote` widens cls method
+ # params (and possibly the return) to bigint, so the adapter
+ # wraps each mrb_int arg via sp_bigint_new_int and unwraps a
+ # bigint return via sp_bigint_to_int before handing back.
+    adapter_rt = rt
+    if base_type(rt) == "bigint"
+      adapter_rt = "int"
+      @needs_bigint = 1
+    end
+    sig = c_type(adapter_rt) + " " + adapter_name + "(void *_unused"
     body_args = ""
     pi2 = 0
     while pi2 < pt_list.length
       sig = sig + ", mrb_int _a" + pi2.to_s
+      arg_expr = "_a" + pi2.to_s
+      if pi2 < pt_list.length && base_type(pt_list[pi2]) == "bigint"
+        arg_expr = "sp_bigint_new_int(_a" + pi2.to_s + ")"
+        @needs_bigint = 1
+      end
       if pi2 == 0
-        body_args = "_a" + pi2.to_s
+        body_args = arg_expr
       else
-        body_args = body_args + ", _a" + pi2.to_s
+        body_args = body_args + ", " + arg_expr
       end
       pi2 = pi2 + 1
     end
@@ -2188,6 +2203,12 @@ class Compiler
       @lambda_funcs << body_args
       @lambda_funcs << ");\n"
       @lambda_funcs << "  return 0;\n"
+    elsif base_type(rt) == "bigint"
+      @lambda_funcs << "  return sp_bigint_to_int("
+      @lambda_funcs << base_name
+      @lambda_funcs << "("
+      @lambda_funcs << body_args
+      @lambda_funcs << "));\n"
     else
       @lambda_funcs << "  return "
       @lambda_funcs << base_name

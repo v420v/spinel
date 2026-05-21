@@ -20429,6 +20429,14 @@ class Compiler
  # bigint). The cache has no version stamp, so wipe it whole —
  # next caller refills lazily off the now-promoted tables.
     @cls_meth_return_cache = {}
+ # cls_meth_ptypes_get / cls_cmeth_ptypes_get use a per-class
+ # memoized split keyed off @cls_meth_ptypes_version /
+ # @cls_cmeth_ptypes_version. promote_meth_ptypes_table below
+ # mutates the underlying join'd string in place, so bump both
+ # version counters now to invalidate any cached split that
+ # downstream readers might pick up.
+    @cls_meth_ptypes_version = @cls_meth_ptypes_version + 1
+    @cls_cmeth_ptypes_version = @cls_cmeth_ptypes_version + 1
  # Top-level methods.
     mi = 0
     while mi < @meth_param_types.length
@@ -20459,6 +20467,16 @@ class Compiler
  # Class instance + class methods.
     ci = 0
     while ci < @cls_names.length
+ # The built-in Method class carries a raw function pointer in
+ # @fn_ptr (cast to mrb_int) and `Method#initialize(self_obj,
+ # fn_ptr)` takes that mrb_int. Promoting either to bigint
+ # breaks dispatch (sp_Method_new expects a function-pointer-
+ # shaped mrb_int, and the .call lowering reads @fn_ptr back as
+ # mrb_int). Skip the whole class.
+      if @cls_names[ci] == "Method"
+        ci = ci + 1
+        next
+      end
       promote_meth_ptypes_table(ci, @cls_meth_ptypes)
       promote_meth_returns_table(ci, @cls_meth_returns)
       if ci < @cls_cmeth_ptypes.length
