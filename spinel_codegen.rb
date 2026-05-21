@@ -5566,6 +5566,22 @@ class Compiler
     if expected_base == "poly" && at != "poly"
       return box_value_to_poly(at, val)
     end
+ # `--int-overflow=promote` rewrites every int slot to bigint at
+ # analyze time, so call sites that pass a literal int (or any
+ # int-typed expression) into a now-bigint param need to box
+ # through sp_bigint_new_int. The reverse direction (bigint
+ # value flowing into an int-expecting slot) is rare in promote
+ # mode since everything is bigint, but the FFI int args and a
+ # few stdlib helpers still want mrb_int -- sp_bigint_to_int
+ # covers that.
+    if expected_base == "bigint" && at == "int"
+      @needs_bigint = 1
+      return "sp_bigint_new_int(" + val + ")"
+    end
+    if expected_base == "int" && at == "bigint"
+      @needs_bigint = 1
+      return "sp_bigint_to_int((sp_Bigint *)" + val + ")"
+    end
  # `*_ptr_array → poly_array` at the call boundary. The callee
  # was inferred to take poly_array (because at least one caller
  # passes a heterogeneous literal) but this caller passes a
@@ -9496,6 +9512,13 @@ class Compiler
  # writes to a multi-typed ivar.
                 if ivt == "poly"
                   val = box_expr_to_poly(expr_id_iv)
+                elsif ivt == "bigint" && infer_type(expr_id_iv) == "int"
+ # `--int-overflow=promote` rewrites every int slot to
+ # bigint, but initialize bodies often seed the ivar with
+ # a literal int (`@n = 0`). Coerce via sp_bigint_new_int
+ # so the C compile sees a sp_Bigint * on both sides.
+                  @needs_bigint = 1
+                  val = "sp_bigint_new_int(" + compile_expr(expr_id_iv) + ")"
                 else
                   val = compile_expr(expr_id_iv)
                 end
@@ -12278,6 +12301,15 @@ class Compiler
       arg_ids = get_args(args_id)
       if arg_ids.length > 0
         ce = compile_expr(arg_ids[0])
+ # `--int-overflow=promote` rewrites every int local to bigint;
+ # array indices, sp_*_get / _set, and other int-expecting C
+ # helpers still need an `mrb_int` here. Unbox through
+ # sp_bigint_to_int so the index is a native int even when the
+ # source expression came from a promoted slot.
+        if infer_type(arg_ids[0]) == "bigint"
+          @needs_bigint = 1
+          return "sp_bigint_to_int((sp_Bigint *)" + ce + ")"
+        end
         if infer_type(arg_ids[0]) == "poly"
           return "(" + ce + ").v.i"
         end
@@ -23727,7 +23759,7 @@ class Compiler
         if k < ptypes.length
           pt = ptypes[k]
           pt_base = base_type(pt)
-          if pt_base == "poly" || pt_base == "string" || is_array_type(pt_base) == 1 || (at == "poly" && is_obj_type(pt_base) == 1) || (at == "poly" && is_hash_type(pt_base) == 1)
+          if pt_base == "poly" || pt_base == "string" || is_array_type(pt_base) == 1 || (at == "poly" && is_obj_type(pt_base) == 1) || (at == "poly" && is_hash_type(pt_base) == 1) || (pt_base == "bigint" && at != "bigint") || (at == "bigint" && pt_base != "bigint")
             aexpr = compile_expr_for_expected_type(arg_ids[k], pt)
             if root_constructor_args == 1
               aexpr = root_constructor_arg_if_needed(arg_ids[k], aexpr, pt, later_arg_may_gc[k])
@@ -31596,13 +31628,24 @@ class Compiler
     bp1 = get_block_param(nid, 0)
     tmp = new_temp
     emit("  for (mrb_int " + tmp + " = " + rc + "; " + tmp + " <= " + lim + "; " + tmp + "++) {")
+ # Block-param type: with `--int-overflow=promote`, the
+ # enclosing function's local for the block param has been
+ # rewritten to sp_Bigint *, but the upto counter is still
+ # mrb_int (the range bounds are int-literal). Box on assignment
+ # so the LV slot type matches its declaration.
+    bp_t = bp1 != "" ? find_var_type(bp1) : ""
     if bp1 != ""
-      emit("    lv_" + bp1 + " = " + tmp + ";")
+      if bp_t == "bigint"
+        @needs_bigint = 1
+        emit("    lv_" + bp1 + " = sp_bigint_new_int(" + tmp + ");")
+      else
+        emit("    lv_" + bp1 + " = " + tmp + ";")
+      end
     end
     @indent = @indent + 1
     push_scope
     if bp1 != ""
-      declare_var(bp1, "int")
+      declare_var(bp1, bp_t == "bigint" ? "bigint" : "int")
     end
     redo_label = push_redo_label
     emit_redo_label(redo_label)

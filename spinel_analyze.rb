@@ -20404,6 +20404,128 @@ class Compiler
  # disagreement and that RBS won, and can fix the source or the
  # RBS as needed. Restores the RBS-declared type as the final
  # inferred type either way.
+ # `--int-overflow=promote` final sweep: every slot that the
+ # inference passes settled on `int` becomes `bigint`. Locals
+ # already got rewritten inside refine_locals_multi_pass_full;
+ # the slots covered here are the ones the locals pass can't
+ # reach -- method params (top-level / class instance / class
+ # singleton), method return types, instance variables. The
+ # codegen's existing bigint path takes over for arithmetic,
+ # comparison, and stringification on those slots; the few
+ # genuinely-int sites that can't accept bigint (FFI numeric
+ # args, sp_sym storage, array indices) coerce via the existing
+ # int<->bigint cast helpers spinel already emits when an
+ # explicit bigint local crosses one of those boundaries.
+ #
+ # No-op when mode != promote.
+  def promote_int_to_bigint_globally
+    if @int_overflow_mode != "promote"
+      return
+    end
+ # Top-level methods.
+    mi = 0
+    while mi < @meth_param_types.length
+      pt = @meth_param_types[mi].split(",")
+      changed = 0
+      pk = 0
+      while pk < pt.length
+        if pt[pk] == "int"
+          pt[pk] = "bigint"
+          @needs_bigint = 1
+          changed = 1
+        end
+        pk = pk + 1
+      end
+      if changed == 1
+        @meth_param_types[mi] = pt.join(",")
+      end
+      mi = mi + 1
+    end
+    mi = 0
+    while mi < @meth_return_types.length
+      if @meth_return_types[mi] == "int"
+        @meth_return_types[mi] = "bigint"
+        @needs_bigint = 1
+      end
+      mi = mi + 1
+    end
+ # Class instance + class methods.
+    ci = 0
+    while ci < @cls_names.length
+      promote_meth_ptypes_table(ci, @cls_meth_ptypes)
+      promote_meth_returns_table(ci, @cls_meth_returns)
+      if ci < @cls_cmeth_ptypes.length
+        promote_meth_ptypes_table(ci, @cls_cmeth_ptypes)
+      end
+      if ci < @cls_cmeth_returns.length
+        promote_meth_returns_table(ci, @cls_cmeth_returns)
+      end
+ # Ivars.
+      ivt = @cls_ivar_types[ci].split(";")
+      changed_iv = 0
+      ik = 0
+      while ik < ivt.length
+        if ivt[ik] == "int"
+          ivt[ik] = "bigint"
+          @needs_bigint = 1
+          changed_iv = 1
+        end
+        ik = ik + 1
+      end
+      if changed_iv == 1
+        @cls_ivar_types[ci] = ivt.join(";")
+        @cls_ivar_types_version = @cls_ivar_types_version + 1
+      end
+      ci = ci + 1
+    end
+  end
+
+  def promote_meth_ptypes_table(ci, tbl)
+    if ci >= tbl.length
+      return
+    end
+    all_pt = tbl[ci].split("|")
+    changed = 0
+    mj = 0
+    while mj < all_pt.length
+      pts = all_pt[mj].split(",")
+      pk = 0
+      while pk < pts.length
+        if pts[pk] == "int"
+          pts[pk] = "bigint"
+          @needs_bigint = 1
+          changed = 1
+        end
+        pk = pk + 1
+      end
+      all_pt[mj] = pts.join(",")
+      mj = mj + 1
+    end
+    if changed == 1
+      tbl[ci] = all_pt.join("|")
+    end
+  end
+
+  def promote_meth_returns_table(ci, tbl)
+    if ci >= tbl.length
+      return
+    end
+    rets = tbl[ci].split(";")
+    changed = 0
+    mj = 0
+    while mj < rets.length
+      if rets[mj] == "int"
+        rets[mj] = "bigint"
+        @needs_bigint = 1
+        changed = 1
+      end
+      mj = mj + 1
+    end
+    if changed == 1
+      tbl[ci] = rets.join(";")
+    end
+  end
+
   def arbitrate_rbs_vs_inferred_methods
  # Definite-conflict detection for returns. A LITERAL return whose
  # type can't unify with the RBS-declared return errors out before
@@ -21309,6 +21431,15 @@ class Compiler
  # inference pass so the slot we're comparing against is final.
     arbitrate_rbs_vs_inferred_ivars
     arbitrate_rbs_vs_inferred_methods
+ # `--int-overflow=promote`: force-promote every remaining `int`-
+ # typed slot to `bigint` across the whole program. The locals
+ # path is already covered by refine_locals_multi_pass_full's
+ # promote branch; this sweep finishes the job for ivars,
+ # method params, method returns, and class methods. Without it
+ # promote mode misses arithmetic that flows through `def f(n);
+ # n + huge; end` because the param `n` stays mrb_int and the
+ # call site can't widen across the function boundary.
+    promote_int_to_bigint_globally
  # Pre-detect bigint variables before feature detection
     pre_detect_bigint
     detect_features
@@ -27427,6 +27558,24 @@ class Compiler
  # codegen would otherwise compute itself.
   def refine_method_body_locals(bid, lnames, ltypes, params)
     scan_locals(bid, lnames, ltypes, params)
+ # `--int-overflow=promote`: every int body local becomes bigint
+ # before the refinement passes see it. Mirrors the same step in
+ # refine_locals_multi_pass_full but applied to method bodies
+ # (where the caller passes the lnames / ltypes through this
+ # path instead of the multi-pass full one). Without this,
+ # `def f(n); acc = 1; while ...; acc *= n; ...; acc; end` had
+ # the body local `acc` stuck at int and the C compile failed
+ # to return mrb_int from a sp_Bigint *-returning function.
+    if @int_overflow_mode == "promote"
+      pj = 0
+      while pj < lnames.length
+        if ltypes[pj] == "int"
+          ltypes[pj] = "bigint"
+          @needs_bigint = 1
+        end
+        pj = pj + 1
+      end
+    end
     j = 0
     while j < lnames.length
       declare_var(lnames[j], ltypes[j])
