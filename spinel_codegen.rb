@@ -23311,7 +23311,18 @@ class Compiler
  # that flows non-string objs through here.
               result = result + box_expr_to_poly(kw_arg_ids[ki])
             else
-              result = result + kw_vals[ki]
+ # promote-mode coerce: kw value's static type vs
+ # param's declared type may need int <-> bigint.
+              kw_val_pft = kw_vals[ki]
+              kw_arg_t_pft = ki < kw_arg_ids.length ? infer_type(kw_arg_ids[ki]) : ""
+              if base_type(ptypes[k]) == "bigint" && kw_arg_t_pft == "int"
+                @needs_bigint = 1
+                kw_val_pft = "sp_bigint_new_int(" + kw_val_pft + ")"
+              elsif base_type(ptypes[k]) == "int" && kw_arg_t_pft == "bigint"
+                @needs_bigint = 1
+                kw_val_pft = "sp_bigint_to_int((sp_Bigint *)" + kw_val_pft + ")"
+              end
+              result = result + kw_val_pft
             end
           else
             result = result + kw_vals[ki]
