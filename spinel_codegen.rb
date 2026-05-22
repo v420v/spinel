@@ -16038,8 +16038,20 @@ class Compiler
                     emit("  sp_PtrArray_push(" + arrnew_tmp + ", (void *)(" + arrnew_lastv + "));")
                   else
  # promote-mode block tail may emit a bigint expr; unbox
- # for the int_array accumulator.
-                    if infer_type(arrnew_stmts2.last) == "bigint"
+ # for the int_array accumulator. Peek arith operands too —
+ # `Array.new(N) { i * 2 }` with bigint i caches "int" but
+ # emits sp_bigint_mul.
+                    arrnew_tail_t = infer_type(arrnew_stmts2.last)
+                    if arrnew_tail_t != "bigint" && @nd_type[arrnew_stmts2.last] == "CallNode"
+                      an_mn = @nd_name[arrnew_stmts2.last]
+                      if an_mn == "+" || an_mn == "-" || an_mn == "*" || an_mn == "/" || an_mn == "%" || an_mn == "**"
+                        an_recv = @nd_receiver[arrnew_stmts2.last]
+                        if an_recv >= 0 && base_type(infer_type(an_recv)) == "bigint"
+                          arrnew_tail_t = "bigint"
+                        end
+                      end
+                    end
+                    if arrnew_tail_t == "bigint"
                       @needs_bigint = 1
                       arrnew_lastv = "sp_bigint_to_int((sp_Bigint *)" + arrnew_lastv + ")"
                     end
@@ -18184,6 +18196,19 @@ class Compiler
             if bs.length > 0
               bexpr = compile_expr(bs.last)
               bexpr_t_sb = infer_type(bs.last)
+ # Peek: unary `-x` (CallNode `-` no args) on a bigint recv emits
+ # sp_bigint_sub. infer_type's CallNode arm caches it as "int" by
+ # default, so probe the recv side.
+              if bexpr_t_sb != "bigint" && @nd_type[bs.last] == "CallNode"
+                un_mn = @nd_name[bs.last]
+                un_args_sb = @nd_arguments[bs.last]
+                if (un_mn == "-" || un_mn == "-@") && (un_args_sb < 0 || get_args(un_args_sb).length == 0)
+                  un_recv = @nd_receiver[bs.last]
+                  if un_recv >= 0 && base_type(infer_type(un_recv)) == "bigint"
+                    bexpr_t_sb = "bigint"
+                  end
+                end
+              end
             end
           end
           ka_init_sb = bexpr
