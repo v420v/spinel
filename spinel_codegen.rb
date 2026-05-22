@@ -11588,6 +11588,16 @@ class Compiler
       if vt == "poly" && rhs_t != "" && rhs_t != "poly"
         val = box_value_to_poly(rhs_t, val)
       end
+ # promote-mode bigint slot: coerce an int rhs (literal, mrb_int-
+ # returning call like `gets.to_i`) before the C-level assign.
+ # Mirrors compile_stmt's LVW arm.
+      if vt == "bigint" && rhs_t == "int"
+        @needs_bigint = 1
+        val = "sp_bigint_new_int(" + val + ")"
+      elsif vt == "int" && rhs_t == "bigint"
+        @needs_bigint = 1
+        val = "sp_bigint_to_int((sp_Bigint *)" + val + ")"
+      end
       return "(" + fiber_var_ref(lname2) + " = " + val + ")"
     end
     if t == "LocalVariableOperatorWriteNode"
