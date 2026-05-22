@@ -35752,6 +35752,14 @@ class Compiler
       end
     end
     expr = compile_expr(last)
+    last_t_cbi = infer_type(last)
+    if base_type(return_type) == "bigint" && last_t_cbi == "int"
+      @needs_bigint = 1
+      expr = "sp_bigint_new_int(" + expr + ")"
+    elsif base_type(return_type) == "int" && last_t_cbi == "bigint"
+      @needs_bigint = 1
+      expr = "sp_bigint_to_int((sp_Bigint *)" + expr + ")"
+    end
     emit("  " + ret_tmp + " = " + expr + ";")
   end
 
