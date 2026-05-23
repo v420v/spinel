@@ -25083,7 +25083,16 @@ class Compiler
       ak = ak + 1
     end
 
-    if splat_count_local == 1
+ # When the splat slot was widened to poly_array (heterogeneous call
+ # sites), bypass compile_call_args_splat — that helper hardcodes
+ # int_array and would mis-pack the args. The main path's poly_array
+ # branch builds a PolyArray under the right element-box helper.
+ # Issue #666.
+    poly_rest_target = 0
+    if rest_param_idx >= 0 && rest_param_idx < ptypes.length && ptypes[rest_param_idx] == "poly_array"
+      poly_rest_target = 1
+    end
+    if splat_count_local == 1 && poly_rest_target == 0
       return compile_call_args_splat(nid, mi, pnames, ptypes, defaults, kw_names, kw_vals, kw_arg_ids, positional_ids, splat_idx, rest_param_idx)
     end
 
@@ -25132,6 +25141,42 @@ class Compiler
       end
       if kw_found == 0
         if k < ptypes.length
+          if ptypes[k] == "poly_array" && k == rest_param_idx
+ # Splat slot was widened to poly_array (heterogeneous call sites
+ # — e.g. `f(1,2,3); f("a","b")`). Build a PolyArray and box each
+ # positional arg in its declared type. Without this branch the
+ # call site emits the raw scalar as the first arg and the
+ # callee's `sp_PolyArray *lv_args` signature mismatches at clang.
+ # Issue #666.
+            @needs_poly_array = 1
+            @needs_gc = 1
+            tmp_pa = new_temp
+            emit("  sp_PolyArray *" + tmp_pa + " = sp_PolyArray_new();")
+            pi_pa = k
+            while pi_pa < positional_ids.length
+              if @nd_type[positional_ids[pi_pa]] == "SplatNode"
+                src_pa_expr = @nd_expression[positional_ids[pi_pa]]
+                if src_pa_expr >= 0
+                  src_pa_t = infer_type(src_pa_expr)
+                  src_pa_c = compile_expr(src_pa_expr)
+                  ii_pa_splat = new_temp
+                  if src_pa_t == "int_array"
+                    emit("  for (mrb_int " + ii_pa_splat + " = 0; " + ii_pa_splat + " < sp_IntArray_length(" + src_pa_c + "); " + ii_pa_splat + "++) sp_PolyArray_push(" + tmp_pa + ", sp_box_int(sp_IntArray_get(" + src_pa_c + ", " + ii_pa_splat + ")));")
+                  elsif src_pa_t == "str_array"
+                    emit("  for (mrb_int " + ii_pa_splat + " = 0; " + ii_pa_splat + " < sp_StrArray_length(" + src_pa_c + "); " + ii_pa_splat + "++) sp_PolyArray_push(" + tmp_pa + ", sp_box_str(sp_StrArray_get(" + src_pa_c + ", " + ii_pa_splat + ")));")
+                  elsif src_pa_t == "poly_array"
+                    emit("  for (mrb_int " + ii_pa_splat + " = 0; " + ii_pa_splat + " < sp_PolyArray_length(" + src_pa_c + "); " + ii_pa_splat + "++) sp_PolyArray_push(" + tmp_pa + ", sp_PolyArray_get(" + src_pa_c + ", " + ii_pa_splat + "));")
+                  end
+                end
+              else
+                emit("  sp_PolyArray_push(" + tmp_pa + ", " + box_expr_to_poly(positional_ids[pi_pa]) + ");")
+              end
+              pi_pa = pi_pa + 1
+            end
+            result = result + tmp_pa
+            k = k + 1
+            next
+          end
           if ptypes[k] == "int_array" && k == rest_param_idx
  # Rest parameter (splat). Trigger when caller passes more
  # positional args than the method has params, OR when any

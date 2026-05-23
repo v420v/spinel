@@ -19524,6 +19524,50 @@ class Compiler
             arg_ids = get_args(args_id)
             ptypes = @meth_param_types[mi].split(",")
             rest_param_idx = method_rest_index(mi)
+ # Splat slot widening: a `def f(*args)` slot defaults to int_array
+ # (the splat default in collect_ptypes_str). Every call site packs
+ # its remaining positional args into that slot; when sites disagree
+ # on element type the slot must widen to poly_array, otherwise the
+ # str-typed args from a later call get reinterpreted as int and
+ # round-trip as garbage pointers. Issue #666.
+            if rest_param_idx >= 0 && rest_param_idx < ptypes.length
+              elem_arg_t_splat = ""
+              ak_splat = rest_param_idx
+              while ak_splat < arg_ids.length
+                if @nd_type[arg_ids[ak_splat]] != "SplatNode" && @nd_type[arg_ids[ak_splat]] != "KeywordHashNode"
+                  at_splat = infer_type_deep(arg_ids[ak_splat])
+                  if at_splat != "" && elem_arg_t_splat == ""
+                    elem_arg_t_splat = at_splat
+                  elsif at_splat != "" && elem_arg_t_splat != "" && elem_arg_t_splat != at_splat
+                    elem_arg_t_splat = "poly"
+                  end
+                end
+                ak_splat = ak_splat + 1
+              end
+              if elem_arg_t_splat != ""
+                cur_rest_t = ptypes[rest_param_idx]
+                cur_elem = elem_type_of_array(cur_rest_t)
+                new_rest_t = "int_array"
+                if elem_arg_t_splat == "string"
+                  new_rest_t = "str_array"
+                elsif elem_arg_t_splat == "float"
+                  new_rest_t = "float_array"
+                elsif elem_arg_t_splat == "symbol"
+                  new_rest_t = "sym_array"
+                elsif elem_arg_t_splat == "poly"
+                  new_rest_t = "poly_array"
+                end
+                if cur_rest_t == "int_array" && cur_elem == "int" && elem_arg_t_splat != "int"
+ # First non-int call site: widen the default int_array to the
+ # matching homogeneous variant.
+                  ptypes[rest_param_idx] = new_rest_t
+                elsif cur_elem != "" && cur_elem != elem_arg_t_splat && cur_rest_t != "poly_array"
+ # Disagreement with the slot's existing element type → poly.
+                  ptypes[rest_param_idx] = "poly_array"
+                  @needs_rb_value = 1
+                end
+              end
+            end
             k = 0
             while k < arg_ids.length
               at = infer_type_deep(arg_ids[k])
