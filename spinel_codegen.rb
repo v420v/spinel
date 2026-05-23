@@ -32359,7 +32359,22 @@ class Compiler
   end
 
  # Emit the puts-equivalent for a single arg (extracted for reuse from p).
+ # Promote-mode stale-int: an attr_reader / method call returning
+ # sp_Bigint * may infer as "int" because the @cls_meth_returns
+ # entry was promoted after annotate_all_node_types cached the
+ # int. compile_puts and compile_puts_single both run into this:
+ # `printf("%lld", (long long)<sp_Bigint*>)` casts a pointer to
+ # long long and prints the address. Detect via the unified emit
+ # walker and route through the bigint puts arm instead.
+  def upgrade_at_for_emit(aid, at)
+    if at == "int" && aid >= 0 && expr_emit_is_bigint(aid) == 1
+      return "bigint"
+    end
+    at
+  end
+
   def compile_puts_single(aid, at, val)
+    at = upgrade_at_for_emit(aid, at)
     if at == "poly"
       @needs_rb_value = 1
       emit("  sp_poly_puts(" + val + ");")
@@ -32406,7 +32421,7 @@ class Compiler
     k = 0
     while k < arg_ids.length
       aid = arg_ids[k]
-      at = infer_type(aid)
+      at = upgrade_at_for_emit(aid, infer_type(aid))
  # Issue #640: `puts cond ? :sym : int` ternary's unify_return_type
  # picks one arm's type (e.g. "symbol") and the other arm's emit
  # gets dispatched through the wrong puts variant — `sp_sym_to_s
