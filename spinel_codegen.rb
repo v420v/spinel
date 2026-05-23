@@ -15535,6 +15535,14 @@ class Compiler
           ca = compile_typed_call_args_by_name(nid, cmp_owner, "<=>")
           rc = compile_expr_gc_rooted(recv)
           cmp_call = "sp_" + cmp_owner + "__cmp(" + rc + ", " + ca + ")"
+ # Promote mode: <=> returns sp_Bigint*. Unbox via sp_bigint_to_int
+ # so the < / > / <= / >= comparison fires on the int value, not
+ # on the heap pointer (which would compare against 0 = "is NULL?").
+          cmp_ret = cls_method_return(find_class_idx(cmp_owner), "<=>")
+          if base_type(cmp_ret) == "bigint"
+            @needs_bigint = 1
+            cmp_call = "sp_bigint_to_int((sp_Bigint *)" + cmp_call + ")"
+          end
           if mname == "<"
             return "(" + cmp_call + " < 0)"
           end
