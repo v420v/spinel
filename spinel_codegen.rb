@@ -15703,6 +15703,41 @@ class Compiler
     if lt != "bigint" && expr_emit_is_bigint(recv) == 1
       lt = "bigint"
     end
+ # When ONE side is bigint and the OTHER side is float, Ruby
+ # promotes the result to float. Coerce the bigint operand to
+ # mrb_float via sp_bigint_to_int and dispatch as float arith.
+    if lt == "bigint"
+      args_fp = @nd_arguments[nid]
+      arg0_fp_t = ""
+      if args_fp >= 0
+        aargs_fp = get_args(args_fp)
+        if aargs_fp.length > 0
+          arg0_fp_t = infer_type(aargs_fp[0])
+        end
+      end
+      recv_fp_t = infer_type(recv)
+      if (recv_fp_t == "float" && arg0_fp_t == "bigint") || (recv_fp_t == "bigint" && arg0_fp_t == "float") || (recv_fp_t == "float" && arg0_fp_t == "float")
+        rc_fp = compile_expr(recv)
+        arg_fp = compile_expr(aargs_fp[0])
+        if recv_fp_t == "bigint"
+          @needs_bigint = 1
+          rc_fp = "(mrb_float)sp_bigint_to_int((sp_Bigint *)" + rc_fp + ")"
+        end
+        if arg0_fp_t == "bigint"
+          @needs_bigint = 1
+          arg_fp = "(mrb_float)sp_bigint_to_int((sp_Bigint *)" + arg_fp + ")"
+        end
+        if mname == "+" || mname == "-" || mname == "*"
+          return "(" + rc_fp + " " + mname + " " + arg_fp + ")"
+        end
+        if mname == "/"
+          return "(" + rc_fp + " / " + arg_fp + ")"
+        end
+        if mname == "<" || mname == ">" || mname == "<=" || mname == ">=" || mname == "==" || mname == "!="
+          return "(" + rc_fp + " " + mname + " " + arg_fp + ")"
+        end
+      end
+    end
     if lt == "bigint"
       rc_raw = compile_expr(recv)
  # Cast away volatile from bigint locals (see compile_bigint_arg).
