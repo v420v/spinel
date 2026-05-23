@@ -37564,6 +37564,23 @@ class Compiler
           compile_each_with_yield_inline(nid, blk, bp_names, map_from, map_to)
           return
         end
+ # Nested call to a user yield-method while we're already inlining
+ # the surrounding caller. The classic shape is `outer do |x| yield x*2 end`
+ # inside `inner`, where `inner` was inlined into main and `outer` is
+ # itself a yield-using top-level method. Pre-fix the call fell through
+ # to compile_expr_remap, which emitted a real `sp_outer(...)` call —
+ # but inlined locals like `lv_x_y2` were never reachable from that
+ # generated function. Inline outer's body in place; its `yield` becomes
+ # the do/end body, and any `yield` *inside* that do/end body still
+ # refers to the surrounding caller's block (the `blk` we already have).
+ # Issue #664.
+        if @nd_receiver[nid] < 0 && find_method_idx(mname2) >= 0
+          inner_mi = find_method_idx(mname2)
+          if inner_mi >= 0 && inner_mi < @meth_has_yield.length && @meth_has_yield[inner_mi] == 1
+            compile_nested_yield_call_inline(nid, inner_mi, blk, bp_names, map_from, map_to)
+            return
+          end
+        end
       end
  # Compile call with remapping for args
       val = compile_expr_remap(nid, map_from, map_to)
@@ -38087,6 +38104,153 @@ class Compiler
 
     @self_override = saved_self_override
     @current_class_idx = saved_ci
+  end
+
+ # Two-level yield inline: `outer do |x| yield x*2 end` appearing
+ # inside an already-inlined caller (`inner`) where `outer` is itself a
+ # yield-using top-level method. The callee body's yield gets replaced
+ # by THIS call's literal block body (the do |x| ... end on this call),
+ # and the surrounding `blk` / `bp_names` / `map_from` / `map_to` carry
+ # the inner-most yields back to the original caller's block. Used by
+ # compile_stmt_with_block's CallNode arm. Issue #664.
+  def compile_nested_yield_call_inline(nid, callee_mi, outer_blk, outer_bp_names, map_from, map_to)
+    call_blk = @nd_block[nid]
+    if call_blk < 0
+      return
+    end
+    cb_names = "".split(",")
+    cb_params = @nd_parameters[call_blk]
+    if cb_params >= 0
+      cb_inner = @nd_parameters[cb_params]
+      if cb_inner >= 0
+        cb_reqs = parse_id_list(@nd_requireds[cb_inner])
+        kcb = 0
+        while kcb < cb_reqs.length
+          cb_names.push(@nd_name[cb_reqs[kcb]])
+          kcb = kcb + 1
+        end
+      end
+    end
+ # Bind callee's params from the call's args. Args are evaluated in the
+ # currently-inlined scope so they go through compile_expr_remap. The
+ # callee's locals get a unique suffix to avoid colliding with outer
+ # scope names (e.g. `lv_x` both from `inner` body and `outer`).
+    pnames_n = @meth_param_names[callee_mi].split(",")
+    ptypes_n = @meth_param_types[callee_mi].split(",")
+    args_id_n = @nd_arguments[nid]
+    arg_ids_n = []
+    if args_id_n >= 0
+      arg_ids_n = get_args(args_id_n)
+    end
+    @block_counter = @block_counter + 1
+    suffix_n = "_n" + @block_counter.to_s
+    nested_from = "".split(",")
+    nested_to = "".split(",")
+    kp_n = 0
+    while kp_n < pnames_n.length
+      pt_n = "int"
+      if kp_n < ptypes_n.length
+        pt_n = ptypes_n[kp_n]
+      end
+      tname_n = pnames_n[kp_n] + suffix_n
+      val_n = c_default_val(pt_n)
+      if kp_n < arg_ids_n.length
+        val_n = compile_expr_remap(arg_ids_n[kp_n], map_from, map_to)
+      end
+      emit("  " + c_type(pt_n) + " lv_" + tname_n + " = " + val_n + ";")
+      nested_from.push(pnames_n[kp_n])
+      nested_to.push(tname_n)
+      declare_var(tname_n, pt_n)
+      kp_n = kp_n + 1
+    end
+ # Declare the call-block's params under their original names so the
+ # callee body's `yield x*2` resolves x in this scope. They were
+ # already added to scope_names by scan_locals on the inlined caller,
+ # so we don't re-declare lv_x — just route through nested_from/to so
+ # the value lookup in compile_stmt_with_block lands on the right name.
+    bid_n = @meth_body_ids[callee_mi]
+    if bid_n >= 0
+      flocals_n = "".split(",")
+      flocals_t = "".split(",")
+      sn_n = @nd_scope_names[bid_n]
+      if sn_n != ""
+        flocals_n = sn_n.split("|")
+        flocals_t = @nd_scope_types[bid_n].split("|")
+      end
+      kf_n = 0
+      while kf_n < flocals_n.length
+        tname_lv_n = flocals_n[kf_n] + suffix_n
+        emit("  " + c_type(flocals_t[kf_n]) + " lv_" + tname_lv_n + " = " + c_default_val(flocals_t[kf_n]) + ";")
+        nested_from.push(flocals_n[kf_n])
+        nested_to.push(tname_lv_n)
+        declare_var(tname_lv_n, flocals_t[kf_n])
+        declare_var(flocals_n[kf_n], flocals_t[kf_n])
+        kf_n = kf_n + 1
+      end
+    end
+ # Walk callee body. A YieldNode in the callee body becomes "bind
+ # call-block params + run call-block body". Within call-block body,
+ # any further YieldNode refers to the *original* outer block, so we
+ # pass outer_blk + outer_bp_names + map_from + map_to through.
+    if bid_n >= 0
+      stmts_n = get_stmts(bid_n)
+      ks_n = 0
+      while ks_n < stmts_n.length
+        compile_nested_callee_stmt(stmts_n[ks_n], call_blk, cb_names,
+                                    nested_from, nested_to,
+                                    outer_blk, outer_bp_names, map_from, map_to)
+        ks_n = ks_n + 1
+      end
+    end
+  end
+
+ # Helper for compile_nested_yield_call_inline. Walks the callee body
+ # (e.g. outer's `yield 1`) translating a YieldNode into the call's
+ # do/end body, and routing other statements through compile_stmt_with_block
+ # so their LV reads see nested_from/to renames.
+  def compile_nested_callee_stmt(nid, call_blk, cb_names,
+                                  nested_from, nested_to,
+                                  outer_blk, outer_bp_names, map_from, map_to)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "YieldNode"
+ # Bind call-block params from yield args (evaluated in the nested
+ # callee scope, so use nested_from/to for renaming). The block
+ # param's storage name in the surrounding inlined caller goes
+ # through map_from/to — `x` in the source becomes `x_y2` in main
+ # after scan_locals' rename, so we must route the destination
+ # through remap_local too.
+      yargs = @nd_arguments[nid]
+      if yargs >= 0
+        yaids = get_args(yargs)
+        yk = 0
+        while yk < yaids.length
+          if yk < cb_names.length
+            v_y = compile_expr_remap(yaids[yk], nested_from, nested_to)
+            dst = remap_local(cb_names[yk], map_from, map_to)
+            emit("  lv_" + dst + " = " + v_y + ";")
+          end
+          yk = yk + 1
+        end
+      end
+ # Run the call's do/end body. yields inside it refer to the
+ # original outer block, so use outer_blk / outer_bp_names /
+ # map_from / map_to (the surrounding inlined caller's scope).
+      cb_body = @nd_body[call_blk]
+      if cb_body >= 0
+        cb_stmts = get_stmts(cb_body)
+        kb = 0
+        while kb < cb_stmts.length
+          compile_stmt_with_block(cb_stmts[kb], outer_blk, outer_bp_names, map_from, map_to)
+          kb = kb + 1
+        end
+      end
+      return
+    end
+ # Non-yield statements in callee body: emit through the standard
+ # walker but with nested_from/to so LV reads see the suffix rename.
+    compile_stmt_with_block(nid, call_blk, cb_names, nested_from, nested_to)
   end
 
   def compile_each_with_yield_inline(nid, outer_blk, outer_bp_names, map_from, map_to)
