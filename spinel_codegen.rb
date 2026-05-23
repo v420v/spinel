@@ -32360,6 +32360,20 @@ class Compiler
         next
       end
       val = compile_expr(aid)
+ # `puts hash[k]` where hash is a sym/str/int_poly_hash returns
+ # sp_RbVal but `infer_type` can report stale "int". Detect the
+ # CallNode `[]` against a poly-hash recv so we route through
+ # the poly puts emit rather than the int `printf("%lld", ...)`
+ # arm which would cast a struct to long long.
+      if at != "poly" && aid >= 0 && @nd_type[aid] == "CallNode" && @nd_name[aid] == "[]"
+        idx_recv_p = @nd_receiver[aid]
+        if idx_recv_p >= 0
+          recv_t_idx_p = base_type(infer_type(idx_recv_p))
+          if recv_t_idx_p == "sym_poly_hash" || recv_t_idx_p == "str_poly_hash" || recv_t_idx_p == "int_poly_hash" || recv_t_idx_p == "poly_poly_hash" || recv_t_idx_p == "poly_array"
+            at = "poly"
+          end
+        end
+      end
       if at == "poly"
         @needs_rb_value = 1
         emit("  sp_poly_puts(" + val + ");")
