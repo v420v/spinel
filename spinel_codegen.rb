@@ -22058,7 +22058,7 @@ class Compiler
       if arg_types[0] == "poly"
         a0_int = "(" + a0_int + ").v.i"
       end
-      if arg_types[0] == "bigint"
+      if arg_types[0] == "bigint" || (arg_types[0] == "int" && (a0_int.start_with?("sp_bigint_") || a0_int.start_with?("(sp_Bigint *)")))
         @needs_bigint = 1
         a0_int = "sp_bigint_to_int((sp_Bigint *)" + a0_int + ")"
       end
@@ -22372,6 +22372,20 @@ class Compiler
       if arg_types.length > 0 && arg_types[0] == "bigint"
         @needs_bigint = 1
         a0 = "sp_bigint_to_int((sp_Bigint *)" + a0 + ")"
+      end
+ # When the cache reports stale "int" but the actual emit is
+ # bigint (arith / bitop / user-method returning bigint), use
+ # the same unbox. arg_types is populated from infer_type; the
+ # walker catches stale-int rhs shapes.
+      if arg_compiled.length > 0 && (arg_types.length == 0 || arg_types[0] == "int") && a0 != ""
+ # Need the original AST node to consult expr_emit_is_bigint;
+ # the caller doesn't pass it, so we detect from the compiled
+ # string instead: sp_bigint_* return-typed expressions all
+ # start with sp_bigint_ except for `(sp_Bigint *)lv_x` casts.
+        if a0.start_with?("sp_bigint_") || a0.start_with?("(sp_Bigint *)")
+          @needs_bigint = 1
+          a0 = "sp_bigint_to_int((sp_Bigint *)" + a0 + ")"
+        end
       end
     end
  # `[]` — element types differ per built-in. When the result temp
@@ -22726,6 +22740,12 @@ class Compiler
           if mi < arg_types.length && arg_types[mi] == "poly"
             ai_val = "(" + ai_val + ").v.i"
           elsif mi < arg_types.length && arg_types[mi] == "bigint"
+            @needs_bigint = 1
+            ai_val = "sp_bigint_to_int((sp_Bigint *)" + ai_val + ")"
+          elsif ai_val.start_with?("sp_bigint_") || ai_val.start_with?("(sp_Bigint *)")
+ # Stale-int cache hiding a bigint emit (canonical arith /
+ # bitop CallNode whose operands include a promote-widened
+ # local). Method's fn_ptr ABI is fixed mrb_int — unbox.
             @needs_bigint = 1
             ai_val = "sp_bigint_to_int((sp_Bigint *)" + ai_val + ")"
           end
