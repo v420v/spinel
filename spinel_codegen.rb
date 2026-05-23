@@ -14570,6 +14570,28 @@ class Compiler
     if recv_type == "bigint"
       # Cast away volatile from bigint locals (see compile_bigint_arg).
       rc_b = "(sp_Bigint *)" + rc
+      if mname == "<=>"
+ # 3-way compare on bigint. Returns mrb_int (-1 / 0 / 1) at C
+ # level; outer wrappers (return / push into bigint slot) will
+ # promote to bigint when needed.
+        args_id_cmp = @nd_arguments[nid]
+        if args_id_cmp >= 0
+          a_cmp = get_args(args_id_cmp)
+          if a_cmp.length > 0
+            other_t_cmp = infer_type(a_cmp[0])
+            other_c_cmp = compile_expr(a_cmp[0])
+            if other_t_cmp == "bigint" || expr_emit_is_bigint(a_cmp[0]) == 1
+              return "sp_bigint_cmp(" + rc_b + ", (sp_Bigint *)" + other_c_cmp + ")"
+            end
+            if other_t_cmp == "int"
+              return "sp_bigint_cmp(" + rc_b + ", sp_bigint_new_int(" + other_c_cmp + "))"
+            end
+            if other_t_cmp == "float"
+              return "(((mrb_float)sp_bigint_to_int(" + rc_b + ") < " + other_c_cmp + ") ? -1 : ((mrb_float)sp_bigint_to_int(" + rc_b + ") > " + other_c_cmp + " ? 1 : 0))"
+            end
+          end
+        end
+      end
       if mname == "[]"
  # Integer#[idx] bit-index on bigint receiver.
         args_id_bi = @nd_arguments[nid]
