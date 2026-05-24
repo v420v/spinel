@@ -25804,29 +25804,62 @@ class Compiler
     if @nd_type[nid] == "ForNode"
       tgt = @nd_target[nid]
       if tgt >= 0
+ # Infer element type from collection (the value bound on each iter)
+        elem_type = "int"
+        coll = @nd_collection[nid]
+        if coll >= 0
+          ct = infer_type(coll)
+          if ct == "str_array"
+            elem_type = "string"
+          elsif ct == "float_array"
+            elem_type = "float"
+          elsif is_ptr_array_type(ct) == 1
+            elem_type = ptr_array_elem_type(ct)
+          end
+        end
         if @nd_type[tgt] == "LocalVariableTargetNode"
           lname = @nd_name[tgt]
           if not_in(lname, names) == 1
             if not_in(lname, params) == 1
- # Infer element type from collection
-              elem_type = "int"
-              coll = @nd_collection[nid]
-              if coll >= 0
-                ct = infer_type(coll)
-                if ct == "str_array"
-                  elem_type = "string"
-                elsif ct == "float_array"
-                  elem_type = "float"
-                elsif is_ptr_array_type(ct) == 1
-                  elem_type = ptr_array_elem_type(ct)
-                end
-              end
               names.push(lname)
               types.push(elem_type)
               @scan_literal_flags.push("")
               @scan_empty_flags.push("")
               @scan_empty_hash_flags.push("")
             end
+          end
+        end
+ # `for a, b in coll` destructures each element into multiple LVs.
+ # Each LV holds an entry of the element-array, so its type is the
+ # element-array's own element type.
+        if @nd_type[tgt] == "MultiTargetNode"
+          inner_type = "int"
+          if elem_type == "int_array" || elem_type == "sym_array"
+            inner_type = "int"
+          elsif elem_type == "str_array"
+            inner_type = "string"
+          elsif elem_type == "float_array"
+            inner_type = "float"
+          else
+            inner_type = "poly"
+          end
+          mt_kids = parse_id_list(@nd_targets[tgt])
+          k = 0
+          while k < mt_kids.length
+            kid = mt_kids[k]
+            if @nd_type[kid] == "LocalVariableTargetNode"
+              kname = @nd_name[kid]
+              if not_in(kname, names) == 1
+                if not_in(kname, params) == 1
+                  names.push(kname)
+                  types.push(inner_type)
+                  @scan_literal_flags.push("")
+                  @scan_empty_flags.push("")
+                  @scan_empty_hash_flags.push("")
+                end
+              end
+            end
+            k = k + 1
           end
         end
       end

@@ -29286,7 +29286,22 @@ class Compiler
  # Loop-var assignment stays OUTSIDE the redo label so `redo` re-runs
  # the body with the same value (matches MRI: `redo` does not advance).
         et_for = elem_type_of_array(ct)
-        if slot_t_for == "bigint" && et_for == "int"
+        if tgt >= 0 && @nd_type[tgt] == "MultiTargetNode"
+ # `for a, b in coll` -- fetch the per-iteration element (always
+ # an array-typed value) and unpack into the named targets.
+          mt_kids_for = parse_id_list(@nd_targets[tgt])
+          inner_pfx = array_c_prefix(et_for)
+          etmp = new_temp
+          emit("    sp_" + inner_pfx + " *" + etmp + " = sp_" + pfx + "_get(" + rc + ", " + tmp + ");")
+          mk = 0
+          while mk < mt_kids_for.length
+            kid = mt_kids_for[mk]
+            if @nd_type[kid] == "LocalVariableTargetNode"
+              emit("    lv_" + @nd_name[kid] + " = sp_" + inner_pfx + "_get(" + etmp + ", " + mk.to_s + ");")
+            end
+            mk = mk + 1
+          end
+        elsif slot_t_for == "bigint" && et_for == "int"
           @needs_bigint = 1
           emit("    lv_" + vname + " = sp_bigint_new_int(sp_" + pfx + "_get(" + rc + ", " + tmp + "));")
         else
