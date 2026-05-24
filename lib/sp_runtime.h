@@ -2177,6 +2177,35 @@ static void sp_raise_cls(const char *cls, const char *msg) { if (sp_exc_top > 0)
 static void sp_raise(const char *msg) { sp_raise_cls("RuntimeError", msg); }
 static void sp_mark_in_flight_exceptions(void) { for (int i = 0; i < sp_exc_top; i++) sp_mark_string(sp_exc_msg[i]); }
 
+/* sp_Exception: first-class exception object. cls_name is a pointer
+   to the per-class const string literal emitted by codegen
+   (sp_class_names[] entry; not GC-managed). msg is GC-managed
+   (sp_str_alloc'd). Phase 2 of the exception modernization plan --
+   replaces the side-channel `@exc_var_*` table that Phase 1
+   relied on. */
+typedef struct sp_Exception_s {
+  const char *cls_name;
+  const char *msg;
+} sp_Exception;
+static void sp_exc_gc_scan(void *p) {
+  sp_Exception *e = (sp_Exception *)p;
+  if (e->msg) sp_mark_string(e->msg);
+  /* cls_name points into the .rodata sp_class_names[] table -- not
+     a GC-managed string, no mark needed. */
+}
+static sp_Exception *sp_exc_new(const char *cls_name, const char *msg) {
+  sp_Exception *e = (sp_Exception *)sp_gc_alloc(sizeof(sp_Exception), NULL, sp_exc_gc_scan);
+  e->cls_name = cls_name ? cls_name : "RuntimeError";
+  e->msg = msg ? msg : sp_str_empty;
+  return e;
+}
+static const char *sp_exc_class_name(sp_Exception *e) { return e ? e->cls_name : "RuntimeError"; }
+static const char *sp_exc_message(sp_Exception *e) { return e ? e->msg : sp_str_empty; }
+static void sp_raise_exc(sp_Exception *e) {
+  if (!e) sp_raise("(nil exception)");
+  sp_raise_cls(e->cls_name, e->msg);
+}
+
 /* Cross-TU bridge for sp_bigint.c (compiled as a separate translation
    unit; can't see static helpers in this header). Defined non-static
    so sp_bigint.c's mrb_raise macro can dispatch into spinel's
