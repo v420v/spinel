@@ -2874,6 +2874,32 @@ class Compiler
       end
     end
 
+ # Phase 2: methods on first-class sp_Exception * values
+ # (`BuiltinExc.new(...)` chains, LVs holding the result, etc.).
+ # codegen's recv_type == "exception" arm lowers these to
+ # sp_exc_class_name / sp_exc_message / sp_exc_class_le -- their
+ # return shapes here must match.
+ #
+ # Gate the (potentially recursive) infer_type(recv) on the
+ # method name first, so non-exception-related calls don't pay
+ # the cost.
+    if recv >= 0
+      if mname == "message" || mname == "to_s" || mname == "class" || mname == "inspect" || mname == "full_message" || mname == "backtrace" || mname == "is_a?" || mname == "kind_of?" || mname == "instance_of?"
+        rt_exc = base_type(infer_type(recv))
+        if rt_exc == "exception"
+          if mname == "message" || mname == "to_s" || mname == "class" || mname == "inspect" || mname == "full_message"
+            return "string"
+          end
+          if mname == "backtrace"
+            return "nil"
+          end
+          if mname == "is_a?" || mname == "kind_of?" || mname == "instance_of?"
+            return "bool"
+          end
+        end
+      end
+    end
+
  # `recv.__sp_ieval_<N>(...)`: the rewritten form of an
  # `recv.instance_eval { ... }` call. v1 only fired on top-level call
  # sites, where the call's value was always discarded — so its return
@@ -3218,16 +3244,11 @@ class Compiler
           return "fiber"
         end
  # Built-in exception class .new (RuntimeError, StandardError,
- # ArgumentError, etc.): the constructed value carries just a
- # message string at the runtime level; spinel's `rescue => e`
- # path already binds the captured exception as a string with a
- # side-channel for the class name (find_exc_var_cls). Type the
- # constructor return as "string" so the receiving LV gets a
- # const char * slot; the codegen pushes the LV name into the
- # same side-channel table. Phase 1C of the exception handling
- # gap fixes.
+ # ArgumentError, etc.): Phase 2 lowers to a first-class
+ # sp_Exception * (cls_name + msg in a single heap allocation).
+ # Replaces Phase 1's const char * + side-channel cls name.
         if is_builtin_exception_class_name(rcname) == 1
-          return "string"
+          return "exception"
         end
       end
     end
@@ -5540,12 +5561,11 @@ class Compiler
           if module_name_exists(rn) == 1
             return ""
           end
- # Built-in exception class `.new`: the constructed value is just
- # the message string (spinel models exception objects as message
- # + side-channel class name, mirroring the `rescue => e` binding).
- # Type as "string" so the LV slot lowers to const char *. Phase 1C.
+ # Built-in exception class `.new`: Phase 2 promotes to a first-
+ # class sp_Exception *. Returns the new type token "exception"
+ # so the LV slot lowers to sp_Exception *.
           if is_builtin_exception_class_name(rn) == 1
-            return "string"
+            return "exception"
           end
           return "obj_" + rn
         end

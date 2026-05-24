@@ -1213,13 +1213,31 @@ class Compiler
         end
       end
     end
- # `raise lv` -- lv tagged as exception via find_exc_var_cls.
+ # `raise lv` -- two shapes:
+ #   - LV typed `exception` (Phase 2 sp_Exception *): sp_raise_exc(lv).
+ #   - LV in the Phase 1 side-channel (rescue => e binding):
+ #     sp_raise_cls(<saved_cls>, lv).
+ # Side-channel arm stays until Phase 2.3 migrates rescue too.
     if @nd_type[arg_id] == "LocalVariableReadNode"
-      lv_cls = find_exc_var_cls(@nd_name[arg_id])
-      if lv_cls != ""
-        emit("  sp_raise_cls(" + lv_cls + ", lv_" + @nd_name[arg_id] + ");")
+      lname = @nd_name[arg_id]
+      lv_t = find_var_type(lname)
+      if lv_t == "exception"
+        emit("  sp_raise_exc(lv_" + lname + ");")
         return
       end
+      lv_cls = find_exc_var_cls(lname)
+      if lv_cls != ""
+        emit("  sp_raise_cls(" + lv_cls + ", lv_" + lname + ");")
+        return
+      end
+    end
+ # `raise <CallNode that returned exception>`: result is sp_Exception*.
+ # Hoist into temp for safety (single eval) then sp_raise_exc.
+    if @nd_type[arg_id] == "CallNode" && infer_type(arg_id) == "exception"
+      tmp_re = new_temp
+      emit("  sp_Exception *" + tmp_re + " = " + compile_expr(arg_id) + ";")
+      emit("  sp_raise_exc(" + tmp_re + ");")
+      return
     end
  # Fallback: raise <msg-expression>; sp_raise treats as RuntimeError.
     emit("  sp_raise(" + compile_expr(arg_id) + ");")
@@ -4062,7 +4080,7 @@ class Compiler
     if is_ptr_array_type(bt) == 1
       return 1
     end
-    if bt == "fiber" || bt == "bigint"
+    if bt == "fiber" || bt == "bigint" || bt == "exception"
       return 1
     end
     if is_obj_type(bt) == 1
@@ -4140,6 +4158,12 @@ class Compiler
     end
     if t == "bigint"
       return "sp_Bigint *"
+    end
+ # First-class exception object (Phase 2). Replaces Phase 1's
+ # const char * + side-channel cls-name pair. Lowers to a
+ # heap-allocated sp_Exception { cls_name; msg }.
+    if t == "exception"
+      return "sp_Exception *"
     end
     if t == "float"
       return "mrb_float"
@@ -4279,6 +4303,9 @@ class Compiler
       return "NULL"
     end
     if t == "bigint"
+      return "NULL"
+    end
+    if t == "exception"
       return "NULL"
     end
     if t == "float"
@@ -15325,6 +15352,53 @@ class Compiler
       end
     end
 
+ # Exception methods (Phase 2). Recv is sp_Exception *; dispatch
+ # through sp_exc_* helpers.
+    if recv_type == "exception"
+      if mname == "class"
+        return "sp_exc_class_name(" + rc + ")"
+      end
+      if mname == "message" || mname == "to_s"
+        return "sp_exc_message(" + rc + ")"
+      end
+      if mname == "inspect"
+        return "sp_sprintf(\"#<%s: %s>\", sp_exc_class_name(" + rc + "), sp_exc_message(" + rc + "))"
+      end
+      if mname == "full_message"
+        return "sp_sprintf(\"%s: %s\", sp_exc_class_name(" + rc + "), sp_exc_message(" + rc + "))"
+      end
+      if mname == "backtrace"
+ # Spinel doesn't track per-exception backtraces; return nil.
+        return "0"
+      end
+      if mname == "is_a?" || mname == "kind_of?"
+        @needs_exc_class_hierarchy = 1
+        args_id_isaxc = @nd_arguments[nid]
+        if args_id_isaxc >= 0
+          aisxc = get_args(args_id_isaxc)
+          if aisxc.length > 0
+            arg_name_isxc = resolve_introspection_arg_name(aisxc[0])
+            if arg_name_isxc != ""
+              return "sp_exc_class_le(sp_exc_class_name(" + rc + "), \"" + arg_name_isxc + "\")"
+            end
+          end
+        end
+        return "FALSE"
+      end
+      if mname == "==" || mname == "!="
+ # Identity compare on the sp_Exception pointer; Ruby's
+ # Exception#== is also identity-based unless overridden.
+        a_isxc = get_args(@nd_arguments[nid])
+        if a_isxc.length > 0
+          op = mname == "==" ? "==" : "!="
+          return "(" + rc + " " + op + " " + compile_expr(a_isxc[0]) + ")"
+        end
+      end
+      if mname == "nil?"
+        return "(" + rc + " == NULL)"
+      end
+    end
+
  # Bigint methods
     if recv_type == "bigint"
       # Cast away volatile from bigint locals (see compile_bigint_arg).
@@ -17520,25 +17594,24 @@ class Compiler
       cname = implicit_new_class_name(recv)
     end
     if cname != ""
- # Built-in exception class `.new("msg")` (RuntimeError, ArgumentError,
- # etc.). Spinel models exception objects as their message string plus
- # a side-channel cls name (find_exc_var_cls). The constructor just
- # returns the message expression; the LV-write codegen registers the
- # binding's class for later `.class` / `.message` / `.is_a?` dispatch.
- # Phase 1C.
+ # Built-in exception class `.new("msg")` (Phase 2): lower to a
+ # heap-allocated sp_Exception { cls_name; msg } via sp_exc_new.
+ # The LV slot type is "exception" (sp_Exception *); subsequent
+ # `.class` / `.message` / `.is_a?` / `raise <e>` dispatch through
+ # sp_exc_*. Replaces Phase 1's "return msg string + side-channel
+ # cls name" pattern.
       if is_builtin_exception_class_name(cname) == 1
         @needs_exc_class_hierarchy = 1
+        @needs_setjmp = 1   # pulls in sp_exc_* runtime helpers
+        msg_expr_be = "(&(\"\\xff\")[1])"
         args_id_be = @nd_arguments[nid]
         if args_id_be >= 0
           aa_be = get_args(args_id_be)
           if aa_be.length >= 1
-            return compile_expr(aa_be[0])
+            msg_expr_be = compile_expr(aa_be[0])
           end
         end
- # `RuntimeError.new` with no msg: empty string. Matches the
- # behaviour of `rescue => e` for a `raise CLS` (no msg) which
- # binds `e` as "".
-        return "(&(\"\\xff\")[1])"
+        return "sp_exc_new(\"" + cname + "\", " + msg_expr_be + ")"
       end
       if cname == "Proc"
         if @nd_block[nid] >= 0
@@ -27366,25 +27439,11 @@ class Compiler
     end
     if t == "LocalVariableWriteNode"
       lname = @nd_name[nid]
- # `err = RuntimeError.new("msg")` (and other built-in exception
- # constructors): register the LV name in the @exc_var_* side-
- # channel so subsequent `err.class` / `err.message` / `err.is_a?`
- # dispatch through find_exc_var_cls -- same path the
- # `rescue => e` binding uses. The RHS itself lowers to just the
- # message string via compile_constructor_expr's exception arm.
- # No matching pop -- LV bindings persist for the program's
- # remaining static scope. Phase 1C.
-      expr_id_exc_check = @nd_expression[nid]
-      if expr_id_exc_check >= 0 && @nd_type[expr_id_exc_check] == "CallNode" && @nd_name[expr_id_exc_check] == "new"
-        recv_exc_check = @nd_receiver[expr_id_exc_check]
-        if recv_exc_check >= 0 && @nd_type[recv_exc_check] == "ConstantReadNode"
-          cname_exc_check = @nd_name[recv_exc_check]
-          if is_builtin_exception_class_name(cname_exc_check) == 1
-            @exc_var_names.push(lname)
-            @exc_var_cls_vars.push("\"" + cname_exc_check + "\"")
-          end
-        end
-      end
+ # Phase 1C used a side-channel push here for `err = RuntimeError
+ # .new(...)`. Phase 2 makes the LV slot itself sp_Exception * --
+ # the type carries the class via `e->cls_name`, so no side-channel
+ # registration is needed. The `rescue => e` binding still uses
+ # the side channel until Phase 2.3 migrates it.
  # `var = method(:name)` (no receiver, top-level) is the legacy
  # static-alias path: the call_expr handler returns a `0`
  # placeholder, we record (lname, mref) here, and a later

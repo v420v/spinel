@@ -2199,9 +2199,21 @@ static sp_Exception *sp_exc_new(const char *cls_name, const char *msg) {
   e->msg = msg ? msg : sp_str_empty;
   return e;
 }
-static const char *sp_exc_class_name(sp_Exception *e) { return e ? e->cls_name : "RuntimeError"; }
-static const char *sp_exc_message(sp_Exception *e) { return e ? e->msg : sp_str_empty; }
-static void sp_raise_exc(sp_Exception *e) {
+/* Accept `volatile` pointers: LV slots holding sp_Exception * are
+   declared volatile when they live across setjmp, so callers may
+   pass volatile-qualified pointers in. The pointee itself isn't
+   volatile (cls_name/msg are stable post-construction), so we
+   strip volatile internally for one access. */
+static const char *sp_exc_class_name(volatile sp_Exception *ve) {
+  sp_Exception *e = (sp_Exception *)ve;
+  return e ? e->cls_name : "RuntimeError";
+}
+static const char *sp_exc_message(volatile sp_Exception *ve) {
+  sp_Exception *e = (sp_Exception *)ve;
+  return e ? e->msg : sp_str_empty;
+}
+static void sp_raise_exc(volatile sp_Exception *ve) {
+  sp_Exception *e = (sp_Exception *)ve;
   if (!e) sp_raise("(nil exception)");
   sp_raise_cls(e->cls_name, e->msg);
 }
