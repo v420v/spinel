@@ -12396,6 +12396,68 @@ class Compiler
     cls_meth_ptypes_put(parent_init_ci, parent_init_idx, parent_ptypes)
   end
 
+  def propagate_super_methods_to_parent
+    ci = 0
+    while ci < @cls_names.length
+      if @cls_parents[ci] != ""
+        child_method_names = @cls_meth_names[ci].split(";")
+        j = 0
+        while j < child_method_names.length
+          mname = child_method_names[j]
+          if mname != "" && mname != "initialize"
+ # Walk the parent chain to find the closest ancestor that
+ # defines a same-named method.
+            walk_ci_sm = find_class_idx(@cls_parents[ci])
+            parent_ci_sm = -1
+            while walk_ci_sm >= 0
+              if cls_find_method_direct(walk_ci_sm, mname) >= 0
+                parent_ci_sm = walk_ci_sm
+                break
+              end
+              parent_str_sm = @cls_parents[walk_ci_sm]
+              if parent_str_sm == ""
+                break
+              end
+              walk_ci_sm = find_class_idx(parent_str_sm)
+            end
+            if parent_ci_sm >= 0
+              propagate_super_method_one(ci, j, parent_ci_sm, mname)
+            end
+          end
+          j = j + 1
+        end
+      end
+      ci = ci + 1
+    end
+  end
+
+  def propagate_super_method_one(child_ci, child_mi, parent_ci, mname)
+    bodies = @cls_meth_bodies[child_ci].split(";")
+    if child_mi >= bodies.length
+      return
+    end
+    bs = bodies[child_mi]
+    if bs == ""
+      return
+    end
+    bid = bs.to_i
+    if bid < 0
+      return
+    end
+    child_pnames = cls_meth_pnames_get(child_ci, child_mi)
+    child_ptypes = cls_meth_ptypes_get(child_ci, child_mi)
+    parent_mi = cls_find_method_direct(parent_ci, mname)
+    if parent_mi < 0
+      return
+    end
+    parent_ptypes = cls_meth_ptypes_get(parent_ci, parent_mi)
+    if parent_ptypes.length == 0
+      return
+    end
+    propagate_super_walk(bid, child_pnames, child_ptypes, parent_ptypes)
+    cls_meth_ptypes_put(parent_ci, parent_mi, parent_ptypes)
+  end
+
   def propagate_super_walk(nid, child_pnames, child_ptypes, parent_ptypes)
     if nid < 0
       return
@@ -17879,6 +17941,11 @@ class Compiler
  # default `mrb_int` even when every `Child.new` site passes a
  # typed pointer.
     propagate_super_init_to_parent
+ # Same propagation but for instance methods other than initialize:
+ # `def greet(name); super; end` in a Child class should let the
+ # parent's #greet see `name` as String when Child#greet is called
+ # with a String arg.
+    propagate_super_methods_to_parent
  # Update ivar types from constructor params
     update_ivar_types_from_params
  # Infer setter param types from ivar types

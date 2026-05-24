@@ -3,7 +3,6 @@ for a, b in [[1, 2], [3, 4]]
   puts "#{a}, #{b}"
 end
 
-# With strings
-for s, n in [["a", 1], ["b", 2], ["c", 3]]
-  puts "#{s}=#{n}"
+for x, y, z in [[1, 2, 3], [4, 5, 6]]
+  puts "#{x},#{y},#{z}"
 end
