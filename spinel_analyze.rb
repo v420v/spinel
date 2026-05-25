@@ -5888,6 +5888,16 @@ class Compiler
       end
       return "int_array"
     end
+ # `(a..b).step(n)` (no block) -- returns an int_array of stepped
+ # values. Issue #731.
+    if mname == "step"
+      if recv >= 0
+        rt_step = infer_type(recv)
+        if rt_step == "range"
+          return "int_array"
+        end
+      end
+    end
     ""
   end
 

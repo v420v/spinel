@@ -19257,6 +19257,23 @@ class Compiler
     if (mname == "any?" || mname == "all?" || mname == "none?" || mname == "one?") && @nd_block[nid] >= 0
       return compile_array_predicate_block(nid, rc, "range", mname)
     end
+ # `(a..b).step(k)` -- returns an IntArray of a, a+k, ... up to b.
+ # Without a block; block form is rarer and stays unhandled.
+ # Issue #731.
+    if mname == "step" && @nd_block[nid] < 0
+      @needs_int_array = 1
+      @needs_gc = 1
+      step_arg = compile_arg0_as_int(nid)
+      range_nid_step = resolve_literal_range_recv(nid)
+      if range_nid_step >= 0
+        rright_step = compile_expr(@nd_right[range_nid_step])
+        if range_excl_end(range_nid_step) == 1
+          rright_step = "(" + rright_step + ") - 1"
+        end
+        return "sp_IntArray_from_range_step(" + compile_expr(@nd_left[range_nid_step]) + ", " + rright_step + ", " + step_arg + ")"
+      end
+      return "sp_IntArray_from_range_step(" + rc + ".first, " + rc + ".last, " + step_arg + ")"
+    end
     ""
   end
 
