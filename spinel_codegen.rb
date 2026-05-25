@@ -996,7 +996,39 @@ class Compiler
       end
     end
  # Fallback: class name (matches `RuntimeError.new.message`).
-    "(&(\"\\xff\" \"" + cname + "\")[1])"
+ # Convert C-mangled `Foo_Bar` into Ruby's `Foo::Bar` when the
+ # prefix matches a registered module so namespaced exceptions
+ # report the user-visible name. Underscores that don't bridge
+ # a module boundary stay as-is (`My_Helper` etc.).
+    "(&(\"\\xff\" \"" + cls_name_to_ruby(cname) + "\")[1])"
+  end
+
+ # Reverse the `_`-as-module-separator mangling applied by
+ # collect_class_with_prefix. Walks the longest prefix that matches
+ # a registered module (recursively, so a nested `Outer_Inner`
+ # module-prefix unmangles further to `Outer::Inner`) and rejoins
+ # the path with `::`. Underscores that don't bridge a module
+ # boundary stay as-is (`My_Helper` etc.).
+  def cls_name_to_ruby(cname)
+    return cname unless cname.include?("_")
+    parts = cname.split("_")
+    best_len = 0
+    try_len = parts.length - 1
+    while try_len >= 1
+      candidate = parts[0, try_len].join("_")
+      if module_name_exists(candidate) == 1
+        best_len = try_len
+        try_len = 0
+      else
+        try_len = try_len - 1
+      end
+    end
+    if best_len == 0
+      return cname
+    end
+    prefix_ruby = cls_name_to_ruby(parts[0, best_len].join("_"))
+    tail = parts[best_len, parts.length - best_len].join("_")
+    prefix_ruby + "::" + tail
   end
 
  # Walk the AST from `nid` looking for a `class <cname> ... end`
