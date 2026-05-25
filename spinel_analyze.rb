@@ -3903,6 +3903,17 @@ class Compiler
         if is_obj_type(rt) == 1
           return "class"
         end
+ # Primitive .class -- Integer / Float / String / Symbol /
+ # NilClass / TrueClass / FalseClass / Range / Time / Array /
+ # Hash / Proc -- all return a `class` value. Issue #715.
+        bt_pc = base_type(rt)
+        if bt_pc == "int" || bt_pc == "bigint" || bt_pc == "float" ||
+           bt_pc == "string" || bt_pc == "mutable_str" || bt_pc == "symbol" ||
+           bt_pc == "bool" || bt_pc == "nil" || bt_pc == "range" || bt_pc == "time" ||
+           is_array_type(bt_pc) == 1 || is_hash_type(bt_pc) == 1 ||
+           bt_pc == "proc" || bt_pc == "lambda"
+          return "class"
+        end
       end
     end
  # `<obj>.class.<cmeth>` chained dispatch. When the

@@ -22637,6 +22637,36 @@ class Compiler
 
  # respond_to? - check if method exists
     if mname == "respond_to?"
+ # Primitive recv: assume the common method set is supported.
+ # An exhaustive enumeration is brittle, but `42.respond_to?(:to_s)`
+ # returning FALSE is much worse than a few false positives. The
+ # short list covers Object's universal methods + each primitive's
+ # commonly probed methods. Returns TRUE for any of these regardless
+ # of actual presence -- spinel can't reliably introspect a primitive's
+ # method table at compile time. Issue #716.
+      bt_rt = base_type(recv_type)
+      if bt_rt == "int" || bt_rt == "bigint" || bt_rt == "float" ||
+         bt_rt == "string" || bt_rt == "mutable_str" || bt_rt == "symbol" ||
+         bt_rt == "bool" || bt_rt == "nil" ||
+         is_array_type(bt_rt) == 1 || is_hash_type(bt_rt) == 1
+        args_id_rt = @nd_arguments[nid]
+        arg0_rt = ""
+        if args_id_rt >= 0
+          a_rt = get_args(args_id_rt)
+          if a_rt.length > 0
+            arg0_rt = @nd_content[a_rt[0]]
+          end
+        end
+ # Conservative allowlist of methods every primitive responds to.
+        if arg0_rt == "to_s" || arg0_rt == "to_i" || arg0_rt == "to_f" ||
+           arg0_rt == "inspect" || arg0_rt == "class" || arg0_rt == "nil?" ||
+           arg0_rt == "is_a?" || arg0_rt == "kind_of?" || arg0_rt == "instance_of?" ||
+           arg0_rt == "==" || arg0_rt == "!=" || arg0_rt == "hash" ||
+           arg0_rt == "respond_to?" || arg0_rt == "frozen?" || arg0_rt == "freeze" ||
+           arg0_rt == "dup" || arg0_rt == "clone" || arg0_rt == "tap" || arg0_rt == "then"
+          return "TRUE"
+        end
+      end
       if is_obj_type(recv_type) == 1
         cname = recv_type[4, recv_type.length - 4]
         ci = find_class_idx(cname)
@@ -22984,6 +23014,50 @@ class Compiler
       if cls_idx >= 0
         @needs_class_table = 1
         return "((sp_Class){" + cls_id_for_user_internal(cls_idx).to_s + "LL})"
+      end
+    end
+ # `<primitive>.class` -- map each primitive type to its builtin
+ # class. Issue #715.
+    if mname == "class"
+      prim_class_name_pc = ""
+      bt_pc = base_type(recv_type)
+      if bt_pc == "int" || bt_pc == "bigint"
+        prim_class_name_pc = "Integer"
+      elsif bt_pc == "float"
+        prim_class_name_pc = "Float"
+      elsif bt_pc == "string" || bt_pc == "mutable_str"
+        prim_class_name_pc = "String"
+      elsif bt_pc == "symbol"
+        prim_class_name_pc = "Symbol"
+      elsif bt_pc == "bool"
+        prim_class_name_pc = "TrueClass"
+ # bool's runtime class is TrueClass / FalseClass depending on
+ # the value; emit a ternary so the static cls_id picks at runtime.
+        @needs_class_table = 1
+        bid_t = builtin_class_id_for_name("TrueClass")
+        bid_f = builtin_class_id_for_name("FalseClass")
+        if bid_t >= 0 && bid_f >= 0
+          return "((" + rc + ") ? ((sp_Class){" + bid_t.to_s + "LL}) : ((sp_Class){" + bid_f.to_s + "LL}))"
+        end
+      elsif bt_pc == "nil"
+        prim_class_name_pc = "NilClass"
+      elsif bt_pc == "range"
+        prim_class_name_pc = "Range"
+      elsif bt_pc == "time"
+        prim_class_name_pc = "Time"
+      elsif is_array_type(bt_pc) == 1
+        prim_class_name_pc = "Array"
+      elsif is_hash_type(bt_pc) == 1
+        prim_class_name_pc = "Hash"
+      elsif bt_pc == "proc" || bt_pc == "lambda"
+        prim_class_name_pc = "Proc"
+      end
+      if prim_class_name_pc != ""
+        bid_pc = builtin_class_id_for_name(prim_class_name_pc)
+        if bid_pc >= 0
+          @needs_class_table = 1
+          return "((sp_Class){" + bid_pc.to_s + "LL})"
+        end
       end
     end
  # Object method calls
@@ -26145,6 +26219,13 @@ class Compiler
             if is_last_param == 1 && positional_ids.length <= k
               treat_as_rest = 1
             end
+ # Middle splat (def f(a, *b, c)): there are trailing fixed params
+ # after the rest slot. The rest slot always gets *some* args (may be
+ # empty), so fire the rest path even when total arg count equals
+ # pname count. Issue #710.
+            if is_last_param == 0
+              treat_as_rest = 1
+            end
             if treat_as_rest == 1
  # Fast path: the only positional is a splat whose source is
  # already an int_array. Pass it directly without copying.
@@ -26163,8 +26244,16 @@ class Compiler
               @needs_gc = 1
               tmp = new_temp
               emit("  sp_IntArray *" + tmp + " = sp_IntArray_new();")
+ # Leave args for trailing positional params after the rest.
+ # `def g(a, *b, c)` -- the splat takes the middle, c gets the
+ # final arg. Issue #710.
+              trailing_after_rest = pnames.length - 1 - rest_param_idx
+              if trailing_after_rest < 0
+                trailing_after_rest = 0
+              end
+              splat_end = positional_ids.length - trailing_after_rest
               pi = k
-              while pi < positional_ids.length
+              while pi < splat_end
                 if @nd_type[positional_ids[pi]] == "SplatNode"
                   src_expr2 = @nd_expression[positional_ids[pi]]
                   if src_expr2 >= 0
@@ -26176,6 +26265,25 @@ class Compiler
                 pi = pi + 1
               end
               result = result + tmp
+ # Rebuild positional_ids so post-splat indices align with the
+ # remaining ptypes. positional_ids[k] (the rest_param slot) is
+ # left as-is (already consumed via the splat tmp above); new
+ # entries at k+1.. pull from positional_ids[splat_end..].
+              new_pos = []
+              ni = 0
+              while ni < k
+                new_pos.push(positional_ids[ni])
+                ni = ni + 1
+              end
+ # Placeholder for the rest_param slot itself; never read because
+ # the outer loop's next iteration starts at k+1.
+              new_pos.push(positional_ids[k])
+              trailing_pi = splat_end
+              while trailing_pi < positional_ids.length
+                new_pos.push(positional_ids[trailing_pi])
+                trailing_pi = trailing_pi + 1
+              end
+              positional_ids = new_pos
               k = k + 1
               next
             end
