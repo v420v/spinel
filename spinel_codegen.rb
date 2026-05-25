@@ -2815,6 +2815,34 @@ class Compiler
         end
       end
     end
+ # Specialization-scope override: when a class method body
+ # (e.g. `def self.from_row(row)`) is reused across multiple
+ # subclass specializations, the per-call-site specialization
+ # narrows the `row` param to `obj_<CommentRow>` / `obj_<ArticleRow>`
+ # etc. via declare_var in emit_class_level_method. But the
+ # @nd_inferred_type cache was populated once during analyze with
+ # the unspecialized union (often "int" — the unconstrained fallback),
+ # so `row.commenter` reads back as int and the boxer dispatch
+ # picks sp_box_int on a string field. Re-resolve `LV.attr_reader`
+ # against the active scope when the scope's declared type is a
+ # concrete obj_<C> that the analyze-time union missed.
+    if @nd_type[nid] == "CallNode"
+      cmt_recv_id = @nd_receiver[nid]
+      if cmt_recv_id >= 0 && @nd_type[cmt_recv_id] == "LocalVariableReadNode"
+        cmt_lvname = @nd_name[cmt_recv_id]
+        cmt_scope_t = find_var_type(cmt_lvname)
+        if is_obj_type(cmt_scope_t) == 1
+          cmt_cname = cmt_scope_t[4, cmt_scope_t.length - 4]
+          cmt_ci = find_class_idx(cmt_cname)
+          if cmt_ci >= 0
+            cmt_mname = @nd_name[nid]
+            if cls_has_attr_reader(cmt_ci, cmt_mname) == 1
+              return cls_ivar_type(cmt_ci, "@" + cmt_mname)
+            end
+          end
+        end
+      end
+    end
  # Cache lookup. analyze.rb's annotate_all_node_types fills
  # @nd_inferred_type for every reachable node OUTSIDE block bodies
  # (block-iteration scope is iterator-specific and dispatched at
@@ -9172,14 +9200,29 @@ class Compiler
     j = 0
     while j < names.length
       if j < types.length
-        kind = gc_trace_kind(types[j])
-        field = "self->" + sanitize_ivar(names[j])
-        if kind == "poly"
-          emit_raw("  " + field + " = sp_box_nil();")
-        elsif kind == "ptr"
-          emit_raw("  " + field + " = NULL;")
-        elsif kind == "value_type"
-          emit_raw("  " + field + " = (" + c_type(types[j]) + "){0};")
+ # Skip ivars already cleared by the parent chain walk above.
+ # The struct field uses the parent's declared type (parent-fields-
+ # first layout in emit_class_fields skips child-side dups), so the
+ # parent's init is the one that matches the actual slot type. A
+ # second init from the child side reads the child's narrower type
+ # table and emits e.g. `NULL` for an sp_RbVal slot — a C type error.
+        in_parent = 0
+        if @cls_parents[ci] != ""
+          pi_dup = find_class_idx(@cls_parents[ci])
+          if pi_dup >= 0 && ivar_in_chain(pi_dup, names[j]) == 1
+            in_parent = 1
+          end
+        end
+        if in_parent == 0
+          kind = gc_trace_kind(types[j])
+          field = "self->" + sanitize_ivar(names[j])
+          if kind == "poly"
+            emit_raw("  " + field + " = sp_box_nil();")
+          elsif kind == "ptr"
+            emit_raw("  " + field + " = NULL;")
+          elsif kind == "value_type"
+            emit_raw("  " + field + " = (" + c_type(types[j]) + "){0};")
+          end
         end
       end
       j = j + 1
