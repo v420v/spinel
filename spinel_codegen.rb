@@ -12118,6 +12118,13 @@ class Compiler
     if t == "void" || t == "nil"
       return "FALSE"
     end
+ # `int?` uses the SP_INT_NIL sentinel, not NULL — comparing the
+ # mrb_int slot to NULL warns -Wint-conversion and is semantically
+ # wrong (SP_INT_NIL is INT64_MIN, not 0). Route through the
+ # scalar-nullable arm.
+    if is_scalar_nullable_type(t) == 1
+      return "(!sp_int_is_nil(" + expr + "))"
+    end
     if is_nullable_type(t) == 1
       return "(" + expr + " != NULL)"
     end
@@ -12151,6 +12158,10 @@ class Compiler
     end
     if t == "nil"
       return "FALSE"
+    end
+ # See compile_cond_expr -- `int?` uses SP_INT_NIL, not NULL.
+    if is_scalar_nullable_type(t) == 1
+      return "(!sp_int_is_nil(" + expr + "))"
     end
     if is_nullable_type(t) == 1 || type_is_pointer(t) == 1
       return "(" + expr + " != NULL)"
