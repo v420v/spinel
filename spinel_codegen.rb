@@ -19483,6 +19483,95 @@ class Compiler
       end
       return "sp_str_include(" + rc + ", " + compile_arg0(nid) + ")"
     end
+    if mname == "gsub" || mname == "sub"
+ # Issue #849: block form. The block receives each matched
+ # substring and returns its replacement. Inline the re_exec
+ # loop and splice the block's result into a growing buffer.
+      if @nd_block[nid] >= 0
+        args_id_gb = @nd_arguments[nid]
+        if args_id_gb >= 0
+          a_gb = get_args(args_id_gb)
+          if a_gb.length >= 1
+            rpat_gb = regex_pat_c_expr(a_gb[0])
+            if rpat_gb != ""
+              bp_gb = get_block_param(nid, 0)
+              if bp_gb == ""
+                bp_gb = "_m"
+              end
+              out_gb = new_temp
+              cap_gb = new_temp
+              olen_gb = new_temp
+              pos_gb = new_temp
+              caps_gb = new_temp
+              n_gb = new_temp
+              before_gb = new_temp
+              mlen_gb = new_temp
+              mbuf_gb = new_temp
+              rep_gb = new_temp
+              rlen_gb = new_temp
+              slen_gb = new_temp
+              did_gb = new_temp
+              rest_gb = new_temp
+              emit("  size_t " + cap_gb + " = strlen(" + rc + ") * 2 + 64;")
+              emit("  char *" + out_gb + " = sp_str_alloc_raw(" + cap_gb + ");")
+              emit("  size_t " + olen_gb + " = 0;")
+              emit("  int64_t " + pos_gb + " = 0;")
+              emit("  int64_t " + slen_gb + " = (int64_t)strlen(" + rc + ");")
+              emit("  int " + caps_gb + "[64];")
+              if mname == "sub"
+                emit("  int " + did_gb + " = 0;")
+              end
+              emit("  while (" + pos_gb + " <= " + slen_gb + ") {")
+              if mname == "sub"
+                emit("    if (" + did_gb + ") break;")
+              end
+              emit("    int " + n_gb + " = re_exec(" + rpat_gb + ", " + rc + ", " + slen_gb + ", " + pos_gb + ", " + caps_gb + ", 64);")
+              emit("    if (" + n_gb + " <= 0 || " + caps_gb + "[0] < 0) break;")
+              emit("    size_t " + before_gb + " = " + caps_gb + "[0] - " + pos_gb + ";")
+              emit("    int " + mlen_gb + " = " + caps_gb + "[1] - " + caps_gb + "[0];")
+              emit("    char *" + mbuf_gb + " = sp_str_alloc_raw(" + mlen_gb + " + 1);")
+              emit("    memcpy(" + mbuf_gb + ", " + rc + " + " + caps_gb + "[0], " + mlen_gb + ");")
+              emit("    " + mbuf_gb + "[" + mlen_gb + "] = 0;")
+              emit("    sp_re_set_captures(" + rc + ", " + caps_gb + ", " + n_gb + " / 2);")
+              emit("    const char *lv_" + bp_gb + " = " + mbuf_gb + ";")
+              @indent = @indent + 1
+              push_scope
+              declare_var(bp_gb, "string")
+              bbody_gb = @nd_body[@nd_block[nid]]
+              bexpr_gb = "\"\""
+              if bbody_gb >= 0
+                bs_gb = get_stmts(bbody_gb)
+                k_gb = 0
+                while k_gb < bs_gb.length - 1
+                  compile_stmt(bs_gb[k_gb])
+                  k_gb = k_gb + 1
+                end
+                if bs_gb.length > 0
+                  bexpr_gb = compile_expr(bs_gb.last)
+                end
+              end
+              emit("    const char *" + rep_gb + " = " + bexpr_gb + ";")
+              pop_scope
+              @indent = @indent - 1
+              emit("    size_t " + rlen_gb + " = strlen(" + rep_gb + ");")
+              emit("    if (" + olen_gb + " + " + before_gb + " + " + rlen_gb + " + 1 >= " + cap_gb + ") { " + cap_gb + " = (" + olen_gb + " + " + before_gb + " + " + rlen_gb + ") * 2 + 64; " + out_gb + " = (char*)realloc(" + out_gb + ", " + cap_gb + "); }")
+              emit("    memcpy(" + out_gb + " + " + olen_gb + ", " + rc + " + " + pos_gb + ", " + before_gb + "); " + olen_gb + " += " + before_gb + ";")
+              emit("    memcpy(" + out_gb + " + " + olen_gb + ", " + rep_gb + ", " + rlen_gb + "); " + olen_gb + " += " + rlen_gb + ";")
+              emit("    " + pos_gb + " = " + caps_gb + "[1]; if (" + caps_gb + "[0] == " + caps_gb + "[1]) " + pos_gb + "++;")
+              if mname == "sub"
+                emit("    " + did_gb + " = 1;")
+              end
+              emit("  }")
+              emit("  { size_t " + rest_gb + " = " + slen_gb + " - " + pos_gb + ";")
+              emit("    if (" + olen_gb + " + " + rest_gb + " + 1 >= " + cap_gb + ") { " + cap_gb + " = " + olen_gb + " + " + rest_gb + " + 64; " + out_gb + " = (char*)realloc(" + out_gb + ", " + cap_gb + "); }")
+              emit("    memcpy(" + out_gb + " + " + olen_gb + ", " + rc + " + " + pos_gb + ", " + rest_gb + "); " + olen_gb + " += " + rest_gb + ";")
+              emit("    " + out_gb + "[" + olen_gb + "] = 0; }")
+              return out_gb
+            end
+          end
+        end
+      end
+    end
     if mname == "gsub"
       args_id = @nd_arguments[nid]
       if args_id >= 0

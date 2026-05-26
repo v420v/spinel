@@ -30074,6 +30074,11 @@ class Compiler
     if mname == "each_line"
       return "string"
     end
+ # Issue #849: gsub/sub block form. Each match is yielded as
+ # a string to the block; block returns the replacement string.
+    if mname == "gsub" || mname == "sub"
+      return "string"
+    end
     if mname == "each_pair"
  # Hash#each_pair: key, value. Mirror scan_locals.
       if recv_t == "str_int_hash"
