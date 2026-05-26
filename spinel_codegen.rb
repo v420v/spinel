@@ -3982,8 +3982,20 @@ class Compiler
   end
 
   def tuple_c_name(t)
- # "tuple:int,string" → "sp_Tuple_int_string"
-    "sp_Tuple_" + tuple_elem_types_str(t).split(",", -1).join("_")
+ # "tuple:int,string" → "sp_Tuple_int_string". base_type strips
+ # nullable `?` suffixes: a tuple of int? has the same C storage
+ # as a tuple of int (mrb_int either way; the nil sentinel lives
+ # in-band as SP_INT_NIL). Without this an int_array#pop return
+ # widens the surrounding tuple type to `sp_Tuple_int?_...` whose
+ # `?` is an illegal C identifier char. #832 follow-up.
+    parts = tuple_elem_types_str(t).split(",", -1)
+    out = "".split(",", -1)
+    k = 0
+    while k < parts.length
+      out.push(base_type(parts[k]))
+      k = k + 1
+    end
+    "sp_Tuple_" + out.join("_")
   end
 
  # Whether a tuple element type must be traced by the GC scan function.
