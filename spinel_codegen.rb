@@ -15704,6 +15704,24 @@ class Compiler
       if mname == "to_s"
         return rc + "->data"
       end
+ # Issues #740, #741: mutating methods on mutable_str.
+      if mname == "prepend" || mname == "<<" || mname == "concat"
+        arg0_ms = compile_arg0(nid)
+        helper_ms = (mname == "prepend") ? "sp_String_prepend" : "sp_String_append"
+        return "(" + helper_ms + "(" + rc + ", " + arg0_ms + "), " + rc + ")"
+      end
+      if mname == "insert"
+        args_id_ms = @nd_arguments[nid]
+        if args_id_ms >= 0
+          aargs_ms = get_args(args_id_ms)
+          if aargs_ms.length >= 2
+            return "(sp_String_insert(" + rc + ", " + compile_expr(aargs_ms[0]) + ", " + compile_expr(aargs_ms[1]) + "), " + rc + ")"
+          end
+        end
+      end
+      if mname == "replace"
+        return "(sp_String_replace(" + rc + ", " + compile_arg0(nid) + "), " + rc + ")"
+      end
  # For all other string methods, convert via ->data
       r = compile_string_method_expr(nid, mname, rc + "->data")
       if r != ""

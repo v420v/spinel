@@ -26675,9 +26675,12 @@ class Compiler
         end
       end
     end
- # Detect << on string local variable: widen to mutable_str
+ # Detect mutating method on string local variable: widen to
+ # mutable_str. Issues #740, #741 extend this to prepend/insert.
     if @nd_type[nid] == "CallNode"
-      if @nd_name[nid] == "<<"
+      mname_mu = @nd_name[nid]
+      if mname_mu == "<<" || mname_mu == "prepend" || mname_mu == "insert" ||
+         mname_mu == "concat" || mname_mu == "replace"
         recv = @nd_receiver[nid]
         if recv >= 0
           if @nd_type[recv] == "LocalVariableReadNode"
