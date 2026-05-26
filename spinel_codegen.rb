@@ -19680,8 +19680,26 @@ class Compiler
     if mname == "to_f"
       return "(mrb_float)(" + rc + ")"
     end
-    if mname == "abs"
+    if mname == "abs" || mname == "magnitude"
       return "((" + rc + ") < 0 ? -(" + rc + ") : (" + rc + "))"
+    end
+    if mname == "modulo"
+      return "sp_imod(" + rc + ", " + compile_arg0(nid) + ")"
+    end
+    if mname == "remainder"
+ # Ruby's Integer#remainder uses truncated division (C `%`),
+ # which differs from `%` (Ruby) / sp_imod (floored division)
+ # for mixed-sign operands: -7.remainder(3) == -1.
+      arg_rem = compile_arg0(nid)
+      return "((" + rc + ") - (((" + rc + ") / (" + arg_rem + ")) * (" + arg_rem + ")))"
+    end
+ # Integer#size: bytes used to represent the integer. Spinel
+ # stores mrb_int as int64, so always 8 on every supported
+ # target. CRuby distinguishes Fixnum (machine word) from Bignum
+ # (variable), but spinel's fixnum range is the whole 64-bit
+ # space anyway. Issue #860.
+    if mname == "size"
+      return "8"
     end
     if mname == "even?"
       return "((" + rc + ") % 2 == 0)"
@@ -19707,6 +19725,20 @@ class Compiler
     end
     if mname == "lcm"
       return "sp_lcm(" + rc + ", " + compile_arg0(nid) + ")"
+    end
+ # Integer#gcdlcm: [gcd, lcm]. Emitted as a tuple value via the
+ # same registered-tuple path divmod uses. Issue #894.
+    if mname == "gcdlcm"
+      tt_gl = "tuple:int,int"
+      register_tuple_type(tt_gl)
+      @needs_gc = 1
+      name_gl = tuple_c_name(tt_gl)
+      arg_gl = compile_arg0(nid)
+      tmp_gl = new_temp
+      emit("  " + name_gl + " *" + tmp_gl + " = (" + name_gl + " *)sp_gc_alloc(sizeof(" + name_gl + "), NULL, " + tuple_scan_name(tt_gl) + ");")
+      emit("  " + tmp_gl + "->_0 = sp_gcd(" + rc + ", " + arg_gl + ");")
+      emit("  " + tmp_gl + "->_1 = sp_lcm(" + rc + ", " + arg_gl + ");")
+      return tmp_gl
     end
     if mname == "ceildiv"
       return "sp_ceildiv(" + rc + ", " + compile_arg0(nid) + ")"

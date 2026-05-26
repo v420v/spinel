@@ -3769,7 +3769,10 @@ class Compiler
     if mname == "allbits?" || mname == "anybits?" || mname == "nobits?"
       return 1
     end
-    if mname == "gcd" || mname == "lcm" || mname == "ceildiv" || mname == "div" || mname == "clamp"
+    if mname == "gcd" || mname == "lcm" || mname == "gcdlcm" || mname == "ceildiv" || mname == "div" || mname == "clamp"
+      return 1
+    end
+    if mname == "magnitude" || mname == "modulo" || mname == "remainder" || mname == "size"
       return 1
     end
     if mname == "itself" || mname == "then" || mname == "yield_self"
@@ -4392,7 +4395,7 @@ class Compiler
     if mname == "nil?"
       return "bool"
     end
-    if mname == "abs"
+    if mname == "abs" || mname == "magnitude"
       if recv >= 0
         lt = infer_type(recv)
         if lt == "float"
@@ -4400,6 +4403,29 @@ class Compiler
         end
       end
       return "int"
+    end
+    if mname == "modulo" || mname == "remainder"
+      if recv >= 0
+        lt = infer_type(recv)
+        if lt == "float"
+          return "float"
+        end
+      end
+      return "int"
+    end
+ # Integer#size: bytes used to represent the int. Spinel
+ # mrb_int is always 64-bit, so it's a constant 8. Issue #860.
+    if mname == "size" && recv >= 0
+      rt_sz = infer_type(recv)
+      if rt_sz == "int"
+        return "int"
+      end
+    end
+ # Integer#gcdlcm returns [gcd, lcm] as a tuple value. Issue #894.
+    if mname == "gcdlcm"
+      tt_gl_inf = "tuple:int,int"
+      register_tuple_type(tt_gl_inf)
+      return "tuple:int,int"
     end
     if mname == "**" || mname == "pow"
       if recv >= 0
