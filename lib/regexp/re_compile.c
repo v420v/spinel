@@ -45,8 +45,19 @@ static uint32_t
 emit(re_compiler *c, uint8_t op, uint8_t a, uint16_t offset)
 {
   if (c->code_len >= c->code_capa) {
-    c->code_capa = c->code_capa ? c->code_capa * 2 : 64;
-    c->code = (re_inst*)realloc(c->code, sizeof(re_inst) * c->code_capa);
+    /* Issue #821: detect uint32_t overflow on doubling. The previous
+       form silently wrapped to a small value (e.g. 2^31 doubles to
+       0), realloc'd a tiny buffer, then wrote past it. Cap at
+       (UINT32_MAX / 2) before doubling so the next * 2 stays in
+       range; if we're already past that, raise instead of overflowing. */
+    if (c->code_capa > (uint32_t)0x40000000u) {
+      compile_error(c, "regexp too large");
+    }
+    uint32_t new_capa = c->code_capa ? c->code_capa * 2 : 64;
+    re_inst *nc = (re_inst*)realloc(c->code, sizeof(re_inst) * new_capa);
+    if (!nc) compile_error(c, "regexp too large");
+    c->code = nc;
+    c->code_capa = new_capa;
   }
   uint32_t pos = c->code_len++;
   c->code[pos].op = op;
