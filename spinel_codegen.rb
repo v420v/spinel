@@ -18817,6 +18817,25 @@ class Compiler
     if mname == "chomp!"
       return compile_string_method_expr(nid, "chomp", rc)
     end
+ # String#<=> dispatches to strcmp clamped to -1/0/1.
+ # Issue #900. Symmetric to the int / sym arms.
+    if mname == "<=>"
+      args_id_scmp = @nd_arguments[nid]
+      if args_id_scmp >= 0
+        a_scmp = get_args(args_id_scmp)
+        if a_scmp.length >= 1
+          arg_t_scmp = infer_type(a_scmp[0])
+          if arg_t_scmp == "string" || arg_t_scmp == "mutable_str"
+            arg_e_scmp = compile_expr(a_scmp[0])
+            if arg_t_scmp == "mutable_str"
+              arg_e_scmp = "(" + arg_e_scmp + ")->data"
+            end
+            cmp_scmp = "strcmp(" + rc + ", " + arg_e_scmp + ")"
+            return "((" + cmp_scmp + ") < 0 ? (mrb_int)-1 : ((" + cmp_scmp + ") > 0 ? (mrb_int)1 : (mrb_int)0))"
+          end
+        end
+      end
+    end
  # is_a? / kind_of? / instance_of? for primitive String. Decide at
  # compile time based on Ruby's class hierarchy (String < Comparable
  # < Object). Anything outside that chain is FALSE.
