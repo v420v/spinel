@@ -31444,6 +31444,18 @@ class Compiler
  # tmp, tripping the C compile.
           elsif @nd_type[cid] == "ConstantReadNode" && not_in(@nd_name[cid], @builtin_class_names) == 0
             result = result + (@nd_name[cid] == "String" ? "1" : "0")
+ # Issue #852: `case <string> when /regex/` -- Regexp#=== runs
+ # the regex against the receiver. Route through sp_re_match_p.
+ # Without this, the generic strcmp arm passed `0` (compile_expr
+ # fallback for RegularExpressionNode) and segfaulted.
+          elsif @nd_type[cid] == "RegularExpressionNode" || @nd_type[cid] == "InterpolatedRegularExpressionNode"
+            rpat_w = regex_pat_c_expr(cid)
+            if rpat_w != ""
+              @needs_regexp = 1
+              result = result + "sp_re_match_p(" + rpat_w + ", " + tmp + ")"
+            else
+              result = result + "0"
+            end
           else
             result = result + "strcmp(" + tmp + ", " + compile_expr(cid) + ") == 0"
           end
