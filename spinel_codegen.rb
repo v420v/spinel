@@ -296,6 +296,12 @@ class Compiler
  # Mirror of @meth_param_empty for class methods. Pipe-separated by
  # method, comma-separated by param. .
     @cls_meth_ptypes_empty = "".split(",", -1)
+ # Prepend chain (issue #720): per-class mapping from a Ruby
+ # method name to the ordered list of synthetic shadow names
+ # registered by analyze. compile_super_expr consults this to
+ # redirect super calls inside prepended methods to the next
+ # shadow in the chain. See spinel_analyze.rb prep_snapshot_active.
+    @cls_meth_prep_chain = "".split(",", -1)
     @cls_attr_readers = "".split(",", -1)
     @cls_attr_writers = "".split(",", -1)
     @cls_cmeth_names = "".split(",", -1)
@@ -2912,13 +2918,24 @@ class Compiler
  # returns. Walk to the parent's `find_method_owner`-resolved
  # method and read its return type.
       if @current_class_idx >= 0 && @current_method_name != ""
+ # Prepend chain redirect (issue #720): when inside a prepended
+ # method or a shadow, super dispatches to a synthetic on the
+ # same class. Mirror the spinel_analyze.rb arm.
+        prep_target_st = prep_super_target(@current_class_idx, @current_method_name)
+        if prep_target_st != ""
+          ret_pt = cls_method_return(@current_class_idx, prep_target_st)
+          if ret_pt != ""
+            return ret_pt
+          end
+        end
+        super_mname_st = prep_super_parent_mname(@current_class_idx, @current_method_name)
         parent_name_st = @cls_parents[@current_class_idx]
         if parent_name_st != ""
           parent_ci_st = find_class_idx(parent_name_st)
           if parent_ci_st >= 0
-            owner_st = find_method_owner(parent_ci_st, @current_method_name)
+            owner_st = find_method_owner(parent_ci_st, super_mname_st)
             if owner_st != ""
-              ret_st = cls_method_return(find_class_idx(owner_st), @current_method_name)
+              ret_st = cls_method_return(find_class_idx(owner_st), super_mname_st)
               if ret_st != ""
                 return ret_st
               end
@@ -13733,6 +13750,23 @@ class Compiler
     if @current_class_idx < 0 || @current_method_name == ""
       return "0"
     end
+    mname_su = @current_method_name
+ # Prepend chain redirect (issue #720). When inside an active
+ # prepended method or a shadow, super dispatches to a synthetic
+ # method on the same class instead of walking the parent chain.
+    prep_target_name = prep_super_target(@current_class_idx, mname_su)
+    if prep_target_name != ""
+      blk_pr = @nd_block[nid]
+      if blk_pr >= 0 && @nd_type[blk_pr] == "BlockNode"
+        $stderr.puts "warning: super { block } from a prepended method is not yet supported (issue #720 v1); falling back to bare super"
+      end
+      return compile_super_prep_call(nid, t, @current_class_idx, prep_target_name, mname_su)
+    end
+ # When the current method is a shadow at chain index 0 (no more
+ # on-class shadows), super falls through to the parent class,
+ # but the parent-side lookup must use the original user mname,
+ # not the synthetic name. For non-shadows this is a no-op.
+    parent_lookup_mname = prep_super_parent_mname(@current_class_idx, mname_su)
     parent_name = @cls_parents[@current_class_idx]
     if parent_name == ""
       return "0"
@@ -13741,8 +13775,7 @@ class Compiler
     if parent_ci < 0
       return "0"
     end
-    mname_su = @current_method_name
-    owner_su = find_method_owner(parent_ci, mname_su)
+    owner_su = find_method_owner(parent_ci, parent_lookup_mname)
     if owner_su == ""
       return "0"
     end
@@ -13756,7 +13789,7 @@ class Compiler
     if blk_su >= 0 && @nd_type[blk_su] == "BlockNode"
       owner_ci_su = find_class_idx(owner_su)
       if owner_ci_su >= 0
-        midx_su = cls_find_method_direct(owner_ci_su, mname_su)
+        midx_su = cls_find_method_direct(owner_ci_su, parent_lookup_mname)
         if midx_su >= 0
           return compile_super_with_block_inline(nid, t, owner_ci_su, midx_su, blk_su)
         end
@@ -13796,10 +13829,54 @@ class Compiler
     yargs_su = ""
     owner_ci_su2 = find_class_idx(owner_su)
     if owner_ci_su2 >= 0
-      midx_su2 = cls_find_method_direct(owner_ci_su2, mname_su)
+      midx_su2 = cls_find_method_direct(owner_ci_su2, parent_lookup_mname)
       yargs_su = cls_call_yargs(owner_ci_su2, midx_su2)
     end
-    "sp_" + owner_su + "_" + sanitize_name(mname_su) + "(" + cast_self + args_c + yargs_su + ")"
+    "sp_" + owner_su + "_" + sanitize_name(parent_lookup_mname) + "(" + cast_self + args_c + yargs_su + ")"
+  end
+
+ # Emit a super call routed through the prepend chain. target_name
+ # is a synthetic shadow on the current class ci. Same-class call
+ # so the self cast is `(sp_<ci> *)self`. Args are forwarded the
+ # same way as a regular super.
+  def compile_super_prep_call(nid, t, ci, target_name, cur_mname)
+    cname = @cls_names[ci]
+    if @cls_is_value_type[ci] == 1
+      cast_self = "self"
+    else
+      cast_self = "self"
+    end
+    args_c = ""
+    if t == "ForwardingSuperNode"
+      cur_params = @cls_meth_params[ci].split("|", -1)
+      midx_cur = cls_find_method_direct(ci, cur_mname)
+      if midx_cur >= 0 && midx_cur < cur_params.length
+        pn_list = cur_params[midx_cur].split(",", -1)
+        pi_pr = 0
+        while pi_pr < pn_list.length
+          if pn_list[pi_pr] != ""
+            args_c = args_c + ", lv_" + pn_list[pi_pr]
+          end
+          pi_pr = pi_pr + 1
+        end
+      end
+    else
+      args_id_pr = @nd_arguments[nid]
+      if args_id_pr >= 0
+        a_ids_pr = get_args(args_id_pr)
+        ai_pr = 0
+        while ai_pr < a_ids_pr.length
+          args_c = args_c + ", " + compile_expr(a_ids_pr[ai_pr])
+          ai_pr = ai_pr + 1
+        end
+      end
+    end
+    yargs_pr = ""
+    midx_target = cls_find_method_direct(ci, target_name)
+    if midx_target >= 0
+      yargs_pr = cls_call_yargs(ci, midx_target)
+    end
+    "sp_" + cname + "_" + target_name + "(" + cast_self + args_c + yargs_pr + ")"
   end
 
  # `super { ... }` lowering. Mirrors compile_yield_call_expr but reads
@@ -27675,6 +27752,137 @@ class Compiler
       end
     end
     ""
+  end
+
+ # --- prepend chain helpers (mirror of spinel_analyze.rb) ----------
+ # The chain is materialized into @cls_meth_prep_chain by analyze.
+ # See spinel_analyze.rb prep_snapshot_active for the storage shape.
+
+ # List of synthetic shadow names for (ci, mname). Index 0 is the
+ # oldest snapshot (closest to parent); the highest index is the
+ # newest (next super target from the active method).
+  def prep_chain_syn_names(ci, mname)
+    result = "".split(",", -1)
+    if ci < 0 || ci >= @cls_meth_prep_chain.length
+      return result
+    end
+    chain_str = @cls_meth_prep_chain[ci]
+    if chain_str == ""
+      return result
+    end
+    entries = chain_str.split(";", -1)
+    ei = 0
+    while ei < entries.length
+      eq_pos = entries[ei].index("=")
+      if eq_pos != nil
+        em = entries[ei][0, eq_pos]
+        if em == mname
+          syns_str = entries[ei][eq_pos + 1, entries[ei].length - eq_pos - 1]
+          return syns_str.split(",", -1)
+        end
+      end
+      ei = ei + 1
+    end
+    result
+  end
+
+ # Reverse lookup -- source user mname for a synthetic shadow on
+ # class ci. "" if syn_name is not a shadow.
+  def prep_syn_source_mname(ci, syn_name)
+    if ci < 0 || ci >= @cls_meth_prep_chain.length
+      return ""
+    end
+    chain_str = @cls_meth_prep_chain[ci]
+    if chain_str == ""
+      return ""
+    end
+    entries = chain_str.split(";", -1)
+    ei = 0
+    while ei < entries.length
+      eq_pos = entries[ei].index("=")
+      if eq_pos != nil
+        em = entries[ei][0, eq_pos]
+        syns_str = entries[ei][eq_pos + 1, entries[ei].length - eq_pos - 1]
+        syns = syns_str.split(",", -1)
+        si = 0
+        while si < syns.length
+          if syns[si] == syn_name
+            return em
+          end
+          si = si + 1
+        end
+      end
+      ei = ei + 1
+    end
+    ""
+  end
+
+ # Position in chain (0 = oldest = deepest from active) for a
+ # synthetic shadow on ci. -1 if syn_name is not a shadow.
+  def prep_syn_position(ci, syn_name)
+    if ci < 0 || ci >= @cls_meth_prep_chain.length
+      return -1
+    end
+    chain_str = @cls_meth_prep_chain[ci]
+    if chain_str == ""
+      return -1
+    end
+    entries = chain_str.split(";", -1)
+    ei = 0
+    while ei < entries.length
+      eq_pos = entries[ei].index("=")
+      if eq_pos != nil
+        syns_str = entries[ei][eq_pos + 1, entries[ei].length - eq_pos - 1]
+        syns = syns_str.split(",", -1)
+        si = 0
+        while si < syns.length
+          if syns[si] == syn_name
+            return si
+          end
+          si = si + 1
+        end
+      end
+      ei = ei + 1
+    end
+    -1
+  end
+
+ # Synthetic on-class super target for (ci, cur_mname). Returns
+ # the shadow name to call (always a method on ci) or "" to mean
+ # "fall through to the parent class".
+  def prep_super_target(ci, cur_mname)
+    if ci < 0 || ci >= @cls_meth_prep_chain.length
+      return ""
+    end
+    if @cls_meth_prep_chain[ci] == ""
+      return ""
+    end
+    pos = prep_syn_position(ci, cur_mname)
+    if pos >= 0
+      if pos > 0
+        src_mname = prep_syn_source_mname(ci, cur_mname)
+        syns = prep_chain_syn_names(ci, src_mname)
+        if pos - 1 < syns.length
+          return syns[pos - 1]
+        end
+      end
+      return ""
+    end
+    syns = prep_chain_syn_names(ci, cur_mname)
+    if syns.length > 0
+      return syns[syns.length - 1]
+    end
+    ""
+  end
+
+ # When super walks past the synthetic to the parent, the parent
+ # lookup uses the original user mname.
+  def prep_super_parent_mname(ci, cur_mname)
+    src = prep_syn_source_mname(ci, cur_mname)
+    if src != ""
+      return src
+    end
+    cur_mname
   end
 
  # `recv OP rhs` lowering for an obj-typed receiver. When the
@@ -42046,6 +42254,8 @@ class Compiler
       @cls_meth_defaults = val
     elsif name == "@cls_meth_ptypes_empty"
       @cls_meth_ptypes_empty = val
+    elsif name == "@cls_meth_prep_chain"
+      @cls_meth_prep_chain = val
     elsif name == "@cls_attr_readers"
       @cls_attr_readers = val
     elsif name == "@cls_attr_writers"

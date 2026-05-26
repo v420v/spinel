@@ -261,6 +261,20 @@ class Compiler
  # Mirror of @meth_param_empty for class methods. Pipe-separated by
  # method, comma-separated by param. .
     @cls_meth_ptypes_empty = "".split(",", -1)
+ # Per-class prepend chain table. Issue #720 follow-up: when
+ # `prepend M` overrides C's existing method `m`, the original
+ # body is registered as a synthetic shadow method on C named
+ # `__prep_<sanitize(m)>_<idx>` (idx = insertion order, 0 = first
+ # snapshot taken). The chain table stores per-class entries of
+ # the form `<mname>:<idx0>,<idx1>,...;<mname2>:...` so that
+ # super-from-prepended dispatch can locate the next shadow in
+ # the chain. Higher idx = closer to the active method; super
+ # from active calls highest idx, super from shadow at idx k
+ # calls k-1, super from idx 0 falls to the parent chain.
+    @cls_meth_prep_chain = "".split(",", -1)
+ # When 1, append_cls_meth suppresses its redefinition warning
+ # (the overwrite is the explicit semantics of `prepend M`).
+    @prep_overwrite_in_progress = 0
     @cls_attr_readers = "".split(",", -1)
     @cls_attr_writers = "".split(",", -1)
     @cls_cmeth_names = "".split(",", -1)
@@ -1934,13 +1948,28 @@ class Compiler
  # returns. Walk to the parent's `find_method_owner`-resolved
  # method and read its return type.
       if @current_class_idx >= 0 && @current_method_name != ""
+ # Prepend chain redirect (issue #720). When inside a prepended
+ # method on C, super calls the next shadow on C; when inside a
+ # shadow, super calls the next-older shadow (lower index) or
+ # falls to the parent walk at index 0.
+        prep_target = prep_super_target(@current_class_idx, @current_method_name)
+        if prep_target != ""
+          ret_pt = cls_method_return(@current_class_idx, prep_target)
+          if ret_pt != ""
+            return ret_pt
+          end
+        end
         parent_name_st = @cls_parents[@current_class_idx]
         if parent_name_st != ""
           parent_ci_st = find_class_idx(parent_name_st)
           if parent_ci_st >= 0
-            owner_st = find_method_owner(parent_ci_st, @current_method_name)
+ # When inside a shadow whose chain index is 0 (deepest), the
+ # super walks past the synthetic and reads the parent's method
+ # under the *original* user mname, not the synthetic name.
+            super_mname = prep_super_parent_mname(@current_class_idx, @current_method_name)
+            owner_st = find_method_owner(parent_ci_st, super_mname)
             if owner_st != ""
-              ret_st = cls_method_return(find_class_idx(owner_st), @current_method_name)
+              ret_st = cls_method_return(find_class_idx(owner_st), super_mname)
               if ret_st != ""
                 return ret_st
               end
@@ -8168,6 +8197,7 @@ class Compiler
     end
     @cls_attr_readers.push(attr_readers)
     @cls_attr_writers.push(attr_writers)
+    @cls_meth_prep_chain.push("")
     @cls_cmeth_names.push("")
     @cls_cmeth_params.push("")
     @cls_cmeth_ptypes.push("")
@@ -8567,12 +8597,15 @@ class Compiler
   end
 
  # `prepend M` -- M's instance methods take precedence over the
- # class's own. spinel doesn't model the full MRO; the simplest
- # approximation is to copy M's methods over the class's via the
- # last-def-wins path in append_cls_meth. super resolution back
- # to the original is NOT implemented -- a prepended method that
- # calls super hits the unresolved-call fallback.
- # Issue #720.
+ # class's own. For each method M defines that C already has,
+ # snapshot C's existing slot into a synthetic shadow method
+ # (`__prep_<n>`) on the same class before letting M's body
+ # overwrite the active slot. The shadow is registered as a
+ # regular instance method on C so inference, ivar resolution,
+ # and codegen emission all pick it up for free. super dispatch
+ # (compile_super_expr / infer_type's SuperNode arm) consults
+ # @cls_meth_prep_chain to route super calls through the chain.
+ # Multi-prepend stacks: each call extends the chain. Issue #720.
   def prepend_module_on_class(ci, inc_nid, module_prefix)
     inc_t = @nd_type[inc_nid]
     if inc_t != "ConstantReadNode" && inc_t != "ConstantPathNode"
@@ -8603,10 +8636,13 @@ class Compiler
                 is_cls_def_p = 1
               end
               if is_cls_def_p == 0
- # collect_class_method routes through append_cls_meth
- # which has last-def-wins on collision -- the prepended
- # method replaces the class's own.
+ # Snapshot the existing method (if any) as a shadow before
+ # overwrite. prep_snapshot_active is a no-op when there's
+ # nothing to snapshot.
+                prep_snapshot_active(ci, @nd_name[sid])
+                @prep_overwrite_in_progress = 1
                 collect_class_method(ci, sid)
+                @prep_overwrite_in_progress = 0
               end
             end
             mk = mk + 1
@@ -8615,6 +8651,258 @@ class Compiler
       end
       mi = mi + 1
     end
+  end
+
+ # Snapshot class ci's existing method `mname` as a synthetic
+ # shadow `__prep_<n>` and record the (mname -> shadow) link in
+ # @cls_meth_prep_chain[ci]. No-op if ci has no existing method
+ # named `mname`. Synthetic names use a numeric suffix (no source
+ # mname encoded) so they don't need C-name sanitization;
+ # @cls_meth_prep_chain is the authoritative mapping. Issue #720.
+  def prep_snapshot_active(ci, mname)
+    existing_mi = cls_find_method_direct(ci, mname)
+    if existing_mi < 0
+      return
+    end
+    cur_names = @cls_meth_names[ci].split(";", -1)
+    cur_params = @cls_meth_params[ci].split("|", -1)
+    cur_ptypes = @cls_meth_ptypes[ci].split("|", -1)
+    cur_returns = @cls_meth_returns[ci].split(";", -1)
+    cur_bodies = @cls_meth_bodies[ci].split(";", -1)
+    cur_defaults = @cls_meth_defaults[ci].split("|", -1)
+    cur_hy = @cls_meth_has_yield[ci].split(";", -1)
+    snap_params = ""
+    snap_ptypes = ""
+    snap_ret = "int"
+    snap_body = -1
+    snap_defs = ""
+    snap_hy = "0"
+    if existing_mi < cur_params.length
+      snap_params = cur_params[existing_mi]
+    end
+    if existing_mi < cur_ptypes.length
+      snap_ptypes = cur_ptypes[existing_mi]
+    end
+    if existing_mi < cur_returns.length
+      snap_ret = cur_returns[existing_mi]
+    end
+    if existing_mi < cur_bodies.length
+      snap_body = cur_bodies[existing_mi].to_i
+    end
+    if existing_mi < cur_defaults.length
+      snap_defs = cur_defaults[existing_mi]
+    end
+    if existing_mi < cur_hy.length
+      snap_hy = cur_hy[existing_mi]
+    end
+    syn_name = prep_alloc_syn_name(ci)
+ # Register the shadow as a normal instance method on ci.
+ # Use raw append (not append_cls_meth) to avoid the redefinition
+ # path -- the synthetic name is guaranteed unique by allocator.
+    if @cls_meth_names[ci] != ""
+      @cls_meth_names[ci] = @cls_meth_names[ci] + ";" + syn_name
+      @cls_meth_params[ci] = @cls_meth_params[ci] + "|" + snap_params
+      @cls_meth_ptypes[ci] = @cls_meth_ptypes[ci] + "|" + snap_ptypes
+      @cls_meth_returns[ci] = @cls_meth_returns[ci] + ";" + snap_ret
+      @cls_meth_bodies[ci] = @cls_meth_bodies[ci] + ";" + snap_body.to_s
+      @cls_meth_defaults[ci] = @cls_meth_defaults[ci] + "|" + snap_defs
+      @cls_meth_ptypes_empty[ci] = @cls_meth_ptypes_empty[ci] + "|"
+    else
+      @cls_meth_names[ci] = syn_name
+      @cls_meth_params[ci] = snap_params
+      @cls_meth_ptypes[ci] = snap_ptypes
+      @cls_meth_returns[ci] = snap_ret
+      @cls_meth_bodies[ci] = snap_body.to_s
+      @cls_meth_defaults[ci] = snap_defs
+      @cls_meth_ptypes_empty[ci] = ""
+    end
+    if @cls_meth_has_yield[ci] != ""
+      @cls_meth_has_yield[ci] = @cls_meth_has_yield[ci] + ";" + snap_hy
+    else
+      @cls_meth_has_yield[ci] = snap_hy
+    end
+    @cls_meth_params_version = @cls_meth_params_version + 1
+    @cls_meth_ptypes_version = @cls_meth_ptypes_version + 1
+    @cls_meth_idx_cache = {}
+    @cls_meth_return_cache = {}
+ # Append (mname, syn_name) to the chain. Chain entry shape:
+ # `<mname>=<syn0>,<syn1>,...` joined by `;` across mnames.
+    chain_str = @cls_meth_prep_chain[ci]
+    if chain_str == ""
+      @cls_meth_prep_chain[ci] = mname + "=" + syn_name
+    else
+      entries = chain_str.split(";", -1)
+      found = 0
+      ei = 0
+      while ei < entries.length
+        eq_pos = entries[ei].index("=")
+        if eq_pos != nil
+          em = entries[ei][0, eq_pos]
+          if em == mname
+            entries[ei] = entries[ei] + "," + syn_name
+            found = 1
+            ei = entries.length
+          end
+        end
+        ei = ei + 1
+      end
+      if found == 0
+        entries.push(mname + "=" + syn_name)
+      end
+      @cls_meth_prep_chain[ci] = entries.join(";")
+    end
+  end
+
+ # Allocate a synthetic shadow name unique on class ci. Probes
+ # `__prep_0`, `__prep_1`, ... for the first free slot.
+  def prep_alloc_syn_name(ci)
+    seq = 0
+    while seq < 4096
+      cand = "__prep_" + seq.to_s
+      if cls_find_method_direct(ci, cand) < 0
+        return cand
+      end
+      seq = seq + 1
+    end
+    "__prep_overflow"
+  end
+
+ # Return the list of synthetic shadow names (in chain order:
+ # index 0 = oldest = closest to parent, last index = newest =
+ # next super target from active) for (ci, mname). [] if no
+ # prepends.
+  def prep_chain_syn_names(ci, mname)
+    result = "".split(",", -1)
+    if ci < 0 || ci >= @cls_meth_prep_chain.length
+      return result
+    end
+    chain_str = @cls_meth_prep_chain[ci]
+    if chain_str == ""
+      return result
+    end
+    entries = chain_str.split(";", -1)
+    ei = 0
+    while ei < entries.length
+      eq_pos = entries[ei].index("=")
+      if eq_pos != nil
+        em = entries[ei][0, eq_pos]
+        if em == mname
+          syns_str = entries[ei][eq_pos + 1, entries[ei].length - eq_pos - 1]
+          return syns_str.split(",", -1)
+        end
+      end
+      ei = ei + 1
+    end
+    result
+  end
+
+ # Determine the on-class super target for (ci, current_mname).
+ # Returns the synthetic name to call (always a method on ci) or
+ # "" if super should fall through to the parent class chain.
+ #
+ # - current is an active prepended method (chain non-empty):
+ #     -> highest-index (newest) shadow
+ # - current is a shadow `__prep_<n>` at chain index k > 0:
+ #     -> shadow at index k - 1
+ # - current is a shadow at chain index 0 or not prepended:
+ #     -> "" (caller falls to parent)
+  def prep_super_target(ci, cur_mname)
+    if ci < 0 || ci >= @cls_meth_prep_chain.length
+      return ""
+    end
+    if @cls_meth_prep_chain[ci] == ""
+      return ""
+    end
+    pos = prep_syn_position(ci, cur_mname)
+    if pos >= 0
+      if pos > 0
+        src_mname = prep_syn_source_mname(ci, cur_mname)
+        syns = prep_chain_syn_names(ci, src_mname)
+        if pos - 1 < syns.length
+          return syns[pos - 1]
+        end
+      end
+      return ""
+    end
+    syns = prep_chain_syn_names(ci, cur_mname)
+    if syns.length > 0
+      return syns[syns.length - 1]
+    end
+    ""
+  end
+
+ # When super from a shadow falls past the synthetic to the
+ # parent class, the parent-side lookup must use the *original*
+ # user-visible mname, not the synthetic. Returns the user mname
+ # for a shadow, or cur_mname unchanged for non-shadows.
+  def prep_super_parent_mname(ci, cur_mname)
+    src = prep_syn_source_mname(ci, cur_mname)
+    if src != ""
+      return src
+    end
+    cur_mname
+  end
+
+ # Source user mname for a synthetic shadow on class ci. "" if
+ # syn_name is not a shadow. Scalar return -- callers can plug
+ # the result directly into string-typed contexts.
+  def prep_syn_source_mname(ci, syn_name)
+    if ci < 0 || ci >= @cls_meth_prep_chain.length
+      return ""
+    end
+    chain_str = @cls_meth_prep_chain[ci]
+    if chain_str == ""
+      return ""
+    end
+    entries = chain_str.split(";", -1)
+    ei = 0
+    while ei < entries.length
+      eq_pos = entries[ei].index("=")
+      if eq_pos != nil
+        em = entries[ei][0, eq_pos]
+        syns_str = entries[ei][eq_pos + 1, entries[ei].length - eq_pos - 1]
+        syns = syns_str.split(",", -1)
+        si = 0
+        while si < syns.length
+          if syns[si] == syn_name
+            return em
+          end
+          si = si + 1
+        end
+      end
+      ei = ei + 1
+    end
+    ""
+  end
+
+ # Chain position (0 = oldest, deepest from active) for a
+ # synthetic shadow on ci. -1 if syn_name is not a shadow.
+  def prep_syn_position(ci, syn_name)
+    if ci < 0 || ci >= @cls_meth_prep_chain.length
+      return -1
+    end
+    chain_str = @cls_meth_prep_chain[ci]
+    if chain_str == ""
+      return -1
+    end
+    entries = chain_str.split(";", -1)
+    ei = 0
+    while ei < entries.length
+      eq_pos = entries[ei].index("=")
+      if eq_pos != nil
+        syns_str = entries[ei][eq_pos + 1, entries[ei].length - eq_pos - 1]
+        syns = syns_str.split(",", -1)
+        si = 0
+        while si < syns.length
+          if syns[si] == syn_name
+            return si
+          end
+          si = si + 1
+        end
+      end
+      ei = ei + 1
+    end
+    -1
   end
 
  # `extend M` -- copy M's instance methods (`def X`) onto the
@@ -9087,7 +9375,9 @@ class Compiler
  # (matches class reopen for adding new methods) and warn so the
  # user can spot the divergence from CRuby's intermediate-version
  # behaviour.
-        $stderr.puts "warning: method '" + name + "' on " + @cls_names[ci] + " is being redefined; spinel uses last-def-wins semantics (calls before the redefinition won't see the original body — subset limitation)"
+        if @prep_overwrite_in_progress == 0
+          $stderr.puts "warning: method '" + name + "' on " + @cls_names[ci] + " is being redefined; spinel uses last-def-wins semantics (calls before the redefinition won't see the original body — subset limitation)"
+        end
         cur_names = @cls_meth_names[ci].split(";", -1)
         cur_params = @cls_meth_params[ci].split("|", -1)
         cur_ptypes = @cls_meth_ptypes[ci].split("|", -1)
@@ -11763,6 +12053,7 @@ class Compiler
     @cls_meth_ptypes_empty.push("")
     @cls_attr_readers.push("")
     @cls_attr_writers.push("")
+    @cls_meth_prep_chain.push("")
     @cls_cmeth_names.push("")
     @cls_cmeth_params.push("")
     @cls_cmeth_ptypes.push("")
@@ -11797,6 +12088,7 @@ class Compiler
     @cls_meth_ptypes_empty.push("")
     @cls_attr_readers.push("")
     @cls_attr_writers.push("")
+    @cls_meth_prep_chain.push("")
     @cls_cmeth_names.push("")
     @cls_cmeth_params.push("")
     @cls_cmeth_ptypes.push("")
@@ -25436,6 +25728,36 @@ class Compiler
       end
       ui = ui + 1
     end
+ # Step 4 (issue #720): for every class with a prep chain, if the
+ # active user-visible method is live, mark every synthetic shadow
+ # in the chain live too. Shadows are only called from super
+ # dispatch (compile_super_expr) which doesn't appear as a
+ # CallNode in the AST, so the previous steps miss them.
+    cip = 0
+    while cip < @cls_meth_prep_chain.length
+      chain_str = @cls_meth_prep_chain[cip]
+      if chain_str != ""
+        entries = chain_str.split(";", -1)
+        ep = 0
+        while ep < entries.length
+          eq_pos = entries[ep].index("=")
+          if eq_pos != nil
+            em = entries[ep][0, eq_pos]
+            if cls_meth_is_live(cip, em) == 1
+              syns_str = entries[ep][eq_pos + 1, entries[ep].length - eq_pos - 1]
+              syns = syns_str.split(",", -1)
+              sp = 0
+              while sp < syns.length
+                cls_meth_mark_live(cip, syns[sp])
+                sp = sp + 1
+              end
+            end
+          end
+          ep = ep + 1
+        end
+      end
+      cip = cip + 1
+    end
   end
 
  # Walk the AST collecting CallNode names + SymbolNode values into
@@ -28758,6 +29080,7 @@ class Compiler
     buf = ir_emit_sa(buf, "@cls_meth_bodies", @cls_meth_bodies)
     buf = ir_emit_sa(buf, "@cls_meth_defaults", @cls_meth_defaults)
     buf = ir_emit_sa(buf, "@cls_meth_ptypes_empty", @cls_meth_ptypes_empty)
+    buf = ir_emit_sa(buf, "@cls_meth_prep_chain", @cls_meth_prep_chain)
     buf = ir_emit_sa(buf, "@cls_attr_readers", @cls_attr_readers)
     buf = ir_emit_sa(buf, "@cls_attr_writers", @cls_attr_writers)
     buf = ir_emit_sa(buf, "@cls_cmeth_names", @cls_cmeth_names)
@@ -30685,11 +31008,20 @@ class Compiler
       saved_ci = @current_class_idx
       @current_class_idx = ci
       bodies = @cls_meth_bodies[ci].split(";", -1)
+      ann_mnames = @cls_meth_names[ci].split(";", -1)
       bj = 0
       while bj < bodies.length
         bid = bodies[bj].to_i
         if bid >= 0
           push_scope
+ # Issue #720: SuperNode infer_type consults @current_method_name
+ # to drive prep-chain redirect. Without setting it, super inside
+ # a prepended method or shadow caches as "int" and codegen reads
+ # the stale cache before its own redirect runs.
+          saved_meth_cls = @current_method_name
+          if bj < ann_mnames.length
+            @current_method_name = ann_mnames[bj]
+          end
           pnames2 = cls_meth_pnames_get(ci, bj)
           ptypes2 = cls_meth_ptypes_get(ci, bj)
           pk = 0
@@ -30705,6 +31037,7 @@ class Compiler
           mt2 = "".split(",", -1)
           refine_method_body_locals(bid, ml2, mt2, pnames2)
           walk_and_cache(bid)
+          @current_method_name = saved_meth_cls
           pop_scope
         end
         bj = bj + 1
