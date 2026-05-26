@@ -1636,7 +1636,22 @@ static const char*sp_str_capitalize(const char*s){if(!s)return sp_str_empty;size
 static mrb_int sp_str_count(const char*s,const char*chars){if(!chars)return 0;size_t setn;uint32_t*set=sp_utf8_decode_charset(chars,&setn);mrb_int c=0;const char*p=s;while(*p){uint32_t cp;p+=sp_utf8_decode(p,&cp);if(sp_utf8_set_has(set,setn,cp))c++;}free(set);return c;}
 /* Issue #800: clamp l*n so a malicious input can't allocate a tiny
    buffer through size_t overflow. */
-static const char*sp_str_repeat(const char*s,mrb_int n){if(!s||n<=0)return sp_str_empty;size_t l=strlen(s);if(l>0&&(size_t)n>SIZE_MAX/l)return sp_str_empty;char*r=sp_str_alloc_raw(l*n+1);for(mrb_int i=0;i<n;i++)memcpy(r+l*i,s,l);r[l*n]=0;return r;}
+/* Issue #836: bound the multiplier so a wildly oversized request
+   raises ArgumentError rather than segfaulting when malloc returns
+   NULL and memcpy walks it. 1 GiB cap covers realistic use. */
+static const char*sp_str_repeat(const char*s,mrb_int n){
+  if(n<0) sp_raise_cls("ArgumentError","negative argument");
+  if(!s||n<=0)return sp_str_empty;
+  size_t l=strlen(s);
+  if(l==0) return sp_str_empty;
+  if((size_t)n>SIZE_MAX/l) sp_raise_cls("ArgumentError","string size too big");
+  size_t total=(size_t)n*l;
+  if(total>(size_t)(1u<<30)) sp_raise_cls("ArgumentError","string size too big");
+  char*r=sp_str_alloc_raw(total+1);
+  for(mrb_int i=0;i<n;i++)memcpy(r+l*i,s,l);
+  r[total]=0;
+  return r;
+}
 static sp_IntArray*sp_str_bytes(const char*s){sp_IntArray*a=sp_IntArray_new();if(!s)return a;size_t n=sp_str_byte_len(s);for(size_t i=0;i<n;i++)sp_IntArray_push(a,(mrb_int)(unsigned char)s[i]);return a;}
 /* Issue #903: String#codepoints -- one IntArray entry per UTF-8
    codepoint (not byte). Replacement-character behaviour mirrors
