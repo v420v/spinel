@@ -262,6 +262,59 @@ static mrb_int sp_str_to_i_cruby(const char *s) {
   return neg ? -v : v;
 }
 
+/* `String#to_i(base)` with a non-decimal base. Accepts bases 2..36
+   like MRI; `_` is allowed between digits the same way as base 10.
+   Stops at the first invalid digit and returns what's parsed so
+   far. Issue #883. */
+static mrb_int sp_str_to_i_base(const char *s, mrb_int base) {
+  if (!s) return 0;
+  if (base < 2 || base > 36) base = 10;
+  const char *p = s;
+  while (isspace((unsigned char)*p)) p++;
+  int neg = 0;
+  if (*p == '+') p++;
+  else if (*p == '-') { neg = 1; p++; }
+  /* Optional `0x` / `0b` / `0o` prefix matching the explicit base.
+     CRuby's String#to_i(base) accepts these. */
+  if (*p == '0' && p[1] != 0) {
+    if ((base == 16) && (p[1] == 'x' || p[1] == 'X')) p += 2;
+    else if ((base == 2) && (p[1] == 'b' || p[1] == 'B')) p += 2;
+    else if ((base == 8) && (p[1] == 'o' || p[1] == 'O')) p += 2;
+  }
+  mrb_int v = 0;
+  int any = 0;
+  int saturated = 0;
+  while (*p) {
+    int d = -1;
+    if (*p >= '0' && *p <= '9') d = *p - '0';
+    else if (*p >= 'a' && *p <= 'z') d = *p - 'a' + 10;
+    else if (*p >= 'A' && *p <= 'Z') d = *p - 'A' + 10;
+    if (d < 0 || d >= (int)base) {
+      if (*p == '_' && any) {
+        /* Lookahead: only consume `_` between digits. */
+        int n = -1;
+        char c = p[1];
+        if (c >= '0' && c <= '9') n = c - '0';
+        else if (c >= 'a' && c <= 'z') n = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'Z') n = c - 'A' + 10;
+        if (n >= 0 && n < (int)base) { p++; continue; }
+      }
+      break;
+    }
+    mrb_int t;
+    if (__builtin_mul_overflow(v, base, &t) ||
+        __builtin_add_overflow(t, (mrb_int)d, &v)) {
+      v = INT64_MAX;
+      saturated = 1;
+    }
+    any = 1;
+    p++;
+  }
+  if (!any) return 0;
+  if (saturated) return neg ? INT64_MIN : INT64_MAX;
+  return neg ? -v : v;
+}
+
 /* CRuby's `Integer(s)` raises ArgumentError for unparseable input
    (empty string, leading/trailing junk, all-whitespace). The bare
    `(mrb_int)strtoll(s, NULL, 10)` spinel previously emitted silently

@@ -18885,6 +18885,15 @@ class Compiler
       return "sp_str_length(" + rc + ")"
     end
     if mname == "to_i"
+ # `"ff".to_i(16)` -- base-aware parse via sp_str_to_i_base.
+ # Issue #883. The 0-arg form stays on sp_str_to_i_cruby (no
+ # base prefix recognition; CRuby's plain `to_i` ignores `0x`).
+      if @nd_arguments[nid] >= 0
+        a_ti = get_args(@nd_arguments[nid])
+        if a_ti.length > 0
+          return "sp_str_to_i_base(" + rc + ", " + compile_expr_as_int(a_ti[0]) + ")"
+        end
+      end
       return "sp_str_to_i_cruby(" + rc + ")"
     end
     if mname == "to_f"
