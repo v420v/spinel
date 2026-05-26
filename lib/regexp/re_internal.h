@@ -109,8 +109,12 @@ typedef struct mrb_regexp_pattern {
 #define MRB_REGEXP_STEP_LIMIT 1000000
 #endif
 
-/* Maximum captures */
-#define RE_MAX_CAPTURES 32
+/* Maximum captures. Issues #820, #776: raised from 32 so deeply
+   nested-paren regexes (`((((...((a))...))))`) compile instead of
+   raising RegexpError. 4096 covers >1k-deep nesting with room to
+   spare; runtime memory scales with actual ncap per regex (see
+   re_exec.c comment) so this is purely a compile-time cap. */
+#define RE_MAX_CAPTURES 4096
 
 /* Thread struct for Pike VM. `sp` is the input position the thread is
    waiting for; the outer loop only dispatches a thread when its sp
