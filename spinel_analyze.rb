@@ -2947,6 +2947,18 @@ class Compiler
  # shape, so `lv_s = sp_M_cls_greet()` mis-typed an `const char *`
  # return. Mirror new cases in both functions, in the same order, with
  # the same recogniser logic.
+ # Static return-type table for StringScanner runtime methods.
+ # Empty string for an unknown method (caller falls through to
+ # the standard class-method inference path). For methods that
+ # "return self" the table reports "stringscanner".
+  def strscan_return_type(mname)
+    return "string" if mname == "scan" || mname == "check" || mname == "scan_until" || mname == "matched" || mname == "getch" || mname == "peek" || mname == "rest" || mname == "string" || mname == "pre_match" || mname == "post_match"
+    return "bool" if mname == "matched?" || mname == "eos?" || mname == "rest?"
+    return "int" if mname == "pos" || mname == "pos=" || mname == "rest_size"
+    return "stringscanner" if mname == "unscan" || mname == "terminate" || mname == "reset"
+    ""
+  end
+
   def infer_call_type(nid)
     mname = @nd_name[nid]
     recv = @nd_receiver[nid]
@@ -2955,6 +2967,25 @@ class Compiler
       if recv < 0 || (recv >= 0 && @nd_type[recv] == "SelfNode")
         return "bool"
       end
+    end
+
+ # StringScanner method return types — the methods are
+ # implemented in lib/sp_strscan.c (libspinel_rt.a). Mirror the
+ # C return types of the sp_StringScanner_* helpers. Gate the
+ # recv infer on the method name first (infer_type can be a
+ # heavy walk through cached LV slots — fast-path-bail on names
+ # outside the StringScanner table).
+    if recv >= 0
+      ss_t = strscan_return_type(mname)
+      if ss_t != ""
+        rt_ss = infer_type(recv)
+        return ss_t if rt_ss == "stringscanner"
+      end
+    end
+ # `StringScanner.new(s)` constructs an sp_StringScanner * — return
+ # the primitive type, not the (non-existent) user-class type.
+    if mname == "new" && recv >= 0 && @nd_type[recv] == "ConstantReadNode" && @nd_name[recv] == "StringScanner"
+      return "stringscanner"
     end
 
  # `Regexp.new(<arg>)` / `Regexp.compile(<arg>)` returns a compiled

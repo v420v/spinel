@@ -3484,12 +3484,37 @@ sp_Bigint *sp_bigint_shr(sp_Bigint *a, int64_t n);
 sp_Bigint *sp_bigint_not(sp_Bigint *a);
 
 /* ---- Pack / Unpack (linked from sp_pack.o) ----
-   Issue #889. Implementation lives in libspinel_rt.a; the entry
-   points below call into the static GC helpers in this header
-   via the sp_ext_* shims defined just below. */
+   Implementation lives in libspinel_rt.a; the entry points
+   below call into the static GC helpers in this header via the
+   sp_ext_* shims defined further down. */
 const char *sp_IntArray_pack(sp_IntArray *arr, const char *fmt);
 const char *sp_PolyArray_pack(sp_PolyArray *arr, const char *fmt);
 sp_PolyArray *sp_str_unpack(const char *str, const char *fmt);
+
+/* ---- StringScanner (linked from sp_strscan.o) ----
+   GC-allocated; the source / matched fields are marked by
+   sp_StringScanner_scan_gc through the shim layer. */
+typedef struct sp_StringScanner sp_StringScanner;
+sp_StringScanner *sp_StringScanner_new(const char *str);
+const char *sp_StringScanner_scan(sp_StringScanner *sc, mrb_regexp_pattern *pat);
+const char *sp_StringScanner_check(sp_StringScanner *sc, mrb_regexp_pattern *pat);
+const char *sp_StringScanner_scan_until(sp_StringScanner *sc, mrb_regexp_pattern *pat);
+const char *sp_StringScanner_matched(sp_StringScanner *sc);
+mrb_bool    sp_StringScanner_matched_p(sp_StringScanner *sc);
+mrb_int     sp_StringScanner_pos(sp_StringScanner *sc);
+mrb_int     sp_StringScanner_pos_set(sp_StringScanner *sc, mrb_int p);
+mrb_bool    sp_StringScanner_eos_p(sp_StringScanner *sc);
+const char *sp_StringScanner_getch(sp_StringScanner *sc);
+const char *sp_StringScanner_peek(sp_StringScanner *sc, mrb_int n);
+sp_StringScanner *sp_StringScanner_unscan(sp_StringScanner *sc);
+const char *sp_StringScanner_rest(sp_StringScanner *sc);
+mrb_int     sp_StringScanner_rest_size(sp_StringScanner *sc);
+mrb_bool    sp_StringScanner_rest_p(sp_StringScanner *sc);
+sp_StringScanner *sp_StringScanner_terminate(sp_StringScanner *sc);
+const char *sp_StringScanner_string(sp_StringScanner *sc);
+const char *sp_StringScanner_pre_match(sp_StringScanner *sc);
+const char *sp_StringScanner_post_match(sp_StringScanner *sc);
+sp_StringScanner *sp_StringScanner_reset(sp_StringScanner *sc);
 
 /* External-TU shim wrappers. The runtime's GC-allocating helpers
    are `static inline`; separately-compiled .c files in
@@ -3505,6 +3530,8 @@ char *sp_ext_str_alloc(size_t n) { return sp_str_alloc(n); }
 void sp_ext_str_set_len(char *s, size_t n) { sp_str_set_len(s, n); }
 const char *sp_ext_str_empty(void) { return sp_str_empty; }
 size_t sp_ext_str_byte_len(const char *s) { return sp_str_byte_len(s); }
+void *sp_ext_gc_alloc(size_t sz, void (*fin)(void *), void (*scan)(void *)) { return sp_gc_alloc(sz, fin, scan); }
+void sp_ext_mark_string(const char *s) { sp_mark_string(s); }
 
 #ifdef __APPLE__
 #pragma clang diagnostic pop

@@ -4205,6 +4205,9 @@ class Compiler
     if t == "exception"
       return 1
     end
+    if t == "stringscanner"
+      return 1
+    end
     if is_obj_type(t) == 1
       cname = t[4, t.length - 4]
       ci = find_class_idx(cname)
@@ -4475,6 +4478,12 @@ class Compiler
  # can only carry a single static or dyn-cache index).
     if t == "regexp"
       return "mrb_regexp_pattern *"
+    end
+ # StringScanner is a builtin reference type whose impl lives
+ # in lib/sp_strscan.c — the C type is just a pointer to the
+ # opaque sp_StringScanner struct declared in sp_runtime.h.
+    if t == "stringscanner"
+      return "sp_StringScanner *"
     end
  # FFI raw C pointer (void *). See type_is_pointer for GC rules.
     if t == "ptr"
@@ -4922,6 +4931,84 @@ class Compiler
       j_sh = j_sh + 1
     end
     tmp_sh
+  end
+
+ # Map an obj_StringScanner method call to the runtime helper
+ # in libspinel_rt.a. Returns the C expression, or "" for an
+ # unknown method (the caller then falls through to the standard
+ # user-class dispatch).
+  def strscan_runtime_call(mname, rc, nid)
+    if mname == "scan"
+      return "sp_StringScanner_scan(" + rc + ", " + strscan_pat_arg(nid) + ")"
+    end
+    if mname == "check"
+      return "sp_StringScanner_check(" + rc + ", " + strscan_pat_arg(nid) + ")"
+    end
+    if mname == "scan_until"
+      return "sp_StringScanner_scan_until(" + rc + ", " + strscan_pat_arg(nid) + ")"
+    end
+    if mname == "matched"
+      return "sp_StringScanner_matched(" + rc + ")"
+    end
+    if mname == "matched?"
+      return "sp_StringScanner_matched_p(" + rc + ")"
+    end
+    if mname == "pos"
+      return "sp_StringScanner_pos(" + rc + ")"
+    end
+    if mname == "pos="
+      return "sp_StringScanner_pos_set(" + rc + ", " + compile_arg0_as_int(nid) + ")"
+    end
+    if mname == "eos?"
+      return "sp_StringScanner_eos_p(" + rc + ")"
+    end
+    if mname == "getch"
+      return "sp_StringScanner_getch(" + rc + ")"
+    end
+    if mname == "peek"
+      return "sp_StringScanner_peek(" + rc + ", " + compile_arg0_as_int(nid) + ")"
+    end
+    if mname == "unscan"
+      return "sp_StringScanner_unscan(" + rc + ")"
+    end
+    if mname == "rest"
+      return "sp_StringScanner_rest(" + rc + ")"
+    end
+    if mname == "rest_size"
+      return "sp_StringScanner_rest_size(" + rc + ")"
+    end
+    if mname == "rest?"
+      return "sp_StringScanner_rest_p(" + rc + ")"
+    end
+    if mname == "terminate"
+      return "sp_StringScanner_terminate(" + rc + ")"
+    end
+    if mname == "string"
+      return "sp_StringScanner_string(" + rc + ")"
+    end
+    if mname == "pre_match"
+      return "sp_StringScanner_pre_match(" + rc + ")"
+    end
+    if mname == "post_match"
+      return "sp_StringScanner_post_match(" + rc + ")"
+    end
+    if mname == "reset"
+      return "sp_StringScanner_reset(" + rc + ")"
+    end
+    ""
+  end
+
+ # Resolve a regex arg to its compiled mrb_regexp_pattern * expr.
+ # scan / check / scan_until all take a single regex; route through
+ # the standard regex_pat_c_expr helper. Falls back to NULL for
+ # malformed calls so the runtime helpers see "no match".
+  def strscan_pat_arg(nid)
+    args_id_ss = @nd_arguments[nid]
+    return "NULL" if args_id_ss < 0
+    a_ss = get_args(args_id_ss)
+    return "NULL" if a_ss.length == 0
+    pat = regex_pat_c_expr(a_ss[0])
+    pat == "" ? compile_expr(a_ss[0]) : pat
   end
 
   def gvar_punct_word(c)
@@ -19959,8 +20046,9 @@ class Compiler
       end
       return "sp_str_bytes(" + rc + ")"
     end
- # Issue #889: String#unpack — returns a poly_array of boxed
- # elements (ints for numeric specs, strings for a/A/Z).
+ # String#unpack — returns a poly_array of boxed elements
+ # (ints for numeric specs, strings for a/A/Z). Dispatches to
+ # sp_str_unpack (lib/sp_pack.c, libspinel_rt.a).
     if mname == "unpack"
       args_id_up = @nd_arguments[nid]
       if args_id_up >= 0
@@ -21252,8 +21340,9 @@ class Compiler
             return tmp
           end
         end
- # Issue #889: general int_array#pack — non-"C*" formats route
- # through sp_IntArray_pack (libspinel_rt.a).
+ # Generic format string: route through the runtime helper in
+ # libspinel_rt.a (sp_pack.c). The C* fast-path above stays as
+ # an open-coded fast path for the hot optcarrot use.
         if args_id >= 0
           a_pk2 = get_args(args_id)
           if a_pk2.length >= 1
@@ -21889,7 +21978,7 @@ class Compiler
       if mname == "length" || mname == "size"
         return "sp_PolyArray_length(" + rc + ")"
       end
- # Issue #889: poly_array#pack via libspinel_rt.a helper.
+ # poly_array#pack via the libspinel_rt.a helper (sp_pack.c).
       if mname == "pack"
         args_id_pkp = @nd_arguments[nid]
         if args_id_pkp >= 0
@@ -23389,6 +23478,11 @@ class Compiler
           return "sp_dir_pwd()"
         end
       end
+      if rcname == "StringScanner"
+        if mname == "new"
+          return "sp_StringScanner_new(" + compile_arg0(nid) + ")"
+        end
+      end
       if rcname == "Time"
         if mname == "now"
           return "sp_time_now()"
@@ -24434,6 +24528,13 @@ class Compiler
           return "((sp_Class){" + bid_pc.to_s + "LL})"
         end
       end
+    end
+ # StringScanner: the type is a primitive (`stringscanner` →
+ # `sp_StringScanner *`); methods route to the sp_StringScanner_*
+ # helpers in libspinel_rt.a (lib/sp_strscan.c).
+    if recv_type == "stringscanner"
+      ssm = strscan_runtime_call(mname, rc, nid)
+      return ssm if ssm != ""
     end
  # Object method calls
     if is_obj_type(recv_type) == 1
