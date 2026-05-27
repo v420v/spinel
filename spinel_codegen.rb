@@ -22687,6 +22687,68 @@ class Compiler
           return tmp_sa_mb
         end
       end
+ # str_array.sort_by — mirrors the int_array bubble-sort but with
+ # const char * elements and a string block param. The block
+ # returns an int sort key (`.length`, `.bytesize`, `.to_i`, ...).
+ # Supports explicit `{ |s| ... }` blocks and the `&:length` /
+ # `&:bytesize` symbol-to-proc shortcuts inline. Other &:sym
+ # shapes fall through to the unresolved-call path.
+      if mname == "sort_by" && @nd_block[nid] >= 0
+        blk_sb_s = @nd_block[nid]
+        sb_s_kind = @nd_type[blk_sb_s]
+        sb_s_sym = ""
+        if sb_s_kind == "BlockArgumentNode"
+          inner_sb_s = @nd_expression[blk_sb_s]
+          if inner_sb_s >= 0 && @nd_type[inner_sb_s] == "SymbolNode"
+            sb_s_sym = @nd_unescaped[inner_sb_s]
+          else
+            return ""
+          end
+        end
+        if sb_s_kind != "BlockNode" && sb_s_sym == ""
+          return ""
+        end
+        @needs_str_array = 1
+        @needs_gc = 1
+        tmp_sb_s = new_temp
+        emit("  sp_StrArray *" + tmp_sb_s + " = sp_StrArray_new(); sp_StrArray_replace(" + tmp_sb_s + ", " + rc + ");")
+        bp_sb_s = "_s"
+        if sb_s_kind == "BlockNode"
+          bp_sb_s = get_block_param(nid, 0)
+          if bp_sb_s == ""
+            bp_sb_s = "_s"
+          end
+        end
+        emit("  { mrb_int _n = " + tmp_sb_s + "->len;")
+        emit("  for (mrb_int _i = 0; _i < _n - 1; _i++)")
+        emit("    for (mrb_int _j = 0; _j < _n - 1 - _i; _j++) {")
+        emit("      const char *lv_" + bp_sb_s + " = " + tmp_sb_s + "->data[_j];")
+        bexpr_sb_s = "0"
+        if sb_s_kind == "BlockNode"
+          bbody_sb_s = @nd_body[blk_sb_s]
+          if bbody_sb_s >= 0
+            bs_sb_s = get_stmts(bbody_sb_s)
+            if bs_sb_s.length > 0
+              bexpr_sb_s = compile_expr(bs_sb_s.last)
+            end
+          end
+        elsif sb_s_sym == "length"
+          bexpr_sb_s = "sp_str_length(lv_" + bp_sb_s + ")"
+        elsif sb_s_sym == "bytesize" || sb_s_sym == "size"
+          bexpr_sb_s = "(mrb_int)strlen(lv_" + bp_sb_s + ")"
+        elsif sb_s_sym == "to_i"
+          bexpr_sb_s = "(mrb_int)atoll(lv_" + bp_sb_s + ")"
+        else
+          return ""
+        end
+        emit("      mrb_int _ka = " + bexpr_sb_s + ";")
+        emit("      lv_" + bp_sb_s + " = " + tmp_sb_s + "->data[_j + 1];")
+        emit("      mrb_int _kb = " + bexpr_sb_s + ";")
+        emit("      if (_ka > _kb) { const char *_tt = " + tmp_sb_s + "->data[_j]; " + tmp_sb_s + "->data[_j] = " + tmp_sb_s + "->data[_j + 1]; " + tmp_sb_s + "->data[_j + 1] = _tt; }")
+        emit("    }")
+        emit("  }")
+        return tmp_sb_s
+      end
     end
 
  # PolyArray methods
