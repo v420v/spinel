@@ -4137,6 +4137,12 @@ class Compiler
            bt_pc == "proc" || bt_pc == "lambda"
           return "class"
         end
+ # poly receivers — runtime tag dispatch in codegen returns a
+ # sp_Class struct (built-in class id for primitive tags, stored
+ # cls_id for OBJ-tagged values).
+        if bt_pc == "poly" || bt_pc == "poly?"
+          return "class"
+        end
       end
     end
  # `<obj>.class.<cmeth>` chained dispatch. When the

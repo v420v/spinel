@@ -17070,6 +17070,22 @@ class Compiler
 
  # Poly method calls
     if recv_type == "poly"
+ # `poly.class` — dispatch on the sp_RbVal's tag at runtime.
+ # Each primitive tag maps to its builtin class id; SP_TAG_OBJ
+ # falls back to the stored cls_id. Avoids the
+ # compile_poly_method_call warning + emit-0 path.
+      if mname == "class"
+        int_cls_id_pc = builtin_class_id_for_name("Integer")
+        str_cls_id_pc = builtin_class_id_for_name("String")
+        flt_cls_id_pc = builtin_class_id_for_name("Float")
+        sym_cls_id_pc = builtin_class_id_for_name("Symbol")
+        nil_cls_id_pc = builtin_class_id_for_name("NilClass")
+        true_cls_id_pc = builtin_class_id_for_name("TrueClass")
+        false_cls_id_pc = builtin_class_id_for_name("FalseClass")
+        tmp_pc_rb = new_temp
+        emit("  sp_RbVal " + tmp_pc_rb + " = " + rc + ";")
+        return "((sp_Class){" + tmp_pc_rb + ".tag == SP_TAG_INT ? " + int_cls_id_pc.to_s + "LL : " + tmp_pc_rb + ".tag == SP_TAG_STR ? " + str_cls_id_pc.to_s + "LL : " + tmp_pc_rb + ".tag == SP_TAG_FLT ? " + flt_cls_id_pc.to_s + "LL : " + tmp_pc_rb + ".tag == SP_TAG_SYM ? " + sym_cls_id_pc.to_s + "LL : " + tmp_pc_rb + ".tag == SP_TAG_NIL ? " + nil_cls_id_pc.to_s + "LL : " + tmp_pc_rb + ".tag == SP_TAG_BOOL ? (" + tmp_pc_rb + ".v.b ? " + true_cls_id_pc.to_s + "LL : " + false_cls_id_pc.to_s + "LL) : " + tmp_pc_rb + ".cls_id})"
+      end
       return compile_poly_method_call(nid, rc, mname)
     end
 
