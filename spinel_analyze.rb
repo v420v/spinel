@@ -4352,6 +4352,9 @@ class Compiler
     if mname == "match?"
       return "bool"
     end
+    if mname == "casecmp?"
+      return "bool"
+    end
     if mname == "start_with?"
       return "bool"
     end

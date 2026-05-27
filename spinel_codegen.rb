@@ -19689,6 +19689,15 @@ class Compiler
     if mname == "itself"
       return rc
     end
+ # Case-insensitive String compares. CRuby returns -1/0/1 for
+ # `casecmp` and a bool for `casecmp?`. Runtime sp_str_casecmp
+ # avoids the POSIX/Windows strcasecmp/stricmp split.
+    if mname == "casecmp"
+      return "sp_str_casecmp(" + rc + ", " + compile_str_arg0(nid) + ")"
+    end
+    if mname == "casecmp?"
+      return "(sp_str_casecmp(" + rc + ", " + compile_str_arg0(nid) + ") == 0)"
+    end
  # Comparable#clamp on string. Issue #899.
     if mname == "clamp"
       args_id_clp = @nd_arguments[nid]
