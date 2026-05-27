@@ -21073,6 +21073,15 @@ class Compiler
       end
       return rc
     end
+ # Integer#step in expression position with a block — emit the
+ # statement-form loop and return the receiver (CRuby semantics).
+ # Without this `result = 1.step(5) { ... }` fell through to the
+ # unresolved-call path emitting 0.
+    if mname == "step" && @nd_block[nid] >= 0
+      if compile_block_iteration_stmt(nid, "step", @nd_receiver[nid]) == 1
+        return rc
+      end
+    end
  # Integer#coerce(other): CRuby returns [other, self] with both
  # widened to float when either side is Float, else both Integer.
     if mname == "coerce"
@@ -21261,6 +21270,13 @@ class Compiler
       emit("  " + tmp + "->_0 = (mrb_int)floor(" + recv_tmp + " / " + arg_tmp + ");")
       emit("  " + tmp + "->_1 = " + recv_tmp + " - " + tmp + "->_0 * " + arg_tmp + ";")
       return tmp
+    end
+ # Float#step in expression position with a block — emit the
+ # statement-form loop and return the receiver (CRuby semantics).
+    if mname == "step" && @nd_block[nid] >= 0
+      if compile_block_iteration_stmt(nid, "step", @nd_receiver[nid]) == 1
+        return rc
+      end
     end
  # Float#coerce(other): CRuby returns [other.to_f, self]. Always
  # promotes to FloatArray regardless of arg type.

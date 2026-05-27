@@ -6297,8 +6297,13 @@ class Compiler
           return "int_array"
         end
  # `n.step(...)` / `f.step(...)` without a block materialises into
- # a typed array. Float promotes when any operand is float.
+ # a typed array. Float promotes when any operand is float. With a
+ # block, the call returns the receiver (per CRuby) so the type is
+ # the receiver's type.
         if rt_step == "int" || rt_step == "float"
+          if @nd_block[nid] >= 0
+            return rt_step
+          end
           step_is_float = (rt_step == "float") ? 1 : 0
           args_id_step = @nd_arguments[nid]
           if args_id_step >= 0
