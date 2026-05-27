@@ -587,6 +587,7 @@ class Compiler
  # Global variables ($x)
     @gvar_names = "".split(",", -1)
     @gvar_types = "".split(",", -1)
+    @gvar_written = []
 
  # Poly tracking: functions with params called with different types
     @poly_funcs = "".split(",", -1)
@@ -14136,10 +14137,19 @@ class Compiler
         return "((const char*)0)"
       end
       if it_d == "GlobalVariableReadNode"
- # CRuby returns "global-variable" whether the gvar has been
- # assigned or not (gvars read as nil when unset, but the name
- # itself is always "defined" syntactically).
-        return "\"global-variable\""
+        gname_d = @nd_name[inner_d]
+        gi_d = 0
+        while gi_d < @gvar_names.length
+          if @gvar_names[gi_d] == gname_d
+            if @gvar_written[gi_d] == 1
+              return "\"global-variable\""
+            end
+            gi_d = @gvar_names.length
+          else
+            gi_d = gi_d + 1
+          end
+        end
+        return "((const char*)0)"
       end
       if it_d == "CallNode" && @nd_receiver[inner_d] < 0
         mname_d = @nd_name[inner_d]
@@ -45786,6 +45796,8 @@ class Compiler
       @pre_execution_blocks = val
     elsif name == "@post_execution_blocks"
       @post_execution_blocks = val
+    elsif name == "@gvar_written"
+      @gvar_written = val
     end
   end
 

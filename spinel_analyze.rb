@@ -581,6 +581,7 @@ class Compiler
  # Global variables ($x)
     @gvar_names = "".split(",", -1)
     @gvar_types = "".split(",", -1)
+    @gvar_written = []
 
  # Poly tracking: functions with params called with different types
     @poly_funcs = "".split(",", -1)
@@ -20829,8 +20830,9 @@ class Compiler
         if not_in(gname, @gvar_names) == 1
           @gvar_names.push(gname)
           @gvar_types.push(gt)
+          @gvar_written.push(1)
         else
- # Check type consistency
+ # Check type consistency + mark written
           gi = 0
           while gi < @gvar_names.length
             if @gvar_names[gi] == gname
@@ -20838,6 +20840,7 @@ class Compiler
                 $stderr.puts "Error: global variable " + gname + " type mismatch: " + @gvar_types[gi] + " vs " + gt
                 exit(1)
               end
+              @gvar_written[gi] = 1
             end
             gi = gi + 1
           end
@@ -20858,8 +20861,10 @@ class Compiler
  # against an mrb_int and fail to compile.
           if gname == "$PROGRAM_NAME" || gname == "$0"
             @gvar_types.push("string")
+            @gvar_written.push(1)
           else
             @gvar_types.push("int")
+            @gvar_written.push(0)
           end
         end
       end
@@ -29915,6 +29920,7 @@ class Compiler
     buf = ir_emit_sa(buf, "@cvar_init_values", @cvar_init_values)
     buf = ir_emit_sa(buf, "@gvar_names", @gvar_names)
     buf = ir_emit_sa(buf, "@gvar_types", @gvar_types)
+    buf = ir_emit_ia(buf, "@gvar_written", @gvar_written)
 
  # Modules
     buf = ir_emit_sa(buf, "@module_names", @module_names)

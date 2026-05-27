@@ -1,6 +1,7 @@
 # defined? on globals and methods. Methods already returned
 # "method"; globals were returning "expression". CRuby returns
-# "global-variable" for $x whether set or not.
+# "global-variable" for assigned $x but nil for never-assigned
+# globals (the name alone is not "defined" if never written).
 $g = 1
 puts defined?($g)
 puts defined?($unset_gvar)
