@@ -3081,9 +3081,86 @@ class Compiler
     ""
   end
 
+ # True when `n` is the `Float::INFINITY` constant-path node.
+  def is_float_infinity(n)
+    if n < 0
+      return 0
+    end
+    if @nd_name[n] != "INFINITY"
+      return 0
+    end
+    r = @nd_receiver[n]
+    if r >= 0 && resolve_const_ref_name(r) == "Float"
+      return 1
+    end
+    0
+  end
+
+ # Recognise `<literal-range>.lazy[.select/.reject/.filter{blk}].first`
+ # where `nid` is the terminal `.first` CallNode. Returns the source
+ # RangeNode nid, or -1 when the chain is not a supported lazy chain.
+ # Mirror of codegen's lazy_chain_range.
+  def lazy_chain_range(nid)
+    recv = @nd_receiver[nid]
+    if recv < 0 || @nd_type[recv] != "CallNode"
+      return -1
+    end
+    rn = @nd_name[recv]
+    lazy_nid = -1
+    if rn == "lazy" && @nd_block[recv] < 0
+      lazy_nid = recv
+    elsif (rn == "select" || rn == "filter" || rn == "reject") && @nd_block[recv] >= 0
+      inner = @nd_receiver[recv]
+      if inner >= 0 && @nd_type[inner] == "CallNode" && @nd_name[inner] == "lazy" && @nd_block[inner] < 0
+        lazy_nid = inner
+      end
+    end
+    if lazy_nid < 0
+      return -1
+    end
+    src = @nd_receiver[lazy_nid]
+    if src < 0
+      return -1
+    end
+    rng = -1
+    if @nd_type[src] == "RangeNode"
+      rng = src
+    elsif @nd_type[src] == "ParenthesesNode"
+      pb = @nd_body[src]
+      if pb >= 0
+        ps = get_stmts(pb)
+        if ps.length > 0 && @nd_type[ps.first] == "RangeNode"
+          rng = ps.first
+        end
+      end
+    end
+    if rng < 0
+      return -1
+    end
+    if @nd_left[rng] < 0 || @nd_type[@nd_left[rng]] == "NilNode"
+      return -1
+    end
+    rng
+  end
+
   def infer_call_type(nid)
     mname = @nd_name[nid]
     recv = @nd_receiver[nid]
+
+ # Lazy range chain `(a..b).lazy[.select/.reject/.filter{blk}].first`.
+ # first(n) materialises an int_array, bare first an int. codegen
+ # lowers the whole chain to a bounded pull-loop; here we only need
+ # the terminal's type so a following `.inspect` dispatches as array.
+    if mname == "first" && lazy_chain_range(nid) >= 0
+      args_id_lz = @nd_arguments[nid]
+      if args_id_lz >= 0
+        aa_lz = get_args(args_id_lz)
+        if aa_lz.length > 0
+          return "int_array"
+        end
+      end
+      return "int"
+    end
 
     if mname == "block_given?"
       if recv < 0 || (recv >= 0 && @nd_type[recv] == "SelfNode")

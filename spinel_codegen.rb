@@ -3347,6 +3347,15 @@ class Compiler
       return "int"
     end
     if t == "CallNode"
+ # Lazy range chain `(a..b).lazy[.select...].first(n)`: first(n) is
+ # an int_array, bare first an int. Mirrors analyze's arm so the
+ # cache-miss path (block bodies) types it the same.
+      if @nd_name[nid] == "first" && lazy_chain_range(nid) >= 0
+        if lazy_first_has_arg(nid) == 1
+          return "int_array"
+        end
+        return "int"
+      end
  # CallNode falls here only on cache miss. analyze's
  # walk_and_cache covers ~99% of CallNodes; the remaining
  # misses are:
@@ -16047,6 +16056,17 @@ class Compiler
   def compile_call_expr(nid)
     mname = @nd_name[nid]
     recv = @nd_receiver[nid]
+
+ # Lazy enumeration over a literal range:
+ # `(a..b).lazy[.select/.reject/.filter{blk}].first(n)`. Lower the
+ # whole chain to a single bounded pull-loop so an unbounded source
+ # (`(1..Float::INFINITY)`) terminates at the `first` count. Must
+ # run before the range-method routing, whose receiver-type check
+ # would otherwise treat the inner `.lazy`/`.select` result as a
+ # scalar range.
+    if mname == "first" && lazy_chain_range(nid) >= 0
+      return compile_lazy_first_expr(nid)
+    end
 
  # Safe navigation `recv&.method`: short-circuit to nil when recv
  # is nil. The result type is nullable (T? where T is the method's
@@ -42983,6 +43003,223 @@ class Compiler
       return tmp_arr
     end
     "0"
+  end
+
+ # True when the `.first` CallNode `nid` has an argument (first(n)).
+  def lazy_first_has_arg(nid)
+    args_id = @nd_arguments[nid]
+    if args_id >= 0
+      aa = get_args(args_id)
+      if aa.length > 0
+        return 1
+      end
+    end
+    0
+  end
+
+ # True when `n` is the `Float::INFINITY` constant-path node.
+  def is_float_infinity(n)
+    if n < 0
+      return 0
+    end
+    if @nd_name[n] != "INFINITY"
+      return 0
+    end
+    r = @nd_receiver[n]
+    if r >= 0 && resolve_const_ref_name(r) == "Float"
+      return 1
+    end
+    0
+  end
+
+ # Recognise `<literal-range>.lazy[.select/.reject/.filter{blk}].first`
+ # where `nid` is the terminal `.first` CallNode. Returns the source
+ # RangeNode nid, or -1 when the chain is not a supported lazy chain.
+ # The range must have a concrete begin; map/collect and multi-op
+ # chains are intentionally left to fall through to the normal
+ # (warn-and-0) path.
+  def lazy_chain_range(nid)
+    recv = @nd_receiver[nid]
+    if recv < 0 || @nd_type[recv] != "CallNode"
+      return -1
+    end
+    rn = @nd_name[recv]
+    lazy_nid = -1
+    if rn == "lazy" && @nd_block[recv] < 0
+      lazy_nid = recv
+    elsif (rn == "select" || rn == "filter" || rn == "reject") && @nd_block[recv] >= 0
+      inner = @nd_receiver[recv]
+      if inner >= 0 && @nd_type[inner] == "CallNode" && @nd_name[inner] == "lazy" && @nd_block[inner] < 0
+        lazy_nid = inner
+      end
+    end
+    if lazy_nid < 0
+      return -1
+    end
+    src = @nd_receiver[lazy_nid]
+    if src < 0
+      return -1
+    end
+    rng = -1
+    if @nd_type[src] == "RangeNode"
+      rng = src
+    elsif @nd_type[src] == "ParenthesesNode"
+      pb = @nd_body[src]
+      if pb >= 0
+        ps = get_stmts(pb)
+        if ps.length > 0 && @nd_type[ps.first] == "RangeNode"
+          rng = ps.first
+        end
+      end
+    end
+    if rng < 0
+      return -1
+    end
+ # Require a concrete begin; beginless lazy.first is meaningless.
+    if @nd_left[rng] < 0 || @nd_type[@nd_left[rng]] == "NilNode"
+      return -1
+    end
+    rng
+  end
+
+  def compile_lazy_first_expr(nid)
+    src = lazy_chain_range(nid)
+    @needs_int_array = 1
+    @needs_gc = 1
+    old = @in_loop
+    @in_loop = 1
+
+    op_nid = @nd_receiver[nid]
+    op = @nd_name[op_nid]
+    has_op = 0
+    blk = -1
+    bp1 = "_x"
+    if op == "select" || op == "filter" || op == "reject"
+      has_op = 1
+      blk = @nd_block[op_nid]
+      bp1 = get_block_param(op_nid, 0)
+      if bp1 == ""
+        bp1 = "_x"
+      end
+    end
+
+ # `first(n)` materialises an array; `first` (no arg) a scalar.
+    has_n = 0
+    args_id = @nd_arguments[nid]
+    if args_id >= 0
+      aa = get_args(args_id)
+      if aa.length > 0
+        has_n = 1
+      end
+    end
+
+    left_c = compile_expr(@nd_left[src])
+    right_e = @nd_right[src]
+    endless = 0
+    if right_e < 0 || @nd_type[right_e] == "NilNode" || is_float_infinity(right_e) == 1
+      endless = 1
+    end
+    hi = ""
+    cmp = " <= "
+    if endless == 0
+      hi = new_temp
+      emit("  mrb_int " + hi + " = " + compile_expr(right_e) + ";")
+      if range_excl_end(src) == 1
+        cmp = " < "
+      end
+    end
+
+    loopv = new_temp
+    if has_n == 1
+      nlim = new_temp
+      emit("  mrb_int " + nlim + " = " + compile_arg0_as_int(nid) + ";")
+      res = new_temp
+      emit("  sp_IntArray *" + res + " = sp_IntArray_new();")
+      bound = "sp_IntArray_length(" + res + ") < " + nlim
+      if endless == 0
+        bound = loopv + cmp + hi + " && " + bound
+      end
+      emit("  for (mrb_int " + loopv + " = " + left_c + "; " + bound + "; " + loopv + "++) {")
+      @indent = @indent + 1
+      push_scope
+      emit("  mrb_int lv_" + bp1 + " = " + loopv + ";")
+      declare_var(bp1, "int")
+      emit_lazy_op_push(blk, has_op, op, res, loopv, bp1)
+      pop_scope
+      @indent = @indent - 1
+      emit("  }")
+      @in_loop = old
+      return res
+    end
+
+ # first (no arg): first matching element, or 0 when none in a
+ # bounded source.
+    res = new_temp
+    found = new_temp
+    emit("  mrb_int " + res + " = 0;")
+    emit("  mrb_bool " + found + " = 0;")
+    bound = "!" + found
+    if endless == 0
+      bound = bound + " && " + loopv + cmp + hi
+    end
+    emit("  for (mrb_int " + loopv + " = " + left_c + "; " + bound + "; " + loopv + "++) {")
+    @indent = @indent + 1
+    push_scope
+    emit("  mrb_int lv_" + bp1 + " = " + loopv + ";")
+    declare_var(bp1, "int")
+    emit_lazy_op_first(blk, has_op, op, res, found, loopv, bp1)
+    pop_scope
+    @indent = @indent - 1
+    emit("  }")
+    @in_loop = old
+    return res
+  end
+
+ # Emit the per-element body for `first(n)`: push the (possibly
+ # filtered) element into `res`.
+  def emit_lazy_op_push(blk, has_op, op, res, loopv, bp1)
+    if has_op == 0
+      emit("  sp_IntArray_push(" + res + ", " + loopv + ");")
+      return
+    end
+    pred = lazy_block_pred(blk, bp1)
+    if op == "reject"
+      emit("  if (!(" + pred + ")) sp_IntArray_push(" + res + ", " + loopv + ");")
+    else
+      emit("  if (" + pred + ") sp_IntArray_push(" + res + ", " + loopv + ");")
+    end
+  end
+
+ # Emit the per-element body for `first` (no arg): record the first
+ # matching element and stop.
+  def emit_lazy_op_first(blk, has_op, op, res, found, loopv, bp1)
+    if has_op == 0
+      emit("  " + res + " = " + loopv + "; " + found + " = 1;")
+      return
+    end
+    pred = lazy_block_pred(blk, bp1)
+    if op == "reject"
+      emit("  if (!(" + pred + ")) { " + res + " = " + loopv + "; " + found + " = 1; }")
+    else
+      emit("  if (" + pred + ") { " + res + " = " + loopv + "; " + found + " = 1; }")
+    end
+  end
+
+ # Compile the lazy filter block's body (last statement) as a truthy
+ # C condition. Returns "1" for an empty block.
+  def lazy_block_pred(blk, bp1)
+    if blk < 0
+      return "1"
+    end
+    body = @nd_body[blk]
+    if body < 0
+      return "1"
+    end
+    stmts = get_stmts(body)
+    if stmts.length == 0
+      return "1"
+    end
+    compile_cond_expr(stmts.last)
   end
 
   def compile_select_expr(nid)
