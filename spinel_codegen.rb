@@ -11467,6 +11467,14 @@ class Compiler
     @indent = 1
     @in_gc_scope = 0
 
+ # Reset @heap_promoted_names at the method boundary; otherwise a
+ # sibling method whose param shares a name with a fiber-captured
+ # local here reads `(*_hcell_<name>_<n>)`, a cell declared only in
+ # this function's C scope. The top-level method path already does
+ # this; class instance / class methods did not.
+    saved_hp_names_len_mb = @heap_promoted_names.length
+    saved_hp_cells_len_mb = @heap_promoted_cells.length
+
     midx = cls_find_method_direct(ci, mname)
     if midx >= 0
       if cls_method_has_yield(ci, midx) == 1
@@ -11564,6 +11572,12 @@ class Compiler
     @in_yield_method = 0
     @current_method_yield_arity = 1
     @indent = 0
+    while @heap_promoted_names.length > saved_hp_names_len_mb
+      @heap_promoted_names.pop
+    end
+    while @heap_promoted_cells.length > saved_hp_cells_len_mb
+      @heap_promoted_cells.pop
+    end
     emit_raw("  return " + c_return_default(rt) + ";")
     emit_raw("}")
     emit_raw("")
@@ -11578,6 +11592,11 @@ class Compiler
     @current_method_has_self = 0
     @indent = 1
     @in_gc_scope = 0
+
+ # Reset @heap_promoted_names at the method boundary; see the note
+ # in emit_instance_method.
+    saved_hp_names_len_mb = @heap_promoted_names.length
+    saved_hp_cells_len_mb = @heap_promoted_cells.length
 
     emit_raw("static " + c_type(rt) + " sp_" + cname + "_cls_" + sanitize_name(mname) + "(" + build_params_decl(pnames, ptypes) + ") {")
 
@@ -11625,6 +11644,12 @@ class Compiler
     @current_method_name = ""
     @current_method_block_param = ""
     @indent = 0
+    while @heap_promoted_names.length > saved_hp_names_len_mb
+      @heap_promoted_names.pop
+    end
+    while @heap_promoted_cells.length > saved_hp_cells_len_mb
+      @heap_promoted_cells.pop
+    end
     emit_raw("  return " + c_return_default(rt) + ";")
     emit_raw("}")
     emit_raw("")
