@@ -412,6 +412,10 @@ class Compiler
     @current_lexical_scope = ""
     @current_method_return = ""
     @current_method_block_param = ""
+ # #709: while emitting a yielding constructor body, the C name of the
+ # threaded block proc ("_ctor_blk"); "" elsewhere. yield routes to
+ # sp_proc_call on it.
+    @ctor_blk_var = ""
  # 1 when the wrapping C function being emitted has a `self`
  # binding (instance method, constructor synthesis). 0 for
  # class methods, module class methods, and top-level free
@@ -10556,6 +10560,20 @@ class Compiler
     -1
   end
 
+ # #709: does `<C>`'s initialize yield? Such a constructor takes a
+ # trailing `sp_Proc *_ctor_blk` and routes `yield` to sp_proc_call.
+  def ctor_yields?(ci)
+    init_ci = find_init_class(ci)
+    if init_ci < 0
+      return 0
+    end
+    init_idx = cls_find_method_direct(init_ci, "initialize")
+    if init_idx < 0
+      return 0
+    end
+    cls_method_has_yield(init_ci, init_idx)
+  end
+
   def constructor_params_decl(ci)
     init_ci = find_init_class(ci)
     if init_ci < 0
@@ -10564,7 +10582,14 @@ class Compiler
     init_idx = cls_find_method_direct(init_ci, "initialize")
     pnames = cls_meth_pnames_get(init_ci, init_idx)
     ptypes = cls_meth_ptypes_get(init_ci, init_idx)
+    blk_tail = ""
+    if ctor_yields?(ci) == 1
+      blk_tail = "sp_Proc *_ctor_blk"
+    end
     if pnames.length == 0
+      if blk_tail != ""
+        return blk_tail
+      end
       return "void"
     end
     result = ""
@@ -10579,6 +10604,9 @@ class Compiler
       end
       result = result + c_type(pt) + " lv_" + pnames[j]
       j = j + 1
+    end
+    if blk_tail != ""
+      result = result + ", " + blk_tail
     end
     result
   end
@@ -11040,6 +11068,12 @@ class Compiler
         else
           @current_method_return = "obj_" + cname
         end
+ # #709: route `yield` in this constructor body to the threaded
+ # block proc parameter.
+        saved_ctor_blk = @ctor_blk_var
+        if ctor_yields?(ci) == 1
+          @ctor_blk_var = "_ctor_blk"
+        end
         pnames = cls_meth_pnames_get(ci, init_idx)
         ptypes = cls_meth_ptypes_get(ci, init_idx)
         push_scope
@@ -11319,6 +11353,7 @@ class Compiler
         @current_class_idx = -1
         @current_method_return = saved_method_return
         @current_method_has_self = saved_has_self
+        @ctor_blk_var = saved_ctor_blk
       end
     else
  # No own initialize - call parent's if it exists
@@ -13164,6 +13199,22 @@ class Compiler
  # is meaningless and falls through to the default int-0.
       empty_map = "".split(",", -1)
       return compile_yield_inline_expr(nid, @inline_yield_blk, @inline_yield_bp_names, empty_map, empty_map)
+    end
+ # #709: yield in a yielding constructor body calls the threaded
+ # block proc. The proc-call ABI returns mrb_int; cast to the
+ # yield's inferred type (cached from analyze's ctor-yield-ret) so
+ # a string-returning block flows into @ivar.push as const char *.
+    if t == "YieldNode" && @ctor_blk_var != ""
+      raw_yc = "sp_proc_call(" + @ctor_blk_var + ", (mrb_int[]){" + compile_proc_call_args(nid) + "})"
+      yt_yc = infer_type(nid)
+      if yt_yc == "int" || yt_yc == "bool" || yt_yc == "" || yt_yc == "void" || yt_yc == "nil"
+        return raw_yc
+      end
+      if yt_yc == "float"
+ # proc ABI returns mrb_int bits; reinterpret is out of scope.
+        return raw_yc
+      end
+      return "(" + c_type(yt_yc) + ")(uintptr_t)(" + raw_yc + ")"
     end
     if t == "UnsupportedNode"
  # The parser emitted this sentinel because it hit a Prism node
@@ -19857,7 +19908,21 @@ class Compiler
       end
       ci = find_class_idx(cname)
       if ci >= 0
-        return "sp_" + cname + "_new(" + compile_constructor_args(ci, nid) + ")"
+ # #709: a yielding constructor takes a trailing block proc. Emit
+ # the call's block as a proc literal (captures handled) — or NULL
+ # when no block was passed.
+        ctor_args = compile_constructor_args(ci, nid)
+        if ctor_yields?(ci) == 1
+          blk_arg = "NULL"
+          if @nd_block[nid] >= 0
+            blk_arg = compile_proc_literal(nid)
+          end
+          if ctor_args == ""
+            return "sp_" + cname + "_new(" + blk_arg + ")"
+          end
+          return "sp_" + cname + "_new(" + ctor_args + ", " + blk_arg + ")"
+        end
+        return "sp_" + cname + "_new(" + ctor_args + ")"
       end
     end
     ""
@@ -37815,6 +37880,12 @@ class Compiler
     if base_type(bexpr_t_proc) == "bigint"
       @needs_bigint = 1
       bexpr = "sp_bigint_to_int((sp_Bigint *)(" + bexpr + "))"
+ # Proc fn ABI returns mrb_int; a pointer-typed body tail (string,
+ # array, hash, ...) round-trips through the integer slot. Cast
+ # explicitly so the return doesn't warn under -Wint-conversion.
+ # Issue #709 (string-returning ctor block).
+    elsif type_is_pointer(bexpr_t_proc) == 1
+      bexpr = "(mrb_int)(uintptr_t)(" + bexpr + ")"
     end
     pop_scope
     @in_proc_body = saved_in_proc_body

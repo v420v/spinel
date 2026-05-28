@@ -440,6 +440,10 @@ class Compiler
  # Yield/block tracking (parallel with meth_names / cls_meth_names)
     @meth_has_yield = []
     @cls_meth_has_yield = "".split(",", -1)
+ # #709: per-class type a yielding `initialize`'s `yield` returns,
+ # taken from the first `C.new(...) { block }` site's block tail
+ # expr. Keyed by class name. Drives `@ivar.push(yield)` ivar typing.
+    @cls_ctor_yield_ret = {}
 
  # Block function accumulator (emitted before forward decls)
     @block_funcs = ""
@@ -2477,6 +2481,17 @@ class Compiler
     end
     if t == "CallNode"
       return infer_call_type(nid)
+    end
+ # #709: `yield` as an expression inside a yielding `initialize`
+ # takes the type recorded from the matching `C.new(...) { block }`
+ # site, so `@free.push(yield)` widens @free to the block's element
+ # type. Only fires when current_ctor_yield_ret is set (a class with
+ # a yielding initialize and a known .new{block} call site).
+    if t == "YieldNode"
+      cyr = current_ctor_yield_ret
+      if cyr != ""
+        return cyr
+      end
     end
     if t == "IfNode"
       then_type = "nil"
@@ -13040,6 +13055,64 @@ class Compiler
     scan_new_calls(@root_id)
   end
 
+ # #709: walk the AST for `C.new(...) { block }` where C's initialize
+ # yields, and record the block's tail-expr type as C's ctor-yield
+ # return type. First site wins (the one-site-drives-it convention).
+ # `infer_type(YieldNode)` reads this so `@free.push(yield)` widens
+ # @free to the right array variant.
+  def infer_ctor_yield_ret
+    scan_ctor_yield_ret(@root_id)
+  end
+  def scan_ctor_yield_ret(nid)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "CallNode" && @nd_name[nid] == "new" && @nd_block[nid] >= 0
+      recv = @nd_receiver[nid]
+      if recv >= 0 && @nd_type[recv] == "ConstantReadNode"
+        cname = @nd_name[recv]
+        ci = find_class_idx(cname)
+        if ci >= 0 && @cls_ctor_yield_ret[cname] == nil
+          init_idx = cls_find_method(ci, "initialize")
+          if init_idx >= 0 && cls_method_has_yield(ci, init_idx) == 1
+            blk = @nd_block[nid]
+            bbody = @nd_body[blk]
+            if bbody >= 0
+              bs = get_stmts(bbody)
+              if bs.length > 0
+                rt = infer_type(bs.last)
+                if rt != "" && rt != "void"
+                  @cls_ctor_yield_ret[cname] = rt
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      scan_ctor_yield_ret(cs[k])
+      k = k + 1
+    end
+  end
+
+ # Look up the ctor-yield return type for the class currently being
+ # analyzed; "" when unknown. Used by infer_type's YieldNode arm.
+  def current_ctor_yield_ret
+    if @current_class_idx < 0
+      return ""
+    end
+    cn = @cls_names[@current_class_idx]
+    r = @cls_ctor_yield_ret[cn]
+    if r == nil
+      return ""
+    end
+    r
+  end
+
  # Narrow pre-pass for `rewrite_instance_eval_calls`: walk top-level
  # CallNodes shaped `recv.method(args)` where recv resolves to an
  # obj_<C> via top-level scope, and let scan_new_calls' receiver-method
@@ -19831,6 +19904,8 @@ class Compiler
     infer_cls_meth_param_from_body
  # Pre-pass: scan for .new calls to infer constructor param types
     infer_constructor_types
+ # Pre-pass: record ctor-yield return types from C.new{block} sites.
+    infer_ctor_yield_ret
  # Bare `new(args)` in an inherited class method body widens
  # the subclass's `initialize` ptypes via the cls method's
  # already-widened ptypes. Runs after infer_constructor_types
