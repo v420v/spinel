@@ -250,6 +250,43 @@ parse_escape(re_compiler *c)
      this arm only fires from read_class_atom -- i.e. always the
      character-class meaning. Issue #632. */
   case 'b': return 0x08;
+  /* Octal escape `\NNN` (1-3 digits, value 0-255). The outer dispatcher
+     consumes `\1`-`\9` as backref, so the only octal-leading digit
+     that reaches here from the top level is `\0` -- but parse_escape
+     also fires from read_class_atom inside `[...]`, where backref
+     parsing does not apply, so the full 0-7 range needs handling.
+     Issue #1009. */
+  case '0': case '1': case '2': case '3':
+  case '4': case '5': case '6': case '7': {
+    int val = ch - '0';
+    int n = 1;
+    while (n < 3) {
+      int d = peek(c);
+      if (d < '0' || d > '7') break;
+      val = val * 8 + (d - '0');
+      next_char(c);
+      n++;
+    }
+    return val & 0xff;
+  }
+  /* Hex escape `\xHH` (1-2 hex digits, value 0-255). Spinel does not
+     yet implement the `\x{HHHH}` form for codepoints above 0xff. */
+  case 'x': {
+    int val = 0;
+    int n = 0;
+    while (n < 2) {
+      int d = peek(c);
+      int v;
+      if (d >= '0' && d <= '9') v = d - '0';
+      else if (d >= 'a' && d <= 'f') v = d - 'a' + 10;
+      else if (d >= 'A' && d <= 'F') v = d - 'A' + 10;
+      else break;
+      val = val * 16 + v;
+      next_char(c);
+      n++;
+    }
+    return val & 0xff;
+  }
   default: return ch;  /* literal: \., \\, \/, \(, etc. */
   }
 }
