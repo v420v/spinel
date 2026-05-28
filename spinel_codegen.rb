@@ -37883,8 +37883,11 @@ class Compiler
  # Proc fn ABI returns mrb_int; a pointer-typed body tail (string,
  # array, hash, ...) round-trips through the integer slot. Cast
  # explicitly so the return doesn't warn under -Wint-conversion.
- # Issue #709 (string-returning ctor block).
-    elsif type_is_pointer(bexpr_t_proc) == 1
+ # Issue #709 (string-returning ctor block); extended for FFI :ptr
+ # (issue #1017) — ffi_read_ptr / ffi_func :ret => :ptr return a
+ # raw C pointer that type_is_pointer() reports as 0 (not GC-traced)
+ # but still needs the same mrb_int round-trip in the proc-fn ABI.
+    elsif type_is_pointer(bexpr_t_proc) == 1 || base_type(bexpr_t_proc) == "ptr"
       bexpr = "(mrb_int)(uintptr_t)(" + bexpr + ")"
     end
     pop_scope
