@@ -1358,6 +1358,16 @@ class Compiler
       emit("  sp_raise(\"" + cname_cr + "\");")
       return
     end
+ # `raise M::Err` -- namespaced exception class, no message. Resolve
+ # to the registered class name so the class survives for rescue.
+    if @nd_type[arg_id] == "ConstantPathNode"
+      cname_cp = resolve_const_ref_name(arg_id)
+      if is_exception_class_name(cname_cp) == 1
+        @needs_exc_class_hierarchy = 1
+        emit("  sp_raise_cls(\"" + cname_cp + "\", " + exc_default_msg_expr(cname_cp) + ");")
+        return
+      end
+    end
  # `raise <BuiltinExc>.new(<msg>)` -- ConstantReadNode is the exc
  # class, msg comes from the .new args.
     if @nd_type[arg_id] == "CallNode" && @nd_name[arg_id] == "new"
@@ -17862,6 +17872,10 @@ class Compiler
         if arg_ids.length >= 2
           if @nd_type[arg_ids[0]] == "ConstantReadNode"
             emit("  sp_raise_cls(\"" + @nd_name[arg_ids[0]] + "\", " + compile_expr(arg_ids[1]) + ");")
+          elsif @nd_type[arg_ids[0]] == "ConstantPathNode"
+ # `raise M::Err, msg` -- resolve the namespaced constant to the
+ # registered class name (M_Err) so it matches `rescue M::Err`.
+            emit("  sp_raise_cls(\"" + resolve_const_ref_name(arg_ids[0]) + "\", " + compile_expr(arg_ids[1]) + ");")
           else
             emit("  sp_raise(" + compile_expr(arg_ids[1]) + ");")
           end
@@ -36616,6 +36630,10 @@ class Compiler
  # raise ClassName, "message" - use the message with class
             if @nd_type[arg_ids[0]] == "ConstantReadNode"
               emit("  sp_raise_cls(\"" + @nd_name[arg_ids[0]] + "\", " + compile_expr(arg_ids[1]) + ");")
+            elsif @nd_type[arg_ids[0]] == "ConstantPathNode"
+ # raise M::Err, msg -- resolve namespaced constant to its
+ # registered class name so `rescue M::Err` matches.
+              emit("  sp_raise_cls(\"" + resolve_const_ref_name(arg_ids[0]) + "\", " + compile_expr(arg_ids[1]) + ");")
             else
               emit("  sp_raise(" + compile_expr(arg_ids[1]) + ");")
             end
@@ -43900,7 +43918,13 @@ class Compiler
         if k > 0
           cond = cond + " || "
         end
-        cond = cond + "sp_exc_class_le((const char*)sp_last_exc_cls, \"" + @nd_name[exc_types[k]] + "\")"
+ # Namespaced rescue target (`rescue M::Err`) resolves to the
+ # registered class name (M_Err); a bare name uses @nd_name as-is.
+        excn_k = @nd_name[exc_types[k]]
+        if @nd_type[exc_types[k]] == "ConstantPathNode"
+          excn_k = resolve_const_ref_name(exc_types[k])
+        end
+        cond = cond + "sp_exc_class_le((const char*)sp_last_exc_cls, \"" + excn_k + "\")"
         k = k + 1
       end
       emit("  if (" + cond + ") {")
@@ -45797,7 +45821,13 @@ class Compiler
         if k > 0
           cond = cond + " || "
         end
-        cond = cond + "sp_exc_class_le((const char*)sp_last_exc_cls, \"" + @nd_name[exc_types[k]] + "\")"
+ # Namespaced rescue target (`rescue M::Err`) resolves to the
+ # registered class name (M_Err); a bare name uses @nd_name as-is.
+        excn_k = @nd_name[exc_types[k]]
+        if @nd_type[exc_types[k]] == "ConstantPathNode"
+          excn_k = resolve_const_ref_name(exc_types[k])
+        end
+        cond = cond + "sp_exc_class_le((const char*)sp_last_exc_cls, \"" + excn_k + "\")"
         k = k + 1
       end
       emit("  if (" + cond + ") {")
