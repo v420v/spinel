@@ -401,6 +401,12 @@ TESTS := $(wildcard test/*.rb)
 ifeq ($(SPINEL_INT_OVERFLOW),promote)
 TESTS := $(filter-out test/int_overflow_raises.rb,$(TESTS))
 endif
+# sp_net is POSIX-only; on Windows the TU compiles to stubs, so the
+# sp_net smoke's output diverges. Skip it there (the POSIX surface is
+# exercised by consumer suites on POSIX targets).
+ifeq ($(OS),Windows_NT)
+TESTS := $(filter-out test/sp_net_basic.rb,$(TESTS))
+endif
 TEST_TARGETS := $(patsubst test/%.rb,build/test-results/%.ok,$(TESTS))
 
 # `make test` is incremental via mtime tracking on .ok files;

@@ -4,8 +4,48 @@
  * Extracted from tep's lib/tep/sphttp.c (the POSIX-runtime core that
  * is generic across HTTP-shaped Spinel programs), per matz/spinel#1054
  * and OriPekelman/tep#12. HTTP framing + WebSocket accessors + TLS stay
- * framework-side. */
+ * framework-side.
+ *
+ * Platform split: sp_net is a POSIX prefork/poll runtime (sockets,
+ * poll(2), fork, sigaction). Those APIs don't exist under MinGW, so on
+ * Windows the whole TU compiles to thin error-sentinel stubs -- the
+ * functionality is simply absent there, but libspinel_rt.a still
+ * builds everywhere. Mirrors sp_runtime.h's per-platform fiber backend
+ * (Win32 Fiber vs POSIX ucontext). */
 #include "sp_net.h"
+
+#if defined(_WIN32)
+
+/* ---------- Windows (MinGW): no POSIX net/process surface ---------- */
+
+int sp_net_install_term_handlers(void) { return -1; }
+int sp_net_shutdown_requested(void)    { return 0; }
+
+int sp_net_listen(int port, int reuseport) { (void)port; (void)reuseport; return -1; }
+int sp_net_accept(int sfd)                 { (void)sfd; return -1; }
+int sp_net_accept_nb(int sfd)              { (void)sfd; return -1; }
+int sp_net_connect(const char *host, int port) { (void)host; (void)port; return -1; }
+int sp_net_close(int fd)                   { (void)fd; return -1; }
+int sp_net_set_nonblock(int fd)            { (void)fd; return -1; }
+
+int         sp_net_write_str(int fd, const char *s) { (void)fd; (void)s; return -1; }
+int         sp_net_write_bytes(int fd, const char *data, int n) { (void)fd; (void)data; (void)n; return -1; }
+const char *sp_net_recv_some(int fd, int maxlen) { (void)fd; (void)maxlen; return ""; }
+const char *sp_net_recv_all(int fd, int max_bytes) { (void)fd; (void)max_bytes; return ""; }
+
+int sp_net_poll_reset(void)               { return 0; }
+int sp_net_poll_add(int fd, int mode_bits) { (void)fd; (void)mode_bits; return -1; }
+int sp_net_poll_run(int timeout_ms)       { (void)timeout_ms; return -1; }
+int sp_net_poll_ready(int slot)           { (void)slot; return 0; }
+
+int sp_net_fork(void)                     { return -1; }
+int sp_net_exit(int status)               { (void)status; return -1; }
+int sp_net_getpid(void)                   { return -1; }
+int sp_net_wait_any(void)                 { return -1; }
+
+const char *sp_net_shell_capture(const char *cmd, int max_bytes) { (void)cmd; (void)max_bytes; return ""; }
+
+#else /* POSIX */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +94,7 @@ int sp_net_shutdown_requested(void) {
 /* ---------- TCP socket lifecycle ---------- */
 
 int sp_net_listen(int port, int reuseport) {
+    if (port < 0 || port > 65535) return -1;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
 
@@ -65,6 +106,7 @@ int sp_net_listen(int port, int reuseport) {
     }
 #endif
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    /* Don't die on a write to a peer that closed. */
     signal(SIGPIPE, SIG_IGN);
 
     struct sockaddr_in addr;
@@ -109,6 +151,11 @@ int sp_net_accept_nb(int sfd) {
 }
 
 int sp_net_connect(const char *host, int port) {
+    if (port < 0 || port > 65535) return -1;
+    /* A client that never listens still needs SIGPIPE ignored: a write
+     * to an upstream that closed would otherwise kill the process. */
+    signal(SIGPIPE, SIG_IGN);
+
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_UNSPEC;
@@ -153,7 +200,7 @@ int sp_net_write_str(int fd, const char *s) {
     while (off < len) {
         ssize_t n = send(fd, s + off, len - off, 0);
         if (n <= 0) {
-            if (errno == EINTR) continue;
+            if (n < 0 && errno == EINTR) continue;
             return -1;
         }
         off += (size_t)n;
@@ -167,7 +214,7 @@ int sp_net_write_bytes(int fd, const char *data, int n) {
     while (off < total) {
         ssize_t w = send(fd, data + off, total - off, 0);
         if (w <= 0) {
-            if (errno == EINTR) continue;
+            if (w < 0 && errno == EINTR) continue;
             return -1;
         }
         off += (size_t)w;
@@ -178,8 +225,16 @@ int sp_net_write_bytes(int fd, const char *data, int n) {
 static char sp_net_recv_buf[SP_NET_BUFSIZE];
 const char *sp_net_recv_some(int fd, int maxlen) {
     if (maxlen <= 0 || maxlen >= SP_NET_BUFSIZE) maxlen = SP_NET_BUFSIZE - 1;
-    ssize_t n = recv(fd, sp_net_recv_buf, (size_t)maxlen, 0);
-    if (n <= 0) {
+    ssize_t n;
+    for (;;) {
+        /* Cooperative shutdown: bail rather than retry into the signal. */
+        if (sp_net_term_flag) {
+            sp_net_recv_buf[0] = '\0';
+            return sp_net_recv_buf;
+        }
+        n = recv(fd, sp_net_recv_buf, (size_t)maxlen, 0);
+        if (n >= 0) break;
+        if (errno == EINTR) continue;   /* e.g. SIGCHLD in a prefork server */
         sp_net_recv_buf[0] = '\0';
         return sp_net_recv_buf;
     }
@@ -192,8 +247,13 @@ const char *sp_net_recv_all(int fd, int max_bytes) {
     if (max_bytes <= 0 || max_bytes >= SP_NET_BUFSIZE) max_bytes = SP_NET_BUFSIZE - 1;
     int total = 0;
     while (total < max_bytes) {
+        if (sp_net_term_flag) break;
         ssize_t n = recv(fd, sp_net_recv_all_buf + total, (size_t)(max_bytes - total), 0);
-        if (n <= 0) break;
+        if (n < 0) {
+            if (errno == EINTR) continue;   /* retry rather than truncate */
+            break;
+        }
+        if (n == 0) break;                   /* clean EOF */
         total += (int)n;
     }
     sp_net_recv_all_buf[total] = '\0';
@@ -224,10 +284,18 @@ int sp_net_poll_add(int fd, int mode_bits) {
 
 int sp_net_poll_run(int timeout_ms) {
     int r;
-    do {
+    for (;;) {
+        /* Don't retry into a pending shutdown -- surface it as -1 so a
+         * blocked scheduler tick can break and run shutdown hooks. */
+        if (sp_net_term_flag) return -1;
         r = poll(sp_net_poll_set, sp_net_poll_n, timeout_ms);
-    } while (r < 0 && errno == EINTR);
-    return r;
+        if (r >= 0) return r;
+        if (errno == EINTR) {
+            if (sp_net_term_flag) return -1;
+            continue;
+        }
+        return -1;
+    }
 }
 
 int sp_net_poll_ready(int slot) {
@@ -278,3 +346,5 @@ const char *sp_net_shell_capture(const char *cmd, int max_bytes) {
     pclose(fp);
     return sp_net_shell_buf;
 }
+
+#endif /* _WIN32 */
