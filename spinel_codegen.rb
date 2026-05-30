@@ -1043,6 +1043,211 @@ class Compiler
     "(&(\"\\xff\" \"" + cls_name_to_ruby(cname) + "\")[1])"
   end
 
+ # `raise E.new(a, b)` / `E.new(a, b)` for a user exception subclass
+ # whose `#initialize` calls `super(<msg>)`: the user's message is
+ # `<msg>` evaluated with the init params bound to the construction
+ # args, NOT just the first construction arg. Returns the C expr for
+ # that message, or "" to fall back to first-arg behavior.
+ #
+ # Binding strategy (see fiber_var_ref): declare a fresh temp per init
+ # param, set the global @inline_rename_map so compile_expr resolves
+ # param reads (including those inside string interpolation) to those
+ # temps, compile the super arg, materialize into a const-char temp.
+ # No class/method context switch -- gated to super args that touch
+ # only params (no self/ivars/method calls), so self never matters.
+  def find_super_node(nid)
+    if nid < 0
+      return -1
+    end
+    t = @nd_type[nid]
+    if t == "SuperNode"
+      return nid
+    end
+ # Don't descend into nested defs/classes -- a `super` there belongs
+ # to a different method.
+    if t == "DefNode" || t == "ClassNode" || t == "ModuleNode" || t == "SingletonClassNode"
+      return -1
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      r = find_super_node(cs[k])
+      if r >= 0
+        return r
+      end
+      k = k + 1
+    end
+    -1
+  end
+
+  def super_arg_refs_only_params(nid, pnames)
+    if nid < 0
+      return 1
+    end
+    t = @nd_type[nid]
+    if t == "CallNode" || t == "SelfNode" || t == "YieldNode"
+      return 0
+    end
+    if t == "InstanceVariableReadNode" || t == "InstanceVariableWriteNode" || t == "GlobalVariableReadNode"
+      return 0
+    end
+    if t == "ConstantReadNode" || t == "ConstantPathNode"
+      return 0
+    end
+    if t == "LocalVariableReadNode"
+      if not_in(@nd_name[nid], pnames) == 1
+        return 0
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      if super_arg_refs_only_params(cs[k], pnames) == 0
+        return 0
+      end
+      k = k + 1
+    end
+    1
+  end
+
+ # Collect the init-param names actually referenced in the super
+ # message expression. Only these need binding, so we never compile a
+ # construction arg the message doesn't use -- avoiding a spurious
+ # "cannot resolve" on, say, a 2nd arg that the old first-arg-only path
+ # silently dropped.
+  def collect_super_arg_param_refs(nid, pnames, acc)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "LocalVariableReadNode"
+      nm = @nd_name[nid]
+      if not_in(nm, pnames) == 0 && not_in(nm, acc) == 1
+        acc.push(nm)
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      collect_super_arg_param_refs(cs[k], pnames, acc)
+      k = k + 1
+    end
+  end
+
+  def exc_param_default_val(def_id, name)
+    params_id = @nd_parameters[def_id]
+    if params_id >= 0
+      opts = parse_id_list(@nd_optionals[params_id])
+      oi = 0
+      while oi < opts.length
+        if @nd_name[opts[oi]] == name
+          dv = @nd_expression[opts[oi]]
+          if dv >= 0
+            return compile_expr(dv)
+          end
+        end
+        oi = oi + 1
+      end
+    end
+    ""
+  end
+
+  def exc_super_msg(cname, ctor_args)
+    def_id = find_initialize_def_for_class(0, cname)
+    if def_id < 0
+      return ""
+    end
+    body = @nd_body[def_id]
+    if body < 0
+      return ""
+    end
+    sup = find_super_node(body)
+    if sup < 0
+      return ""
+    end
+    sargs_id = @nd_arguments[sup]
+    if sargs_id < 0
+      return ""
+    end
+    sargs = get_args(sargs_id)
+    if sargs.length < 1
+      return ""
+    end
+    super_arg = sargs[0]
+    ci = find_class_idx(cname)
+    if ci < 0
+      return ""
+    end
+    midx = cls_find_method_direct(ci, "initialize")
+    if midx < 0
+      return ""
+    end
+    pnames = cls_meth_pnames_get(ci, midx)
+    ptypes = cls_meth_ptypes_get(ci, midx)
+    if super_arg_refs_only_params(super_arg, pnames) == 0
+      return ""
+    end
+ # ctor_args is the already-extracted construction-arg node-id list
+ # (an int array). Passing the extracted list rather than the bare
+ # construction node id keeps analyze from unifying a node-id param
+ # with the caller's `nid` and corrupting its type.
+    cargs = ctor_args
+    refset = "".split(",", -1)
+    collect_super_arg_param_refs(super_arg, pnames, refset)
+    suffix = new_temp
+    mfrom = "".split(",", -1)
+    mto = "".split(",", -1)
+ # Isolate the binding's scope entries so the param names/types we
+ # register for find_var_type (used by interpolation's infer_type)
+ # don't leak into the construction site's scope.
+    push_scope
+    pk = 0
+    while pk < pnames.length
+ # Bind only params the super message actually references, so a
+ # construction arg the message ignores is never compiled (it would
+ # otherwise surface a "cannot resolve" the old first-arg path hid).
+      if not_in(pnames[pk], refset) == 0
+        pt = "string"
+        if pk < ptypes.length && ptypes[pk] != ""
+          pt = ptypes[pk]
+        end
+        tnm = pnames[pk] + suffix
+        val = ""
+        if pk < cargs.length && cargs[pk] >= 0
+          val = compile_expr(cargs[pk])
+        else
+          val = exc_param_default_val(def_id, pnames[pk])
+        end
+        if val == ""
+          pop_scope
+          return ""
+        end
+        emit("  " + c_type(pt) + " lv_" + tnm + " = " + val + ";")
+ # tnm: declared type of the actual C temp (compile_expr unbox path).
+ # pname: the source name, so infer_type's find_var_type resolves the
+ # param type when picking interpolation's %s vs %lld.
+        declare_var(tnm, pt)
+        declare_var(pnames[pk], pt)
+        mfrom.push(pnames[pk])
+        mto.push(tnm)
+      end
+      pk = pk + 1
+    end
+    saved_f = @inline_rename_map_from
+    saved_t = @inline_rename_map_to
+    @inline_rename_map_from = mfrom
+    @inline_rename_map_to = mto
+    msg = compile_expr(super_arg)
+    @inline_rename_map_from = saved_f
+    @inline_rename_map_to = saved_t
+    pop_scope
+    em = new_temp
+    emit("  const char *" + em + " = " + msg + ";")
+    em
+  end
+
  # Reverse the `_`-as-module-separator mangling applied by
  # collect_class_with_prefix. Walks the longest prefix that matches
  # a registered module (recursively, so a nested `Outer_Inner`
@@ -1387,6 +1592,11 @@ class Compiler
         cname_inner = @nd_name[r_inner]
         if is_exception_class_name(cname_inner) == 1
           @needs_exc_class_hierarchy = 1
+          super_msg_inner = exc_super_msg(cname_inner, get_args(@nd_arguments[arg_id]))
+          if super_msg_inner != ""
+            emit("  sp_raise_cls(\"" + cname_inner + "\", " + super_msg_inner + ");")
+            return
+          end
           args_id_inner = @nd_arguments[arg_id]
           if args_id_inner >= 0
             aa_inner = get_args(args_id_inner)
@@ -20013,12 +20223,14 @@ class Compiler
       if is_exception_class_name(cname) == 1
         @needs_exc_class_hierarchy = 1
         @needs_setjmp = 1   # pulls in sp_exc_* runtime helpers
-        msg_expr_be = ""
-        args_id_be = @nd_arguments[nid]
-        if args_id_be >= 0
-          aa_be = get_args(args_id_be)
-          if aa_be.length >= 1
-            msg_expr_be = compile_expr(aa_be[0])
+        msg_expr_be = exc_super_msg(cname, get_args(@nd_arguments[nid]))
+        if msg_expr_be == ""
+          args_id_be = @nd_arguments[nid]
+          if args_id_be >= 0
+            aa_be = get_args(args_id_be)
+            if aa_be.length >= 1
+              msg_expr_be = compile_expr(aa_be[0])
+            end
           end
         end
         if msg_expr_be == ""
