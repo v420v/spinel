@@ -51,8 +51,8 @@ typedef bool mrb_bool;
    the value. This affects ONLY int? (nullable-int) slots; a plain
    (non-nullable) int holding -2147483648 is fine, since it never
    consults sp_int_is_nil. The integer-overflow helpers deliberately do
-   NOT reserve this value (checking every +/-/* result against it would
-   cost the hot path the embedded build is trying to save). Code that
+   NOT reserve this value (checking every add/sub/mul result against it
+   would cost the hot path the embedded build is trying to save). Code that
    must store -2147483648 nullably on 32-bit should box it (poly) rather
    than use a flat int? slot. */
 #define SP_INT_NIL ((mrb_int)INTPTR_MIN)
