@@ -811,4 +811,184 @@ class Compiler
     result
   end
 
+ # Resolve `class CONST` (and `module`) where CONST is a constant
+ # aliased to an existing class via `CONST = SomeClass` or
+ # `CONST = <literal-or-class>.class`, so the body reopens that class
+ # rather than defining a fresh one named after the alias (#1036:
+ # `INTEGER_KLASS = 1.class; class INTEGER_KLASS; include M; end`).
+ #
+ # Runs in BOTH analyze and codegen (each loads its own AST) before any
+ # class collection, and rewrites the ClassNode's constant_path name in
+ # place. Doing it at the source means every downstream name derivation
+ # sees the resolved name -- no half-applied alias where methods land
+ # on one class index and dispatch resolves another.
+  def resolve_class_aliases
+    root = @root_id
+    if @nd_type[root] != "ProgramNode"
+      return
+    end
+    class_names = "".split(",", -1)
+    collect_classnode_names(root, class_names)
+    amap_from = "".split(",", -1)
+    amap_to = "".split(",", -1)
+    build_class_alias_map(root, class_names, amap_from, amap_to)
+    if amap_from.length == 0
+      return
+    end
+    rewrite_class_alias_refs(root, amap_from, amap_to)
+  end
+
+  def collect_classnode_names(nid, acc)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "ClassNode"
+      cp = @nd_constant_path[nid]
+      if cp >= 0 && @nd_type[cp] == "ConstantReadNode"
+        nm = @nd_name[cp]
+        if not_in(nm, acc) == 1
+          acc.push(nm)
+        end
+      end
+    end
+    kids = []
+    push_child_ids(nid, kids)
+    k = 0
+    while k < kids.length
+      collect_classnode_names(kids[k], acc)
+      k = k + 1
+    end
+  end
+
+ # The class a literal node is an instance of, for `<lit>.class`.
+  def literal_class_name(nid)
+    if nid < 0
+      return ""
+    end
+    t = @nd_type[nid]
+    if t == "IntegerNode"
+      return "Integer"
+    end
+    if t == "FloatNode"
+      return "Float"
+    end
+    if t == "StringNode"
+      return "String"
+    end
+    if t == "SymbolNode"
+      return "Symbol"
+    end
+    if t == "ArrayNode"
+      return "Array"
+    end
+    if t == "HashNode"
+      return "Hash"
+    end
+    if t == "RegularExpressionNode"
+      return "Regexp"
+    end
+    if t == "TrueNode"
+      return "TrueClass"
+    end
+    if t == "FalseNode"
+      return "FalseClass"
+    end
+    if t == "NilNode"
+      return "NilClass"
+    end
+    ""
+  end
+
+  def is_builtin_class_const(name)
+    builtins = "Integer;Float;String;Symbol;Array;Hash;Object;BasicObject;Numeric;Regexp;Range;Proc;Exception;StandardError;Comparable;Enumerable;Kernel;Module;Class".split(";", -1)
+    if not_in(name, builtins) == 0
+      return 1
+    end
+    0
+  end
+
+ # Resolve a constant's RHS value-node to the class name it aliases, or
+ # "" when it isn't a class alias.
+  def class_alias_target(rhs, class_names)
+    if rhs < 0
+      return ""
+    end
+    t = @nd_type[rhs]
+    if t == "ConstantReadNode"
+      nm = @nd_name[rhs]
+      if not_in(nm, class_names) == 0 || is_builtin_class_const(nm) == 1
+        return nm
+      end
+      return ""
+    end
+    if t == "CallNode" && @nd_name[rhs] == "class"
+      recv = @nd_receiver[rhs]
+      if recv < 0
+        return ""
+      end
+      lc = literal_class_name(recv)
+      if lc != ""
+        return lc
+      end
+      if @nd_type[recv] == "ConstantReadNode"
+        rnm = @nd_name[recv]
+        if not_in(rnm, class_names) == 0 || is_builtin_class_const(rnm) == 1
+          return rnm
+        end
+      end
+    end
+    ""
+  end
+
+  def build_class_alias_map(nid, class_names, amap_from, amap_to)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "ConstantWriteNode"
+      cname = @nd_name[nid]
+      tgt = class_alias_target(@nd_expression[nid], class_names)
+ # Only treat it as a class alias when it resolves to a DIFFERENT
+ # name (`Foo = Foo` / a class's own const are not aliases) and isn't
+ # already recorded.
+      if tgt != "" && tgt != cname && not_in(cname, amap_from) == 1
+        amap_from.push(cname)
+        amap_to.push(tgt)
+      end
+    end
+    kids = []
+    push_child_ids(nid, kids)
+    k = 0
+    while k < kids.length
+      build_class_alias_map(kids[k], class_names, amap_from, amap_to)
+      k = k + 1
+    end
+  end
+
+  def rewrite_class_alias_refs(nid, amap_from, amap_to)
+    if nid < 0
+      return
+    end
+    if @nd_type[nid] == "ClassNode"
+      cp = @nd_constant_path[nid]
+      if cp >= 0 && @nd_type[cp] == "ConstantReadNode"
+        nm = @nd_name[cp]
+        ai = 0
+        while ai < amap_from.length
+          if amap_from[ai] == nm
+            set_string_field(cp, "name", amap_to[ai])
+            ai = amap_from.length
+          end
+          ai = ai + 1
+        end
+      end
+    end
+    kids = []
+    push_child_ids(nid, kids)
+    k = 0
+    while k < kids.length
+      rewrite_class_alias_refs(kids[k], amap_from, amap_to)
+      k = k + 1
+    end
+  end
+
 end

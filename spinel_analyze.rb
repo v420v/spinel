@@ -8057,6 +8057,9 @@ class Compiler
     if @nd_type[root] != "ProgramNode"
       return
     end
+ # Pre-pass: rewrite `class CONST` reopens of constant-aliased classes
+ # to the real class name before any collection sees them (#1036).
+    resolve_class_aliases
     stmts = get_body_stmts(root)
 
  # Pass 0: modules (must come before classes for include)

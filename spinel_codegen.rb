@@ -8521,6 +8521,10 @@ class Compiler
 
 
   def generate_code
+ # Mirror analyze's pre-pass: rewrite constant-aliased `class CONST`
+ # reopens to the real class name before any AST-derived class-name
+ # lookup, so codegen's names match the IR tables analyze emitted (#1036).
+    resolve_class_aliases
     stmts = get_body_stmts(@root_id)
 
  # Issue #727: warn when the program defines `method_missing`.
