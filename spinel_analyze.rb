@@ -8919,6 +8919,70 @@ class Compiler
     @const_scope_names.push(scope_name)
   end
 
+ # Register a single method as an open-class top-level function
+ # (`__oc_<cname>_<mname>`) -- the form primitive dispatch resolves for
+ # built-in reopens (`class Integer; def to_words`). Shared by the
+ # direct-def and include-into-built-in paths.
+  def register_open_class_def(cname, mname, sid)
+    @meth_names.push("__oc_" + cname + "_" + mname)
+    @meth_param_names.push(collect_params_str(sid))
+    @meth_param_types.push(collect_ptypes_str(sid, -1))
+    @meth_param_empty.push("")
+    @meth_return_types.push("int")
+    @meth_body_ids.push(@nd_body[sid])
+    @meth_has_yield.push(0)
+    @meth_has_defaults.push("0")
+    @meth_rest_index.push(collect_rest_index(sid))
+    @meth_kwrest_index.push(collect_kwrest_index(sid))
+  end
+
+ # Register the instance methods of an included module as open-class
+ # functions on a reopened built-in (`class Integer; include M`). Skips
+ # `def self.x` module functions and names already registered (so a
+ # direct def or a second include doesn't duplicate the C function).
+  def register_open_class_module_methods(cname, inc_nid, module_prefix)
+    inc_t = @nd_type[inc_nid]
+    if inc_t != "ConstantReadNode" && inc_t != "ConstantPathNode"
+      return
+    end
+    mod_name = const_ref_flat_name(inc_nid)
+    if mod_name == ""
+      return
+    end
+    eff_prefix = module_prefix
+    if const_ref_is_relative(inc_nid) == 0
+      eff_prefix = ""
+    end
+    resolved_mod = resolve_include_module_name(mod_name, eff_prefix)
+    mi = 0
+    while mi < @module_names.length
+      if @module_names[mi] == resolved_mod
+        mbody = @module_body_ids[mi]
+        if mbody >= 0
+          mstmts = get_stmts(mbody)
+          mk = 0
+          while mk < mstmts.length
+            sid = mstmts[mk]
+            if @nd_type[sid] == "DefNode"
+              is_cls_def = 0
+              if @nd_receiver[sid] >= 0 && @nd_type[@nd_receiver[sid]] == "SelfNode"
+                is_cls_def = 1
+              end
+              if is_cls_def == 0
+                ocfull = "__oc_" + cname + "_" + @nd_name[sid]
+                if not_in(ocfull, @meth_names) == 1
+                  register_open_class_def(cname, @nd_name[sid], sid)
+                end
+              end
+            end
+            mk = mk + 1
+          end
+        end
+      end
+      mi = mi + 1
+    end
+  end
+
   def collect_class_with_prefix(nid, module_prefix)
     ci = @cls_names.length
     cname = ""
@@ -8941,20 +9005,22 @@ class Compiler
         body_stmts = get_stmts(body)
         body_stmts.each { |sid|
           if @nd_type[sid] == "DefNode"
- # Add as top-level method with prefix
-            mname = @nd_name[sid]
- # Store with special naming for lookup
-            @meth_names.push("__oc_" + cname + "_" + mname)
-            params = collect_params_str(sid)
-            @meth_param_names.push(params)
-            @meth_param_types.push(collect_ptypes_str(sid, -1))
-            @meth_param_empty.push("")
-            @meth_return_types.push("int")
-            @meth_body_ids.push(@nd_body[sid])
-            @meth_has_yield.push(0)
-            @meth_has_defaults.push("0")
-            @meth_rest_index.push(collect_rest_index(sid))
-            @meth_kwrest_index.push(collect_kwrest_index(sid))
+            register_open_class_def(cname, @nd_name[sid], sid)
+          end
+ # `include M` inside a reopened built-in: the module's instance
+ # methods must also become `__oc_<cname>_<m>` top-level functions so
+ # primitive dispatch (e.g. `42.to_words`) finds them, exactly like a
+ # direct `def`. Without this the include was silently dropped here.
+          if @nd_type[sid] == "CallNode" && @nd_name[sid] == "include"
+            inc_args_oc = @nd_arguments[sid]
+            if inc_args_oc >= 0
+              inc_ids_oc = get_args(inc_args_oc)
+              iko = 0
+              while iko < inc_ids_oc.length
+                register_open_class_module_methods(cname, inc_ids_oc[iko], module_prefix)
+                iko = iko + 1
+              end
+            end
           end
         }
       end
