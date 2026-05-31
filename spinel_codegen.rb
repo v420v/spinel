@@ -13301,7 +13301,17 @@ class Compiler
           emit("  sp_init_in_progress_" + @const_names[i] + " = 1;")
         end
         if val == ""
-          val = compile_expr(eid_init)
+ # A poly (sp_RbVal) const slot needs its initializer boxed.
+ # Otherwise a `nil` init lowers to a bare `0` and the assignment
+ # to the sp_RbVal slot is a C type error ("assigning to 'sp_RbVal'
+ # from incompatible type 'int'"). box_expr_to_poly handles nil
+ # (sp_box_nil()) as well as int/string/array seeds. Issue #1075.
+          if ct_init == "poly"
+            @needs_rb_value = 1
+            val = box_expr_to_poly(eid_init)
+          else
+            val = compile_expr(eid_init)
+          end
         end
         @current_lexical_scope = old_scope
         emit("  cst_" + @const_names[i] + " = " + val + ";")
