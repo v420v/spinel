@@ -26420,6 +26420,42 @@ class Compiler
         if mname == "read" || mname == "binread"
           return "sp_file_read(" + compile_arg0(nid) + ")"
         end
+ # File.readlines(path[, chomp: true]) -- read the whole file and split
+ # on "\n", keeping the terminator (CRuby default). The first positional
+ # arg is the path; an `encoding:`/`chomp:` keyword hash trails it and is
+ # not the path. Composing sp_str_lines(sp_file_read(...)) splits on real
+ # newlines, so it handles lines longer than sp_readlines's fgets buffer.
+        if mname == "readlines"
+          @needs_str_array = 1
+          @needs_gc = 1
+          chomp_rl = false
+          args_id_rl = @nd_arguments[nid]
+          if args_id_rl >= 0
+            a_rl = get_args(args_id_rl)
+            ek_rl = 0
+            while ek_rl < a_rl.length
+              if @nd_type[a_rl[ek_rl]] == "KeywordHashNode"
+                elems_rl = parse_id_list(@nd_elements[a_rl[ek_rl]])
+                ei_rl = 0
+                while ei_rl < elems_rl.length
+                  if @nd_type[elems_rl[ei_rl]] == "AssocNode"
+                    key_rl = @nd_key[elems_rl[ei_rl]] >= 0 ? @nd_key[elems_rl[ei_rl]] : -1
+                    val_rl = @nd_expression[elems_rl[ei_rl]] >= 0 ? @nd_expression[elems_rl[ei_rl]] : -1
+                    if key_rl >= 0 && @nd_type[key_rl] == "SymbolNode" && @nd_content[key_rl] == "chomp" && val_rl >= 0 && @nd_type[val_rl] == "TrueNode"
+                      chomp_rl = true
+                    end
+                  end
+                  ei_rl = ei_rl + 1
+                end
+              end
+              ek_rl = ek_rl + 1
+            end
+          end
+          if chomp_rl
+            return "sp_str_lines_chomp(sp_file_read(" + compile_arg0(nid) + "))"
+          end
+          return "sp_str_lines(sp_file_read(" + compile_arg0(nid) + "))"
+        end
         if mname == "mtime"
           return "sp_file_mtime(" + compile_arg0(nid) + ")"
         end

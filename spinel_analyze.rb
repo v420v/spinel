@@ -6691,6 +6691,9 @@ class Compiler
           if mname == "read" || mname == "binread"
             return "string"
           end
+          if mname == "readlines"
+            return "str_array"
+          end
           if mname == "mtime"
             return "time"
           end
