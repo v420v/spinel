@@ -22455,6 +22455,22 @@ class Compiler
     if mname == "itself"
       return rc
     end
+ # `float <=> int/float` -- 3-way numeric compare to mrb_int
+ # (-1 / 0 / 1). Mirrors the int-recv arm; a non-numeric argument
+ # falls through (CRuby returns nil there, outside this typed path).
+    if mname == "<=>"
+      args_id_fcmp = @nd_arguments[nid]
+      if args_id_fcmp >= 0
+        a_fcmp = get_args(args_id_fcmp)
+        if a_fcmp.length >= 1
+          rt_fcmp = infer_type(a_fcmp[0])
+          if rt_fcmp == "int" || rt_fcmp == "float"
+            arg_fe = compile_expr(a_fcmp[0])
+            return "((" + rc + ") < (" + arg_fe + ") ? (mrb_int)-1 : ((" + rc + ") > (" + arg_fe + ") ? (mrb_int)1 : (mrb_int)0))"
+          end
+        end
+      end
+    end
     if mname == "to_s"
       return "sp_float_to_s(" + rc + ")"
     end

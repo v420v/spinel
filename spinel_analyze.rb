@@ -3840,6 +3840,11 @@ class Compiler
           return "bool"
         end
       end
+ # Numeric `<=>` is Integer (-1 / 0 / 1). int already resolves via
+ # its own arm; float was unresolved and fell back to emitting 0.
+      if lt == "float" && mname == "<=>"
+        return "int"
+      end
       args_id = @nd_arguments[nid]
       if args_id >= 0
         aargs = parse_id_list(@nd_args[args_id])
