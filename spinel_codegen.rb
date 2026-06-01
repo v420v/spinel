@@ -22002,6 +22002,22 @@ class Compiler
       end
       return "sp_str_sub_range(" + rc + ", " + compile_arg0_as_int(nid) + ", 1)"
     end
+ # String#byteslice -- byte-indexed substring. `byteslice(i, n)` takes
+ # n bytes from byte offset i; `byteslice(i)` takes a single byte.
+    if mname == "byteslice"
+      args_id_bsl = @nd_arguments[nid]
+      if args_id_bsl >= 0
+        a_bsl = get_args(args_id_bsl)
+        if a_bsl.length >= 2
+          return "sp_str_byteslice(" + rc + ", " + compile_expr_as_int(a_bsl[0]) + ", " + compile_expr_as_int(a_bsl[1]) + ")"
+        end
+        if a_bsl.length == 1
+          return "sp_str_byteslice(" + rc + ", " + compile_expr_as_int(a_bsl[0]) + ", 1)"
+        end
+      end
+      warn_unresolved_call(mname, "string")
+      return "0"
+    end
     if mname == "center"
       args_id = @nd_arguments[nid]
       if args_id >= 0

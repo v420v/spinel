@@ -5349,6 +5349,9 @@ class Compiler
     if mname == "slice"
       return "string"
     end
+    if mname == "byteslice"
+      return "string"
+    end
     if mname == "ljust"
       return "string"
     end

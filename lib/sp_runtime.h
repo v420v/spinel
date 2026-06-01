@@ -1388,6 +1388,10 @@ static const char*sp_str_sub_range(const char*s,mrb_int start,mrb_int len){mrb_i
    range forms keep returning "" on OOB via sp_str_sub_range; only
    the bare single-int index aliases here. Issue #619 puzzle 3. */
 static const char*sp_str_char_at_or_nil(const char*s,mrb_int i){mrb_int cl=sp_str_length(s);if(i<0)i+=cl;if(i<0||i>=cl)return NULL;return sp_str_sub_range(s,i,1);}
+/* String#byteslice(start,len): byte-indexed (unlike the char-indexed
+   sp_str_sub_range). Negative start counts from the byte length. Out of
+   range yields the empty string, matching slice's "" rather than CRuby nil. */
+static const char*sp_str_byteslice(const char*s,mrb_int start,mrb_int len){mrb_int bl=(mrb_int)sp_str_byte_len(s);if(start<0)start+=bl;if(start<0||start>bl||len<0){return &("\xff" "")[1];}if(start+len>bl)len=bl-start;if(len<=0){return &("\xff" "")[1];}char*r=sp_str_alloc_raw(len+1);memcpy(r,s+start,len);r[len]=0;return r;}
 /* Char-indexed variant; the second arg used to be a hoisted byte length, now a
    hoisted codepoint count.  We don't need it for correctness, but keeping the
    ABI lets callers pass it without a wrapper. */
