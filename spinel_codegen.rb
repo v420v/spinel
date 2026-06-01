@@ -23095,6 +23095,11 @@ class Compiler
     if mname == "append"
       return compile_array_method_expr(nid, "push", rc, recv_type)
     end
+ # Array#object_id -- the receiver's pointer bit pattern, as for the
+ # String case. Stable across GC (the array isn't relocated).
+    if mname == "object_id"
+      return "((mrb_int)(uintptr_t)(" + rc + "))"
+    end
  # `map!` / `collect!` -- transform each element in place and return the
  # mutated receiver. The block's last expression is the new value (the
  # codebase's inline-block convention); it must match the array's
