@@ -436,6 +436,24 @@ class Compiler
     result
   end
 
+ # The enclosing module's name when `self` denotes a module -- i.e.
+ # inside a module body or a `def self.x` module class-method.
+ # current_lexical_scope_name already yields the module name in both
+ # contexts (directly from @current_lexical_scope for a body, or by
+ # stripping `_cls_<m>` off @current_method_name for a class method);
+ # this just gates it on the scope actually being a module so `self`
+ # in a plain class isn't mistaken for a module singleton receiver.
+ # Returns "" when self is not a module. Used to route `self.<acc>` /
+ # `self.<acc> = v` to the same module-singleton-accessor slot that
+ # `Mod.<acc>` resolves to.
+  def current_module_scope
+    scope = current_lexical_scope_name
+    if scope != "" && module_name_exists(scope) == 1
+      return scope
+    end
+    ""
+  end
+
  # ---- AST node table storage (parallel arrays by node ID) ----
  # The 46 @nd_* arrays are initialized in each host's `initialize`
  # and operated on here. Fields are listed explicitly (not via

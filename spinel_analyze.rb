@@ -6859,11 +6859,18 @@ class Compiler
  # The poly-slot const synthesized at module-collect time
  # backs the read; codegen returns it as cst_<Mod>_<accessor>
  # (sp_RbVal). Skip when args are present so this doesn't
- # collide with method-style calls. Issue #511.
+ # collide with method-style calls. Issue #511. `self.accessor`
+ # from inside that module (body or `def self.x`) resolves to the
+ # same slot, so accept a SelfNode receiver via current_module_scope.
+    rcname_acc = ""
     if recv >= 0 && @nd_type[recv] == "ConstantReadNode"
+      rcname_acc = @nd_name[recv]
+    elsif recv >= 0 && @nd_type[recv] == "SelfNode"
+      rcname_acc = current_module_scope
+    end
+    if rcname_acc != ""
       args_id_acc = @nd_arguments[nid]
       if args_id_acc < 0 || get_args(args_id_acc).length == 0
-        rcname_acc = @nd_name[recv]
         if module_name_exists(rcname_acc) == 1
           if find_module_acc_idx(rcname_acc + "." + mname) >= 0
             slot_a = rcname_acc + "_" + mname

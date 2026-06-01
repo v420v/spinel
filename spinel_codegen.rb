@@ -12393,20 +12393,32 @@ class Compiler
  # Definitions, constants, and class macros are handled elsewhere, and
  # a call to one of the class's own methods is treated as a
  # compile-time DSL (analysis interprets it, e.g. optcarrot's `op`),
- # so it stays unemitted to avoid double execution.
-  def clsbody_stmt_emittable(sid, ci)
+ # so it stays unemitted to avoid double execution. `mod_scope` is the
+ # body's scoped name (or "") so the self-accessor check below works
+ # during collection, before @current_lexical_scope is set.
+  def clsbody_stmt_emittable(sid, ci, mod_scope)
     if @nd_type[sid] != "CallNode"
       return 0
     end
- # Only bare calls (no explicit receiver) run as definition-time side
- # effects -- e.g. `puts`. A call with a receiver (`M.use(...)`,
- # `self.x = ...`) is a self-referential / metaprogramming shape left
- # to the existing compile-time handling.
     recv = @nd_receiver[sid]
+    mn = @nd_name[sid]
+ # `self.<accessor> = v` -- a module singleton attr writer. It runs at
+ # definition time and lowers to a direct slot write (cst_<Mod>_<acc>),
+ # so it is safe to emit (unlike a general receiver call).
+    if recv >= 0 && @nd_type[recv] == "SelfNode" &&
+       mn.length > 1 && mn[mn.length - 1] == "=" &&
+       mod_scope != "" && module_name_exists(mod_scope) == 1
+      if find_const_idx(mod_scope + "_" + mn[0, mn.length - 1]) >= 0
+        return 1
+      end
+    end
+ # Otherwise only bare calls (no explicit receiver) run as
+ # definition-time side effects -- e.g. `puts`. A call with a receiver
+ # (`M.use(...)`) is a self-referential / metaprogramming shape left to
+ # the existing compile-time handling.
     if recv >= 0
       return 0
     end
-    mn = @nd_name[sid]
     if clsbody_call_is_macro(mn) == 1
       return 0
     end
@@ -12478,7 +12490,7 @@ class Compiler
           has_emittable = 1
         end
       else
-        if clsbody_stmt_emittable(sid, ci) == 1
+        if clsbody_stmt_emittable(sid, ci, cscoped) == 1
           has_emittable = 1
         end
       end
@@ -12517,7 +12529,7 @@ class Compiler
           emit("  sp_clsbody_" + sid.to_s + "();")
         end
       else
-        if clsbody_stmt_emittable(sid, ci) == 1
+        if clsbody_stmt_emittable(sid, ci, cscoped) == 1
           compile_stmt(sid)
         end
       end
@@ -27268,12 +27280,18 @@ class Compiler
  # analyze time. The constant-fold path (used when every observed
  # write had a ConstantReadNode RHS) is checked separately below;
  # this arm covers the non-const RHS case where the slot holds an
- # sp_RbVal at runtime. Issue #511.
-    if rcname != "" && (@nd_arguments[nid] < 0 || get_args(@nd_arguments[nid]).length == 0)
-      if module_name_exists(rcname) == 1
-        slot_r = rcname + "_" + mname
-        if find_const_idx(slot_r) >= 0 && find_module_acc_idx(rcname + "." + mname) >= 0
-          rconsts_r = module_acc_resolved(rcname, mname)
+ # sp_RbVal at runtime. Issue #511. `self.accessor` from inside the
+ # module resolves to the same slot, so accept a SelfNode receiver
+ # via current_module_scope (rcname stays for the rest of the fn).
+    acc_mod = rcname
+    if acc_mod == "" && recv >= 0 && @nd_type[recv] == "SelfNode"
+      acc_mod = current_module_scope
+    end
+    if acc_mod != "" && (@nd_arguments[nid] < 0 || get_args(@nd_arguments[nid]).length == 0)
+      if module_name_exists(acc_mod) == 1
+        slot_r = acc_mod + "_" + mname
+        if find_const_idx(slot_r) >= 0 && find_module_acc_idx(acc_mod + "." + mname) >= 0
+          rconsts_r = module_acc_resolved(acc_mod, mname)
           if rconsts_r == "" || rconsts_r == "?"
             @needs_rb_value = 1
             return "cst_" + slot_r
@@ -37688,9 +37706,16 @@ class Compiler
  # `.nil?` reader compares the slot against 0 to detect
  # un-assigned, so the writer must stamp the sentinel even when
  # the resolver only saw one candidate.
-    if mname.length > 1 && mname[mname.length - 1] == "=" && recv >= 0 && @nd_type[recv] == "ConstantReadNode"
-      mod_name = @nd_name[recv]
-      if module_name_exists(mod_name) == 1
+    if mname.length > 1 && mname[mname.length - 1] == "=" && recv >= 0
+      mod_name = ""
+      if @nd_type[recv] == "ConstantReadNode"
+        mod_name = @nd_name[recv]
+      elsif @nd_type[recv] == "SelfNode"
+ # `self.accessor = v` inside the module body or a `def self.x`
+ # resolves to the same slot as `Mod.accessor = v`.
+        mod_name = current_module_scope
+      end
+      if mod_name != "" && module_name_exists(mod_name) == 1
         accessor = mname[0, mname.length - 1]
         rconsts = module_acc_resolved(mod_name, accessor)
         if rconsts != "" && rconsts != "?"
