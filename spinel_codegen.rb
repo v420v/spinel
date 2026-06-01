@@ -21919,6 +21919,15 @@ class Compiler
     if mname == "squeeze"
       if @nd_arguments[nid] >= 0
         ap_sq = get_args(@nd_arguments[nid])
+ # Multiple args squeeze runs of the INTERSECTION of the charsets.
+        if ap_sq.length > 1
+          tmp_arr_sq = new_temp
+          emit("  const char *" + tmp_arr_sq + "[" + ap_sq.length.to_s + "];")
+          ap_sq.each_with_index do |arg, i|
+            emit("  " + tmp_arr_sq + "[" + i.to_s + "] = " + compile_expr(arg) + ";")
+          end
+          return "sp_str_squeeze_n(" + rc + ", " + tmp_arr_sq + ", " + ap_sq.length.to_s + ")"
+        end
         if ap_sq.length > 0
           return "sp_str_squeeze_chars(" + rc + ", " + compile_expr(ap_sq[0]) + ")"
         end
