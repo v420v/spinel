@@ -5208,6 +5208,22 @@ class Compiler
       if @nd_arguments[nid] < 0 || get_args(@nd_arguments[nid]).length == 0
         return "float"
       end
+ # `rand(range)` yields an Integer for an int range, a Float for a
+ # float range; `rand(float)` yields a Float. An int arg falls
+ # through to the int default. The early return above guarantees a
+ # non-empty arg list here.
+      a0_rand = get_args(@nd_arguments[nid])[0]
+      if @nd_type[a0_rand] == "RangeNode"
+        lr = @nd_left[a0_rand]
+        rr = @nd_right[a0_rand]
+        if (lr >= 0 && infer_type(lr) == "float") || (rr >= 0 && infer_type(rr) == "float")
+          return "float"
+        end
+        return "int"
+      end
+      if infer_type(a0_rand) == "float"
+        return "float"
+      end
     end
     if mname == "scan"
       args_id_scan = @nd_arguments[nid]
@@ -5720,10 +5736,15 @@ class Compiler
             end
           end
         end
- # With arg → returns array of same type
+ # With arg → returns array of same type. A Range receiver
+ # materializes to an int_array (`(1..10).first(3)` => [1,2,3]),
+ # not another Range.
         if @nd_arguments[nid] >= 0
           aargs = get_args(@nd_arguments[nid])
           if aargs.length > 0
+            if rt == "range"
+              return "int_array"
+            end
             return rt
           end
         end

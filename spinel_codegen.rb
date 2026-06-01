@@ -18520,11 +18520,20 @@ class Compiler
       if args_id >= 0
         ra = get_args(args_id)
         if ra.length > 0
-          at_rand = infer_type(ra[0])
- # `rand(range)` and `rand(float)` are deferred — keep the
- # existing int-arg behaviour and add the no-arg Float form.
-          if at_rand == "int" || at_rand == "int?"
-            return "((mrb_int)(rand() % (int)" + compile_expr(ra[0]) + "))"
+ # A uniform deviate in [0.0, 1.0), shared by the range and float
+ # forms below (and matching the no-arg return).
+          unit = "((mrb_float)rand() / ((mrb_float)RAND_MAX + 1.0))"
+          if @nd_type[ra[0]] == "RangeNode"
+            lo_r = compile_expr(@nd_left[ra[0]])
+            hi_r = compile_expr(@nd_right[ra[0]])
+            if infer_type(@nd_left[ra[0]]) == "float" || infer_type(@nd_right[ra[0]]) == "float"
+              return "(" + lo_r + " + " + unit + " * ((" + hi_r + ") - (" + lo_r + ")))"
+            end
+            span_excl = range_excl_end(ra[0]) == 1 ? "" : " + 1"
+            return "((mrb_int)(" + lo_r + ") + (mrb_int)(" + unit + " * (mrb_float)((" + hi_r + ") - (" + lo_r + ")" + span_excl + ")))"
+          end
+          if infer_type(ra[0]) == "float"
+            return "(" + compile_expr(ra[0]) + " * " + unit + ")"
           end
           return "((mrb_int)(rand() % (int)" + compile_expr(ra[0]) + "))"
         end
@@ -22024,6 +22033,26 @@ class Compiler
   end
 
   def compile_range_method_expr(nid, mname, rc)
+    if (mname == "first" || mname == "last") && @nd_arguments[nid] >= 0
+      a_fn = get_args(@nd_arguments[nid])
+      if a_fn.length >= 1
+        @needs_int_array = 1
+        @needs_gc = 1
+        rtmp_fn = new_temp
+        ntmp_fn = new_temp
+        emit("  sp_Range " + rtmp_fn + " = " + rc + ";")
+        emit("  mrb_int " + ntmp_fn + " = " + compile_expr(a_fn[0]) + ";")
+        hi_fn = "(" + rtmp_fn + ".last - " + rtmp_fn + ".excl)"
+        if mname == "first"
+          wanted_fn = "(" + rtmp_fn + ".first + " + ntmp_fn + " - 1)"
+          end_fn = "(" + wanted_fn + " < " + hi_fn + " ? " + wanted_fn + " : " + hi_fn + ")"
+          return "sp_IntArray_from_range(" + rtmp_fn + ".first, " + end_fn + ")"
+        end
+        wanted_lo_fn = "(" + hi_fn + " - " + ntmp_fn + " + 1)"
+        start_fn = "(" + wanted_lo_fn + " > " + rtmp_fn + ".first ? " + wanted_lo_fn + " : " + rtmp_fn + ".first)"
+        return "sp_IntArray_from_range(" + start_fn + ", " + hi_fn + ")"
+      end
+    end
     if mname == "first" || mname == "begin" || mname == "min"
       return rc + ".first"
     end
@@ -22062,6 +22091,18 @@ class Compiler
       end
       tmp = new_temp
       emit("  sp_Range " + tmp + " = " + rc + ";")
+ # `cover?`/`include?`/`===` with a Range argument: self covers the
+ # other range when self.first <= other.first and other's inclusive
+ # upper bound <= self's. Without this the Range arg compiles to an
+ # sp_Range struct fed to `>=`/`<=` against mrb_int (a C type error).
+      if @nd_arguments[nid] >= 0
+        a_cov = get_args(@nd_arguments[nid])
+        if a_cov.length >= 1 && @nd_type[a_cov[0]] == "RangeNode"
+          other_cov = new_temp
+          emit("  sp_Range " + other_cov + " = " + compile_expr(a_cov[0]) + ";")
+          return "(" + other_cov + ".first >= " + tmp + ".first && " + other_cov + ".last - " + other_cov + ".excl <= " + tmp + ".last - " + tmp + ".excl)"
+        end
+      end
       arg = compile_arg0_as_int(nid)
  # Exclusive range excludes `last`: upper bound is `last - excl`.
       return "(" + arg + " >= " + tmp + ".first && " + arg + " <= " + tmp + ".last - " + tmp + ".excl)"
@@ -23084,6 +23125,22 @@ class Compiler
           emit("  if (" + start_tmp + " < 0) " + start_tmp + " = 0;")
           start_expr = start_tmp
           end_expr = "(" + start_tmp + " + " + len_tmp + ")"
+        elsif aargs_fill.length == 2 && @nd_type[aargs_fill[1]] == "RangeNode"
+ # arr.fill(value, range): fills the index range. The end is
+ # inclusive (`..`) or exclusive (`...`); negative endpoints count
+ # from the array length. Without this branch the Range struct was
+ # assigned to an mrb_int start (a C type error).
+          rng_fill = aargs_fill[1]
+          start_tmp = new_temp
+          fend_tmp = new_temp
+          emit("  mrb_int " + start_tmp + " = " + compile_expr(@nd_left[rng_fill]) + ";")
+          emit("  mrb_int " + fend_tmp + " = " + compile_expr(@nd_right[rng_fill]) + ";")
+          emit("  if (" + start_tmp + " < 0) " + start_tmp + " += sp_" + pfx + "_length(" + rc + ");")
+          emit("  if (" + start_tmp + " < 0) " + start_tmp + " = 0;")
+          emit("  if (" + fend_tmp + " < 0) " + fend_tmp + " += sp_" + pfx + "_length(" + rc + ");")
+          start_expr = start_tmp
+ # Inclusive end => loop bound is end+1; exclusive `...` => end.
+          end_expr = range_excl_end(rng_fill) == 1 ? fend_tmp : "(" + fend_tmp + " + 1)"
         elsif aargs_fill.length == 2
  # arr.fill(value, start): fills from start to end of EXISTING
  # array. If start >= length, fills nothing (does NOT grow,
@@ -23298,7 +23355,20 @@ class Compiler
           va_ids = get_args(va_args)
           va_k = 0
           while va_k < va_ids.length
-            emit("  sp_IntArray_push(" + tmp_va + ", sp_IntArray_get(" + rc + ", " + compile_expr(va_ids[va_k]) + "));")
+ # A Range arg (`values_at(1..3)`) expands to a loop over its
+ # indices; a plain index pushes one element. Without the Range
+ # path the range struct was passed straight to sp_IntArray_get,
+ # which expects an mrb_int (a C type error).
+            if @nd_type[va_ids[va_k]] == "RangeNode"
+              lo_vi = compile_expr(@nd_left[va_ids[va_k]])
+              hi_vi = compile_expr(@nd_right[va_ids[va_k]])
+              hi_adj = range_excl_end(va_ids[va_k]) == 1 ? " - 1" : ""
+              ivi = new_temp
+              emit("  for (mrb_int " + ivi + " = " + lo_vi + "; " + ivi + " <= (" + hi_vi + ")" + hi_adj + "; " + ivi + "++)")
+              emit("    sp_IntArray_push(" + tmp_va + ", sp_IntArray_get(" + rc + ", " + ivi + "));")
+            else
+              emit("  sp_IntArray_push(" + tmp_va + ", sp_IntArray_get(" + rc + ", " + compile_expr(va_ids[va_k]) + "));")
+            end
             va_k = va_k + 1
           end
         end
@@ -24248,7 +24318,16 @@ class Compiler
           va_ids_s = get_args(va_args_s)
           va_ks = 0
           while va_ks < va_ids_s.length
-            emit("  sp_StrArray_push(" + tmp_va_s + ", sp_StrArray_get(" + rc + ", " + compile_expr(va_ids_s[va_ks]) + "));")
+            if @nd_type[va_ids_s[va_ks]] == "RangeNode"
+              lo_vis = compile_expr(@nd_left[va_ids_s[va_ks]])
+              hi_vis = compile_expr(@nd_right[va_ids_s[va_ks]])
+              hi_adjs = range_excl_end(va_ids_s[va_ks]) == 1 ? " - 1" : ""
+              ivis = new_temp
+              emit("  for (mrb_int " + ivis + " = " + lo_vis + "; " + ivis + " <= (" + hi_vis + ")" + hi_adjs + "; " + ivis + "++)")
+              emit("    sp_StrArray_push(" + tmp_va_s + ", sp_StrArray_get(" + rc + ", " + ivis + "));")
+            else
+              emit("  sp_StrArray_push(" + tmp_va_s + ", sp_StrArray_get(" + rc + ", " + compile_expr(va_ids_s[va_ks]) + "));")
+            end
             va_ks = va_ks + 1
           end
         end
