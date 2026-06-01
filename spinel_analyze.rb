@@ -5593,10 +5593,18 @@ class Compiler
       return "tuple:int,int"
     end
  # Integer Range#bsearch returns a member of the range or nil when
- # the block never finds one, so it is a nullable int.
+ # the block never finds one, so it is a nullable int. Array#bsearch
+ # returns an element of the (sorted) array or nil: int arrays yield a
+ # nullable int, str arrays a string (NULL renders as nil).
     if mname == "bsearch" && @nd_block[nid] >= 0
-      if recv >= 0 && infer_type(recv) == "range"
-        return "int?"
+      if recv >= 0
+        rt_bs = infer_type(recv)
+        if rt_bs == "range" || rt_bs == "int_array"
+          return "int?"
+        end
+        if rt_bs == "str_array"
+          return "string"
+        end
       end
     end
     if mname == "partition"

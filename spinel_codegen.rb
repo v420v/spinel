@@ -23254,6 +23254,69 @@ class Compiler
         return recv_fb
       end
     end
+ # Array#bsearch (find-minimum mode): binary-search a sorted array for
+ # the first element where the block is truthy; return that element or
+ # nil. int arrays yield a nullable int (SP_INT_NIL), str arrays a
+ # nullable string (NULL). Other element kinds fall through.
+    if mname == "bsearch" && @nd_block[nid] >= 0
+      ctype_bs = ""
+      get_bs = ""
+      elem_bs = ""
+      if recv_type == "int_array"
+        ctype_bs = "sp_IntArray"; get_bs = "sp_IntArray_get"; elem_bs = "int"
+      elsif recv_type == "str_array"
+        ctype_bs = "sp_StrArray"; get_bs = "sp_StrArray_get"; elem_bs = "string"
+      end
+      if ctype_bs != ""
+        @needs_gc = 1
+        recv_bs = new_temp
+        lo_bs = new_temp
+        hi_bs = new_temp
+        mid_bs = new_temp
+        found_bs = new_temp
+        cond_bs = new_temp
+        bp_bs = get_block_param(nid, 0)
+        bp_bs = "_x" if bp_bs == ""
+        emit("  " + ctype_bs + " *" + recv_bs + " = " + rc + ";")
+        emit("  SP_GC_ROOT(" + recv_bs + ");")
+        emit("  mrb_int " + lo_bs + " = 0;")
+        emit("  mrb_int " + hi_bs + " = " + recv_bs + "->len;")
+        emit("  mrb_int " + found_bs + " = -1;")
+        emit("  while (" + lo_bs + " < " + hi_bs + ") {")
+        emit("    mrb_int " + mid_bs + " = " + lo_bs + " + (" + hi_bs + " - " + lo_bs + ") / 2;")
+        elem_get_bs = get_bs + "(" + recv_bs + ", " + mid_bs + ")"
+        if elem_bs == "int"
+          emit("    mrb_int lv_" + bp_bs + " = " + elem_get_bs + ";")
+        else
+          emit("    const char *lv_" + bp_bs + " = " + elem_get_bs + ";")
+        end
+        @indent = @indent + 1
+        push_scope
+        declare_var(bp_bs, elem_bs)
+        bbody_bs = @nd_body[@nd_block[nid]]
+        bexpr_bs = "0"
+        if bbody_bs >= 0
+          bs_bs = get_stmts(bbody_bs)
+          if bs_bs.length > 0
+            k_bs = 0
+            while k_bs < bs_bs.length - 1
+              compile_stmt(bs_bs[k_bs])
+              k_bs = k_bs + 1
+            end
+            bexpr_bs = compile_expr(bs_bs.last)
+          end
+        end
+        pop_scope
+        @indent = @indent - 1
+        emit("    mrb_int " + cond_bs + " = " + bexpr_bs + ";")
+        emit("    if (" + cond_bs + ") { " + found_bs + " = " + mid_bs + "; " + hi_bs + " = " + mid_bs + "; } else { " + lo_bs + " = " + mid_bs + " + 1; }")
+        emit("  }")
+        if elem_bs == "int"
+          return "(" + found_bs + " >= 0 ? " + get_bs + "(" + recv_bs + ", " + found_bs + ") : SP_INT_NIL)"
+        end
+        return "(" + found_bs + " >= 0 ? " + get_bs + "(" + recv_bs + ", " + found_bs + ") : (const char *)0)"
+      end
+    end
  # Array#dig with a single index reduces to []. Multi-arg dig that
  # walks into nested arrays/hashes isn't supported here yet — fall
  # through to the unsupported-call warning.
