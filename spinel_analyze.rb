@@ -6209,6 +6209,29 @@ class Compiler
         end
       end
     end
+ # `grep`/`grep_v` (no block) return a new array of the source type
+ # holding the matching elements. Only the forms codegen supports are
+ # typed here (Range over int, Regexp over str, primitive Class over
+ # poly); other combinations fall through.
+    if (mname == "grep" || mname == "grep_v") && @nd_block[nid] < 0 && recv >= 0
+      rt_g = infer_type(recv)
+      args_g = @nd_arguments[nid] >= 0 ? get_args(@nd_arguments[nid]) : "".split(",", -1)
+      if args_g.length == 1
+        pt_g = base_type(infer_type(args_g[0]))
+        if rt_g == "int_array" && pt_g == "range"
+          return rt_g
+        end
+        if rt_g == "str_array" && pt_g == "regexp"
+          return rt_g
+        end
+        if rt_g == "poly_array" && @nd_type[args_g[0]] == "ConstantReadNode"
+          cn_g = @nd_name[args_g[0]]
+          if cn_g == "Integer" || cn_g == "String" || cn_g == "Float" || cn_g == "Symbol"
+            return rt_g
+          end
+        end
+      end
+    end
     if mname == "map"
       if recv >= 0
  # Declare bp inside a scope so infer_type sees the inner element type, not a shadowed outer local.

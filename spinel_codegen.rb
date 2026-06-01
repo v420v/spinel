@@ -23317,6 +23317,101 @@ class Compiler
         return "(" + found_bs + " >= 0 ? " + get_bs + "(" + recv_bs + ", " + found_bs + ") : (const char *)0)"
       end
     end
+ # Array#grep(pattern) / grep_v(pattern) without a block -- collect the
+ # elements where `pattern === element` (grep) or where it doesn't
+ # (grep_v) into a new array of the source type. Supported forms: a
+ # Range pattern over an int array, a primitive-Class pattern over a
+ # poly array, and a Regexp pattern over a str array. Others fall
+ # through to the unresolved path.
+    if (mname == "grep" || mname == "grep_v") && @nd_block[nid] < 0
+      args_g = @nd_arguments[nid] >= 0 ? get_args(@nd_arguments[nid]) : []
+      if args_g.length == 1
+        pat_g = args_g[0]
+        pat_t = base_type(infer_type(pat_g))
+        invert_g = (mname == "grep_v")
+        ctype_g = ""
+        get_g = ""
+        elem_g = ""
+        new_g = ""
+        push_g = ""
+        if recv_type == "int_array"
+          ctype_g = "sp_IntArray"; get_g = "sp_IntArray_get"; elem_g = "int"; new_g = "sp_IntArray_new"; push_g = "sp_IntArray_push"
+        elsif recv_type == "str_array"
+          ctype_g = "sp_StrArray"; get_g = "sp_StrArray_get"; elem_g = "string"; new_g = "sp_StrArray_new"; push_g = "sp_StrArray_push"
+        elsif recv_type == "poly_array"
+          ctype_g = "sp_PolyArray"; get_g = "sp_PolyArray_get"; elem_g = "poly"; new_g = "sp_PolyArray_new"; push_g = "sp_PolyArray_push"
+        end
+        cond_kind_g = ""
+        cls_tag_g = ""
+        if pat_t == "range" && elem_g == "int"
+          cond_kind_g = "range"
+        elsif pat_t == "regexp" && elem_g == "string"
+          cond_kind_g = "regex"
+ # Only a bare ConstantReadNode (Integer/String/Float/Symbol); kept in
+ # sync with the analyze-side grep arm so the two passes agree on the
+ # exact (variant, pattern) set they handle.
+        elsif elem_g == "poly" && @nd_type[pat_g] == "ConstantReadNode"
+          cn_g = resolve_const_ref_name(pat_g)
+          if cn_g == "Integer"
+            cls_tag_g = "SP_TAG_INT"
+          elsif cn_g == "String"
+            cls_tag_g = "SP_TAG_STR"
+          elsif cn_g == "Float"
+            cls_tag_g = "SP_TAG_FLT"
+          elsif cn_g == "Symbol"
+            cls_tag_g = "SP_TAG_SYM"
+          end
+          if cls_tag_g != ""
+            cond_kind_g = "class"
+          end
+        end
+        if ctype_g != "" && cond_kind_g != ""
+          @needs_gc = 1
+          recv_g = new_temp
+          out_g = new_temp
+          i_g = new_temp
+          ev_g = new_temp
+          emit("  " + ctype_g + " *" + recv_g + " = " + rc + ";")
+          emit("  SP_GC_ROOT(" + recv_g + ");")
+          emit("  " + ctype_g + " *" + out_g + " = " + new_g + "();")
+          emit("  SP_GC_ROOT(" + out_g + ");")
+          rg_tmp_g = ""
+          rpat_g = ""
+          if cond_kind_g == "range"
+            rg_tmp_g = new_temp
+            emit("  sp_Range " + rg_tmp_g + " = " + compile_expr(pat_g) + ";")
+          elsif cond_kind_g == "regex"
+            rpat_g = regex_pat_c_expr(pat_g)
+            if rpat_g == ""
+              rpat_g = compile_expr(pat_g)
+            end
+          end
+          emit("  for (mrb_int " + i_g + " = 0; " + i_g + " < " + recv_g + "->len; " + i_g + "++) {")
+          elem_get_g = get_g + "(" + recv_g + ", " + i_g + ")"
+          if elem_g == "int"
+            emit("    mrb_int " + ev_g + " = " + elem_get_g + ";")
+            cond_g = "(" + ev_g + " >= " + rg_tmp_g + ".first && " + ev_g + " <= " + rg_tmp_g + ".last - " + rg_tmp_g + ".excl)"
+          elsif elem_g == "string"
+            emit("    const char *" + ev_g + " = " + elem_get_g + ";")
+            cond_g = "sp_re_match_p(" + rpat_g + ", " + ev_g + ")"
+          else
+            emit("    sp_RbVal " + ev_g + " = " + elem_get_g + ";")
+            cond_g = "(" + ev_g + ".tag == " + cls_tag_g + ")"
+          end
+          keep_g = invert_g ? "!(" + cond_g + ")" : "(" + cond_g + ")"
+          emit("    if (" + keep_g + ") " + push_g + "(" + out_g + ", " + ev_g + ");")
+          emit("  }")
+          if recv_type == "int_array"
+            @needs_int_array = 1
+          elsif recv_type == "str_array"
+            @needs_str_array = 1
+          else
+            @needs_rb_value = 1
+          end
+          return out_g
+        end
+      end
+    end
  # Array#dig with a single index reduces to []. Multi-arg dig that
  # walks into nested arrays/hashes isn't supported here yet — fall
  # through to the unsupported-call warning.
