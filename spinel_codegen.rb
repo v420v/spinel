@@ -10707,7 +10707,7 @@ class Compiler
           if j < cm_returns.length
             rt = cm_returns[j]
           end
-          emit_raw("static " + c_type(rt) + " sp_" + cname + "_cls_" + sanitize_name(cmnames[j]) + "(" + cls_method_params_decl(i, j) + ");")
+          emit_raw((@debug ? "" : "static ") + c_type(rt) + " sp_" + cname + "_cls_" + sanitize_name(cmnames[j]) + "(" + cls_method_params_decl(i, j) + ");")
           j = j + 1
         end
       end
@@ -12207,6 +12207,14 @@ class Compiler
       emit_raw(cm_linkage + c_type(rt) + " sp_" + cname + "_" + sanitize_name(mname) + "(sp_" + cname + " self" + build_params_str(pnames, ptypes) + yp + ") {")
     else
       emit_raw(cm_linkage + c_type(rt) + " sp_" + cname + "_" + sanitize_name(mname) + "(sp_" + cname + " *self" + build_params_str(pnames, ptypes) + yp + ") {")
+      # Debug-only null-receiver guard: a method called on a nil heap receiver is
+      # a hard NULL deref in a release build (CRuby raises NoMethodError) — the
+      # silent-crash class behind matz/spinel#1259. In --debug, fault loudly with
+      # the Ruby error instead of segfaulting deep in the callee. Zero effect on
+      # release output (gated on @debug); pointer-self methods only.
+      if @debug
+        emit_raw("  if (!self) sp_raise_cls(\"NoMethodError\", \"undefined method '" + mname + "' for nil\");")
+      end
     end
 
     push_scope
@@ -12307,7 +12315,10 @@ class Compiler
     saved_hp_names_len_mb = @heap_promoted_names.length
     saved_hp_cells_len_mb = @heap_promoted_cells.length
 
-    emit_raw("static " + c_type(rt) + " sp_" + cname + "_cls_" + sanitize_name(mname) + "(" + build_params_decl(pnames, ptypes) + ") {")
+    # Debug: external linkage (not static) so -rdynamic exports the symbol and
+    # class/singleton methods resolve in native backtraces, same as instance
+    # methods. Release stays `static` (output unchanged).
+    emit_raw((@debug ? "" : "static ") + c_type(rt) + " sp_" + cname + "_cls_" + sanitize_name(mname) + "(" + build_params_decl(pnames, ptypes) + ") {")
 
     push_scope
     j = 0

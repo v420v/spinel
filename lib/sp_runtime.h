@@ -3378,14 +3378,16 @@ static const char *sp_bt_symbol(const char *line) {
     size_t len = (size_t)(end - p);
     if (len == 0 || len > 250) return 0;          /* unresolved (static/stripped) */
     memcpy(sym, p, len); sym[len] = 0;
-  } else {                                        /* macOS space-delimited form */
-    const char *p = strstr(line, "0x");           /* the address */
-    if (!p) return 0;
-    while (*p && *p != ' ') p++;                   /* skip the address */
-    while (*p == ' ') p++;                          /* to the symbol */
-    if (!*p) return 0;
-    const char *end = p;
-    while (*end && *end != ' ') end++;             /* symbol ends at space/" +" */
+  } else {                                        /* macOS: "<idx> <image> <addr> <symbol> + <off>" */
+    /* The symbol is the token just before the " + <off>" delimiter. Parse
+       backward from the last " + " rather than forward from "0x" — an image
+       path containing "0x" (e.g. /path/0x_proj/bin) would otherwise misparse. */
+    const char *plus = 0, *q = line;
+    while ((q = strstr(q, " + ")) != 0) { plus = q; q += 3; }
+    if (!plus) return 0;
+    const char *end = plus;
+    const char *p = end;
+    while (p > line && p[-1] != ' ') p--;          /* back up to the symbol's start */
     size_t len = (size_t)(end - p);
     if (len == 0 || len > 250) return 0;
     memcpy(sym, p, len); sym[len] = 0;
@@ -3394,20 +3396,39 @@ static const char *sp_bt_symbol(const char *line) {
   if (strncmp(sym, "sp_", 3) != 0) return 0;     /* skip non-Spinel frames */
   const char *name = sym + 3;
   if (sp_bt_is_runtime(name)) return 0;
-  /* sp_Class_method -> Class#method (heuristic: split first '_' after an
-     initial uppercase segment); else just the stripped name. */
-  char out[256];
-  if (name[0] >= 'A' && name[0] <= 'Z') {
-    const char *u = strchr(name, '_');
-    if (u) {
-      size_t cl = (size_t)(u - name);
-      memcpy(out, name, cl);
-      out[cl] = '#';
-      strcpy(out + cl + 1, u + 1);
-      return strdup(out);
-    }
+  /* De-mangle sp_<Class>_<method> back to Ruby. A Spinel symbol is a path of
+     CamelCase class segments (each from a `::`, joined by `_`) followed by the
+     method; the method is the first segment that starts lowercase. A literal
+     `cls` segment marks a singleton method:
+       sp_Helper_cls_boom          -> Helper.boom
+       sp_Tep_Url_parse_query      -> Tep::Url#parse_query
+       sp_Tep_AuthOAuth2_cls_find  -> Tep::AuthOAuth2.find
+       sp_toplevel                 -> toplevel   (top-level method, no class)
+     (Method names stay sanitized — e.g. enabled? is enabled_p; reversing that
+     needs the emitted name table, a separate refinement.) */
+  const char *mstart = 0;   /* first lowercase-starting segment = the method */
+  for (const char *p = name; *p; p++) {
+    int seg_start = (p == name) || (p[-1] == '_');
+    if (seg_start && *p >= 'a' && *p <= 'z') { mstart = p; break; }
   }
-  return strdup(name);
+  if (!mstart) return strdup(name);            /* all-uppercase: leave as-is */
+  if (mstart == name) {                        /* no class path: top-level */
+    if (strncmp(name, "cls_", 4) == 0) return strdup(name + 4);  /* top-level singleton */
+    return strdup(name);
+  }
+  char out[256]; size_t o = 0;
+  const char *meth; char sep;
+  if (strncmp(mstart, "cls_", 4) == 0) { meth = mstart + 4; sep = '.'; }  /* singleton */
+  else                                 { meth = mstart;     sep = '#'; }  /* instance */
+  for (const char *p = name; p < mstart - 1 && o + 2 < sizeof(out); p++) {
+    if (*p == '_') { out[o++] = ':'; out[o++] = ':'; }   /* class-path `_` was a `::` */
+    else out[o++] = *p;
+  }
+  if (o + 1 < sizeof(out)) out[o++] = sep;
+  size_t ml = strlen(meth);
+  if (o + ml < sizeof(out)) { memcpy(out + o, meth, ml); o += ml; }
+  out[o] = 0;
+  return strdup(out);
 }
 
 static sp_StrArray *sp_bt_format(void **buf, int n) {
@@ -3417,9 +3438,10 @@ static sp_StrArray *sp_bt_format(void **buf, int n) {
   if (!syms) return a;
   const char *src = (sp_bt_srcfile && sp_bt_srcfile[0]) ? sp_bt_srcfile : "(spinel)";
   for (int i = 0; i < n; i++) {
-    const char *name = sp_bt_symbol(syms[i]);
+    char *name = (char *)sp_bt_symbol(syms[i]);  /* always strdup'd; free after use */
     if (!name) continue;
     sp_StrArray_push(a, sp_sprintf("%s:in `%s'", src, name));
+    free(name);
   }
   free(syms);
   return a;
