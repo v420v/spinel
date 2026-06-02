@@ -135,6 +135,7 @@ const char *sp_StringScanner_check(sp_StringScanner *sc, mrb_regexp_pattern *pat
     return sp_ext_str_empty();
   }
   char *m = sc_substr(sc->source, sc->pos, mlen);
+  sc->last_pos = sc->pos;
   sc->matched = m;
   sc->matched_p = 1;
   return m;
