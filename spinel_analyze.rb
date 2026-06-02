@@ -9325,6 +9325,215 @@ class Compiler
     count
   end
 
+  def implicit_candidate_new_class(nid)
+    if nid < 0 || @nd_type[nid] != "CallNode" || @nd_name[nid] != "new"
+      return ""
+    end
+    recv = @nd_receiver[nid]
+    if recv < 0
+      return ""
+    end
+    cname = constructor_class_name(recv)
+    if cname == ""
+      return ""
+    end
+    ci = find_class_idx(cname)
+    if ci < 0 || implicit_specializable_class?(ci) == 0
+      return ""
+    end
+    args_id = @nd_arguments[nid]
+    if args_id >= 0 && get_args(args_id).length > 0
+      return ""
+    end
+    cname
+  end
+
+  def implicit_candidate_local_class(name, local_names, local_classes)
+    found = ""
+    k = 0
+    while k < local_names.length
+      if local_names[k] == name
+        cls = local_classes[k]
+        if found == ""
+          found = cls
+        elsif found != cls
+          return ""
+        end
+      end
+      k = k + 1
+    end
+    found
+  end
+
+  def collect_implicit_candidate_local_bindings_in_scope(nid, local_names, local_classes)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "DefNode" || t == "ClassNode" || t == "ModuleNode" || t == "SingletonClassNode"
+      return
+    end
+    if t == "LocalVariableWriteNode"
+      cname = implicit_candidate_new_class(@nd_expression[nid])
+      if cname != ""
+        local_names.push(@nd_name[nid])
+        local_classes.push(cname)
+      end
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      collect_implicit_candidate_local_bindings_in_scope(cs[k], local_names, local_classes)
+      k = k + 1
+    end
+  end
+
+  def mark_implicit_candidate_escape(cname, escaping_classes)
+    if cname == ""
+      return
+    end
+    k = 0
+    while k < escaping_classes.length
+      if escaping_classes[k] == cname
+        return
+      end
+      k = k + 1
+    end
+    escaping_classes.push(cname)
+  end
+
+  def mark_implicit_candidate_expr_escape(nid, local_names, local_classes, escaping_classes)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "DefNode" || t == "ClassNode" || t == "ModuleNode" || t == "SingletonClassNode"
+      return
+    end
+    cname = implicit_candidate_new_class(nid)
+    if cname != ""
+      mark_implicit_candidate_escape(cname, escaping_classes)
+      return
+    end
+    if t == "LocalVariableReadNode"
+      mark_implicit_candidate_escape(implicit_candidate_local_class(@nd_name[nid], local_names, local_classes), escaping_classes)
+      return
+    end
+    if t == "CallNode"
+      args_id = @nd_arguments[nid]
+      if args_id >= 0
+        arg_ids = get_args(args_id)
+        k = 0
+        while k < arg_ids.length
+          mark_implicit_candidate_expr_escape(arg_ids[k], local_names, local_classes, escaping_classes)
+          k = k + 1
+        end
+      end
+      return
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      mark_implicit_candidate_expr_escape(cs[k], local_names, local_classes, escaping_classes)
+      k = k + 1
+    end
+  end
+
+  def collect_implicit_candidate_escapes_in_scope(nid, local_names, local_classes, escaping_classes)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "DefNode" || t == "ClassNode" || t == "ModuleNode" || t == "SingletonClassNode"
+      return
+    end
+    if t == "CallNode"
+      args_id = @nd_arguments[nid]
+      if args_id >= 0
+        arg_ids = get_args(args_id)
+        k = 0
+        while k < arg_ids.length
+          mark_implicit_candidate_expr_escape(arg_ids[k], local_names, local_classes, escaping_classes)
+          k = k + 1
+        end
+      end
+    elsif t == "ReturnNode"
+      args_id = @nd_arguments[nid]
+      if args_id >= 0
+        arg_ids = get_args(args_id)
+        k = 0
+        while k < arg_ids.length
+          mark_implicit_candidate_expr_escape(arg_ids[k], local_names, local_classes, escaping_classes)
+          k = k + 1
+        end
+      end
+    elsif t == "ArrayNode" || t == "HashNode" || t == "KeywordHashNode"
+      mark_implicit_candidate_expr_escape(nid, local_names, local_classes, escaping_classes)
+      return
+    elsif t == "InstanceVariableWriteNode" || t == "GlobalVariableWriteNode" || t == "ClassVariableWriteNode" || t == "ConstantWriteNode"
+      mark_implicit_candidate_expr_escape(@nd_expression[nid], local_names, local_classes, escaping_classes)
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      collect_implicit_candidate_escapes_in_scope(cs[k], local_names, local_classes, escaping_classes)
+      k = k + 1
+    end
+  end
+
+  def collect_implicit_candidate_escape_scope(nid, escaping_classes)
+    if nid < 0
+      return
+    end
+    local_names = "".split(",", -1)
+    local_classes = "".split(",", -1)
+    collect_implicit_candidate_local_bindings_in_scope(nid, local_names, local_classes)
+    collect_implicit_candidate_escapes_in_scope(nid, local_names, local_classes, escaping_classes)
+  end
+
+  def collect_nested_implicit_candidate_escape_scopes(nid, escaping_classes)
+    if nid < 0
+      return
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      child = cs[k]
+      t = @nd_type[child]
+      if t == "DefNode" || t == "ClassNode" || t == "ModuleNode"
+        collect_implicit_candidate_escapes_by_scope(@nd_body[child], escaping_classes)
+      elsif t == "SingletonClassNode"
+        collect_implicit_candidate_escapes_by_scope(@nd_body[child], escaping_classes)
+      else
+        collect_nested_implicit_candidate_escape_scopes(child, escaping_classes)
+      end
+      k = k + 1
+    end
+  end
+
+  def collect_implicit_candidate_escapes_by_scope(nid, escaping_classes)
+    if nid < 0
+      return
+    end
+    collect_implicit_candidate_escape_scope(nid, escaping_classes)
+    collect_nested_implicit_candidate_escape_scopes(nid, escaping_classes)
+  end
+
+  def implicit_candidate_class_escaped?(escaping_classes, cname)
+    k = 0
+    while k < escaping_classes.length
+      if escaping_classes[k] == cname
+        return 1
+      end
+      k = k + 1
+    end
+    0
+  end
+
   def copy_cls_rest_entries_for_implicit_specialization(old_name, new_name)
     prefix = old_name + "#"
     plen = prefix.length
@@ -9488,11 +9697,13 @@ class Compiler
     site_ids = []
     site_classes = "".split(",", -1)
     collect_implicit_new_site_candidates(@root_id, site_ids, site_classes)
+    escaping_classes = "".split(",", -1)
+    collect_implicit_candidate_escapes_by_scope(@root_id, escaping_classes)
     original_class_count = @cls_names.length
     ci = 0
     while ci < original_class_count
       cname = @cls_names[ci]
-      if implicit_specializable_class?(ci) == 1 && count_implicit_new_sites_for_class(site_classes, cname) >= 2
+      if implicit_specializable_class?(ci) == 1 && implicit_candidate_class_escaped?(escaping_classes, cname) == 0 && count_implicit_new_sites_for_class(site_classes, cname) >= 2
         k = 0
         while k < site_ids.length
           if site_classes[k] == cname
