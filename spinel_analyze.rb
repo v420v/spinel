@@ -4783,6 +4783,11 @@ class Compiler
     if recv < 0 && mname == "String"
       return "string"
     end
+ # Kernel#Complex(re, im) builds an sp_Complex value, same type as
+ # Complex.polar and an imaginary literal.
+    if recv < 0 && mname == "Complex"
+      return "complex"
+    end
  # Float#ceil(n)/floor(n)/round(n)/truncate(n) with n given return
  # Float; zero-arg / Integer#ceil etc. return Integer. (truncate's arm
  # used to live next to nan?/infinite? — folded in here for one place

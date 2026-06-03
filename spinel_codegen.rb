@@ -18738,6 +18738,19 @@ class Compiler
     "0"
   end
 
+ # Coerce a Complex() argument to mrb_float for the sp_Complex literal.
+  def complex_part_to_float(aid)
+    at = infer_type(aid)
+    if at == "float"
+      return compile_expr(aid)
+    end
+    if at == "poly"
+      @needs_rb_value = 1
+      return "sp_poly_to_f(" + compile_expr(aid) + ")"
+    end
+    "(mrb_float)(" + compile_expr(aid) + ")"
+  end
+
   def compile_no_recv_call_expr(nid, mname)
  # No-recv IO methods that exist in compile_io_call_stmt (puts/print/
  # printf) all return nil in MRI. When reached in expression context
@@ -18879,6 +18892,24 @@ class Compiler
         end
       end
       return "(mrb_float)(" + compile_arg0(nid) + ")"
+    end
+ # Kernel#Complex(re, im) / Complex(re) -- build an sp_Complex value
+ # (im defaults to 0). Parts are coerced to mrb_float, mirroring the
+ # sp_Complex literal emitted for imaginary literals and Complex.polar.
+    if mname == "Complex"
+      args_id_cx = @nd_arguments[nid]
+      if args_id_cx >= 0
+        arg_ids_cx = get_args(args_id_cx)
+        if arg_ids_cx.length >= 1
+          re_cx = complex_part_to_float(arg_ids_cx[0])
+          im_cx = "0.0"
+          if arg_ids_cx.length >= 2
+            im_cx = complex_part_to_float(arg_ids_cx[1])
+          end
+          return "((sp_Complex){" + re_cx + ", " + im_cx + "})"
+        end
+      end
+      return "((sp_Complex){0.0, 0.0})"
     end
  # Kernel#String() — coerce via .to_s. nil -> "" per MRI.
  # Issue #879.
