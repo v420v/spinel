@@ -28176,6 +28176,16 @@ class Compiler
       end
     end
 
+ # StringIO.open(str): with a block, build a StringIO, run the block
+ # with it bound, and return the block's value; without a block, just
+ # return the constructed StringIO (we do not model the implicit close).
+    if mname == "open" && constructor_class_name(@nd_receiver[nid]) == "StringIO"
+      if @nd_block[nid] >= 0
+        return compile_stringio_open_expr(nid)
+      end
+      return compile_stringio_construct(nid)
+    end
+
  # select as expression
     if mname == "select" || mname == "filter"
       if @nd_block[nid] >= 0
@@ -45557,6 +45567,59 @@ class Compiler
     @indent = @indent + 1
     push_scope
     declare_var(bp, rt)
+    if bs.length > 0
+      k = 0
+      while k < bs.length - 1
+        compile_stmt(bs[k])
+        k = k + 1
+      end
+      last_expr = compile_expr(bs.last)
+      emit("  " + result_tmp + " = " + last_expr + ";")
+    end
+    pop_scope
+    @indent = @indent - 1
+    emit("  }")
+    result_tmp
+  end
+
+  def compile_stringio_open_expr(nid)
+ # `StringIO.open(str) { |io| ... }`: build a StringIO from the call
+ # args, bind it to the block param, run the block, return its last-
+ # expression value. Same value-returning-block shape as compile_then_expr,
+ # but the bound value is a fresh StringIO rather than the receiver.
+    rc = compile_stringio_construct(nid)
+    bp = get_block_param(nid, 0)
+    if bp == ""
+      bp = "_x"
+    end
+    blk = @nd_block[nid]
+    bbody = @nd_body[blk]
+
+    ret_t = "int"
+    bs = []
+    if bbody >= 0
+      bs = get_stmts(bbody)
+      if bs.length > 0
+        push_scope
+        declare_var(bp, "stringio")
+        ret_t = infer_type(bs.last)
+        pop_scope
+      end
+    end
+
+    result_tmp = new_temp
+    emit("  " + c_type(ret_t) + " " + result_tmp + " = " + c_default_val(ret_t) + ";")
+    emit("  {")
+    emit("    " + c_type("stringio") + " lv_" + bp + " = " + rc + ";")
+    @indent = @indent + 1
+    push_scope
+    declare_var(bp, "stringio")
+ # The StringIO is freshly constructed and reachable only through
+ # lv_<bp> for the block's duration. Defer to the type-driven rooting
+ # helper: sp_StringIO is currently calloc-backed (not GC-traced), so
+ # this is a no-op today, but it stays correct if StringIO ever becomes
+ # a GC-managed pointer. The root, if emitted, pops at the C block close.
+    emit_gc_root_for_expr("lv_" + bp, "stringio")
     if bs.length > 0
       k = 0
       while k < bs.length - 1

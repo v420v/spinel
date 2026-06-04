@@ -5136,6 +5136,35 @@ class Compiler
       end
       return "int"
     end
+ # `StringIO.open(str) { |io| ... }` returns the block's value (and
+ # closes the io). Same value-returning-block shape as `then`, but the
+ # block param is a freshly-constructed StringIO, not the receiver.
+    if mname == "open" && constructor_class_name(recv) == "StringIO"
+      blk = @nd_block[nid]
+      if blk >= 0
+ # Block form: the result is the block's value (matching codegen's
+ # compile_stringio_open_expr). An empty block yields int 0, so leave
+ # the default-int return below for that case.
+        bbody = @nd_body[blk]
+        if bbody >= 0
+          bbs = get_stmts(bbody)
+          if bbs.length > 0
+            bp = get_block_param(nid, 0)
+            if bp == ""
+              bp = "_x"
+            end
+            push_scope
+            declare_var(bp, "stringio")
+            rt = infer_type(bbs.last)
+            pop_scope
+            return rt
+          end
+        end
+        return "int"
+      end
+ # No block: StringIO.open returns the constructed io.
+      return "stringio"
+    end
     if mname == "succ" || mname == "next"
       if recv >= 0
         rt = infer_type(recv)
@@ -31737,6 +31766,9 @@ class Compiler
                   elsif mname == "tap" || mname == "then" || mname == "yield_self"
  # Block param gets receiver type
                     types.push(recv_type)
+                  elsif mname == "open" && @nd_receiver[nid] >= 0 && constructor_class_name(@nd_receiver[nid]) == "StringIO"
+ # `StringIO.open(str) { |io| ... }` yields a freshly-built StringIO.
+                    types.push("stringio")
                   elsif mname == "each_with_object"
                     if bk == 0
  # Element
@@ -34049,6 +34081,12 @@ class Compiler
     recv_t = "int"
     if recv >= 0
       recv_t = infer_type(recv)
+    end
+ # `StringIO.open(str) { |io| ... }` yields a freshly-constructed
+ # StringIO. Keyed on the syntactic receiver (the StringIO constant
+ # has no useful inferred type) so it doesn't hijack File.open/IO.open.
+    if mname == "open" && pi == 0 && constructor_class_name(recv) == "StringIO"
+      return "stringio"
     end
  # `"a".upto("e") { |c| ... }` yields successive strings; the block
  # param is a string (Integer#upto keeps the int default).
