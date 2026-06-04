@@ -11085,6 +11085,14 @@ class Compiler
     (pts.length > 0 && pts.last == "proc") ? 1 : 0
   end
 
+ # Instance/top-level counterpart of cls_method_has_block_param,
+ # indexed by the flat method table position. A trailing proc-typed
+ # slot is the method's `&block` capture.
+  def meth_has_block_param(mi)
+    pts = @meth_param_types[mi].split(",", -1)
+    (pts.length > 0 && pts.last == "proc") ? 1 : 0
+  end
+
  # Returns the name of a method's `&block` parameter (the trailing
  # proc-typed slot in pnames), or "" if the method doesn't take
  # one. Ruby syntax requires `&block` to be the trailing param, so
@@ -19267,7 +19275,7 @@ class Compiler
  # `, NULL, NULL` yargs path below produces `sp_measure(, NULL, NULL)`
  # which doesn't compile. Mirror compile_yield_call_stmt's inline
  # path but capture the body's last expression into a result temp.
-      if @meth_has_yield[mi] == 1 && has_literal_block(nid) == 1
+      if @meth_has_yield[mi] == 1 && has_literal_block(nid) == 1 && meth_has_block_param(mi) == 0
         return compile_yield_call_expr(nid, mi)
       end
       yargs = ""
@@ -19293,10 +19301,16 @@ class Compiler
         block_proc = block_forward_expr(nid, blk_types_128)
         if block_proc != ""
           ca = compile_call_args_with_defaults(nid, mi, 1)
+ # Append the trailing `_block, _benv` yield-ABI slots (yargs is
+ # ", NULL, NULL" here) when the callee also uses block_given?/yield
+ # — its C signature carries those slots in addition to the &block
+ # param. The block reaches the body through the &block slot;
+ # block_given? reads `lv_<blk> != NULL` and yield falls back to it,
+ # so NULL yield slots are correct.
           if ca == ""
-            return "sp_" + sanitize_name(mname) + "(" + block_proc + ")"
+            return "sp_" + sanitize_name(mname) + "(" + block_proc + yargs + ")"
           end
-          return "sp_" + sanitize_name(mname) + "(" + ca + ", " + block_proc + ")"
+          return "sp_" + sanitize_name(mname) + "(" + ca + ", " + block_proc + yargs + ")"
         end
       end
       ca_ndef = compile_call_args_with_defaults(nid, mi)
@@ -40622,7 +40636,13 @@ class Compiler
       if recv < 0
         mi = find_method_idx(mname)
         if mi >= 0
-          if @meth_has_yield[mi] == 1
+ # A method that captures its block as a named `&blk` param (and
+ # only counts as a yield-method because it also calls
+ # block_given?) must NOT be inlined: the inline path renames the
+ # block local to `blk_y<N>` but leaves the body's `blk.call`
+ # referencing the original `lv_blk`. Fall through to the regular
+ # call path, which forwards the literal block into the &blk slot.
+          if @meth_has_yield[mi] == 1 && meth_has_block_param(mi) == 0
             compile_yield_call_stmt(nid, mi)
             return 1
           end
@@ -49275,7 +49295,7 @@ class Compiler
     if midx < 0
       return 0
     end
-    if cls_method_has_yield(cls_idx, midx) == 1
+    if cls_method_has_yield(cls_idx, midx) == 1 && cls_method_has_block_param(cls_idx, midx) == 0
       compile_yield_method_call_stmt(nid, cls_idx, midx, mname)
       return 1
     end
