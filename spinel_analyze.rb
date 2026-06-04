@@ -1736,6 +1736,17 @@ class Compiler
     -1
   end
 
+ # True when codegen can emit a real `sp_<name> *` for `name.new`: a
+ # user-defined class, or the builtin `Object` (the only struct-backed
+ # builtin that reaches the generic `.new` fallback — Array/Hash/
+ # String/Random/StringIO/StringScanner/Fiber are special-cased
+ # before it). Unimplemented stdlib classes (Mutex, Pathname,
+ # OpenStruct, ...) have no struct, so their `.new` falls back to the
+ # int slot rather than an undeclared `sp_<Class> *`. Issue #1305.
+  def constructable_class_struct?(name)
+    find_class_idx(name) >= 0 || name == "Object"
+  end
+
  # Walk @cls_parents starting from `child_idx` and return 1 if we
  # ever land on `ancestor_idx`. Used by `is_a?(<Klass>)` on poly
  # receivers to enumerate descendant cls_ids — `recv.is_a?(C)` is
@@ -7100,7 +7111,16 @@ class Compiler
           if is_exception_class_name(rn) == 1
             return "exception"
           end
-          return "obj_" + rn
+ # A constructor whose target class has no Spinel struct (an
+ # unimplemented stdlib class such as Mutex/Pathname/OpenStruct)
+ # can't be pointed at by a typed `sp_<Class> *` slot, which codegen
+ # would emit but never define. Codegen already lowers the unresolved
+ # `.new` to the integer `0`, so type the slot as int — the value's
+ # natural C type — and the local/ivar compiles.
+          if constructable_class_struct?(rn) == true
+            return "obj_" + rn
+          end
+          return "int"
         end
       end
     end
@@ -13461,7 +13481,14 @@ class Compiler
             if module_name_exists(rname) == 1
               return ""
             end
-            return "obj_" + rname
+ # An unresolved stdlib class (no Spinel struct) can't back an
+ # `sp_<Class> *` ivar field. Codegen lowers the unresolved `.new`
+ # to integer 0, so type the slot as int; mirrors the infer_type
+ # `.new` fallback. Issue #1305.
+            if constructable_class_struct?(rname) == true
+              return "obj_" + rname
+            end
+            return "int"
           end
         end
       end
