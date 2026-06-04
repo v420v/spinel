@@ -168,7 +168,7 @@ NODE_TABLE_LOADER_STAMP := build/stamps/node_table_loader.rb.stamp
 COMPILER_HELPERS_STAMP := build/stamps/compiler_helpers.rb.stamp
 PARSE_STAMP   := build/stamps/spinel_parse.c.stamp
 
-.PHONY: all parse bootstrap bootstrap-fixpoint fast-bootstrap codegen rbs_extract rbs-test regen-rbs-expected test retest fast-test clean-test-results regen-expected bench optcarrot clean install uninstall deps FORCE
+.PHONY: all parse bootstrap bootstrap-fixpoint fast-bootstrap codegen rbs_extract rbs-test regen-rbs-expected test retest fast-test clean-test-results regen-expected bench optcarrot gate check gate-legs gate-test gate-bench gate-optcarrot clean install uninstall deps FORCE
 
 # `make all` includes spinel_rbs_extract when vendor/rbs has been
 # fetched (via `make deps`). Without vendor/rbs the extractor is
@@ -701,6 +701,52 @@ optcarrot: spinel_parse$(EXE) $(SP_RT_LIB) spinel_analyze$(EXE) spinel_codegen$(
 	  echo "Optcarrot: FAIL — expected 'fps: <num>' and 'checksum: 59662'"; \
 	  exit 1; \
 	fi
+
+# ---- Developer gates ----
+#
+# Two composite targets to cut the edit/verify loop. The full gate is
+# dominated by the self-host bootstrap (~3x the rest); `test`, `bench`
+# and `optcarrot` only READ the compiler binaries and write to disjoint
+# build/ dirs, so they run concurrently as parallel prerequisites, while
+# `bootstrap` rewrites spinel_{analyze,codegen} (round-3 cp) and must run
+# alone afterward.
+#
+# These rely on make's own jobserver rather than a hand-rolled `-jN` +
+# `&` background loop: every recursive `$(MAKE)` is `+`-prefixed so the
+# jobserver fd is inherited (no "jobserver unavailable -> -j1" fallback),
+# and none pass an explicit `-j` (which would force a sub-make to reset
+# the jobserver and spawn its own full pool -> oversubscription). The
+# default-`-j` logic above gives the top-level invocation its pool.
+
+# Fast pre-commit check: rebuild the compiler and run the full test
+# suite with the optimizer off (type-checking still happens). Skips
+# bench/optcarrot/bootstrap — run `make gate` before pushing for those.
+# LTO=0 keeps the compiler rebuild fast (no -O3 -flto link of the ~80k
+# line generated C); it doesn't affect type-checking or test output.
+check:
+	+@$(MAKE) --no-print-directory LTO=0 all
+	+@$(MAKE) --no-print-directory clean-test-results
+	+@$(MAKE) --no-print-directory test OPT=-O0
+
+# Full pre-push gate: test || bench || optcarrot in parallel (via the
+# gate-legs prerequisites), then the self-host bootstrap. ~90s faster
+# than the four in sequence.
+gate:
+	+@$(MAKE) --no-print-directory LTO=0 all
+	+@$(MAKE) --no-print-directory clean-test-results
+	+@$(MAKE) --no-print-directory gate-legs
+	+@$(MAKE) --no-print-directory LTO=0 bootstrap
+	@echo "gate: ALL GREEN"
+
+# The three read-only legs as parallel prerequisites; make schedules
+# them across the jobserver pool.
+gate-legs: gate-test gate-bench gate-optcarrot
+gate-test:
+	+@$(MAKE) --no-print-directory test OPT=-O0
+gate-bench:
+	+@$(MAKE) --no-print-directory bench
+gate-optcarrot:
+	+@$(MAKE) --no-print-directory optcarrot
 
 # ---- Install ----
 
