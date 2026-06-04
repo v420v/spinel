@@ -4193,6 +4193,13 @@ class Compiler
         @needs_rb_value = 1
         return "poly_array"
       end
+ # Class values box via sp_box_class into a poly_array; there is no
+ # typed class_array slot. Without this the array fell through to the
+ # int_array default and sp_IntArray_push got an sp_Class struct.
+      if et == "class"
+        @needs_rb_value = 1
+        return "poly_array"
+      end
  # Hash literals as elements (`[{n: 3}, {n: 1}]`): each
  # element is a heap-allocated hash pointer. Spinel has no
  # typed `<hash>_ptr_array` slot, so box via poly_array;
@@ -4402,6 +4409,19 @@ class Compiler
  # falling through to the str_int_hash default (which truncates the
  # float to mrb_int on read).
           if first_vt == "float"
+            @needs_rb_value = 1
+            if all_sym_keys == 1
+              return "sym_poly_hash"
+            end
+            if all_int_keys == 1
+              @needs_poly_poly_hash = 1
+              return "poly_poly_hash"
+            end
+            return "str_poly_hash"
+          end
+ # Class values box via sp_box_class into a poly-valued hash; no
+ # typed class-valued hash slot exists. Mirrors the float arm.
+          if first_vt == "class"
             @needs_rb_value = 1
             if all_sym_keys == 1
               return "sym_poly_hash"
@@ -32855,6 +32875,9 @@ class Compiler
     end
     if at == "encoding"
       return "sp_box_encoding(" + val + ")"
+    end
+    if at == "class"
+      return "sp_box_class(" + val + ")"
     end
     if at == "int_array"
       return "sp_box_int_array(" + val + ")"

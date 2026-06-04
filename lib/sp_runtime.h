@@ -2649,6 +2649,7 @@ static const char *sp_Time_inspect(sp_Time *t) {
   return buf;
 }
 static sp_RbVal sp_box_poly_array(void *p)  { return sp_box_obj(p, SP_BUILTIN_POLY_ARRAY); }
+static const char *sp_class_to_s(sp_Class c); /* fwd decl: sp_poly_puts' SP_TAG_CLASS arm */
 static inline void sp_poly_puts(sp_RbVal v) {
   switch (v.tag) {
     case SP_TAG_INT: printf("%lld\n", (long long)v.v.i); break;
@@ -2658,6 +2659,7 @@ static inline void sp_poly_puts(sp_RbVal v) {
     case SP_TAG_NIL: putchar('\n'); break;
     case SP_TAG_SYM: { const char *_ss = sp_sym_to_s((sp_sym)v.v.i); fputs(_ss, stdout); putchar('\n'); break; }
     case SP_TAG_ENCODING: { const char *_es = v.v.s ? v.v.s : sp_str_empty; fputs(_es, stdout); putchar('\n'); break; }
+    case SP_TAG_CLASS: { sp_Class _c = {v.v.i}; fputs(sp_class_to_s(_c), stdout); putchar('\n'); break; }
     case SP_TAG_OBJ: {
       /* MRI's `puts arr` iterates an Array, printing one element per
          line (using to_s on each); a non-Array OBJ falls back to
