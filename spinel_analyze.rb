@@ -2911,12 +2911,13 @@ class Compiler
         end
         return "poly_array"
       end
-      if et == "string"
- # Check if ALL elements are strings
+      if base_type(et) == "string"
+ # Check if ALL elements are strings (nullable string elements ride
+ # the same str_array; a NULL slot renders as nil like CRuby).
         all_str = 1
         k = 1
         while k < elems.length
-          if infer_type(elems[k]) != "string"
+          if base_type(infer_type(elems[k])) != "string"
             all_str = 0
           end
           k = k + 1
@@ -3338,7 +3339,11 @@ class Compiler
  # the standard class-method inference path). For methods that
  # "return self" the table reports "stringscanner".
   def strscan_return_type(mname)
-    return "string" if mname == "scan" || mname == "check" || mname == "scan_until" || mname == "matched" || mname == "getch" || mname == "peek" || mname == "rest" || mname == "string" || mname == "pre_match" || mname == "post_match" || mname == "[]"
+ # Nullable (nil on miss / EOS / no last match): scan, check,
+ # scan_until, getch, matched, pre_match, post_match, []. peek / rest
+ # / string always return a (possibly empty) string, never nil.
+    return "string?" if mname == "scan" || mname == "check" || mname == "scan_until" || mname == "matched" || mname == "getch" || mname == "pre_match" || mname == "post_match" || mname == "[]"
+    return "string" if mname == "peek" || mname == "rest" || mname == "string"
     return "bool" if mname == "matched?" || mname == "eos?" || mname == "rest?"
     return "int" if mname == "pos" || mname == "pos=" || mname == "rest_size"
     return "stringscanner" if mname == "unscan" || mname == "terminate" || mname == "reset"
@@ -4003,6 +4008,14 @@ class Compiler
       if is_scalar_nullable_type(lt) == 1
         lt = base_type(lt)
       end
+ # A nullable string operand behaves like a plain string for operator
+ # result typing -- `m + x` / `m * n` is a string whether or not m can
+ # be nil (a nil receiver faults like CRuby's NoMethodError). Mirrors
+ # the scalar-nullable normalization above and codegen's string?-recv
+ # operator dispatch.
+      if base_type(lt) == "string"
+        lt = "string"
+      end
       if lt == "poly"
         if mname == "+" || mname == "-" || mname == "*" || mname == "/" || mname == "%" || mname == "**"
           return "poly"
@@ -4340,7 +4353,7 @@ class Compiler
  # operator is integer modulo.
       if recv >= 0
         rt = infer_type(recv)
-        if rt == "string" || rt == "mutable_str"
+        if base_type(rt) == "string" || rt == "mutable_str"
           args_id = @nd_arguments[nid]
           if args_id >= 0
             aargs = get_args(args_id)
@@ -4349,7 +4362,7 @@ class Compiler
               if at == "str_array"
                 return "string"
               end
-              if rt == "string"
+              if base_type(rt) == "string"
                 return "string"
               end
             end
@@ -24085,7 +24098,7 @@ class Compiler
  # compile_int_method_expr still emits `sp_sym_intern(...)`
  # — leaving a linker error against a missing definition.
           rt = infer_type(@nd_receiver[nid])
-          if rt == "string" || rt == "poly" || rt == "int"
+          if base_type(rt) == "string" || rt == "poly" || rt == "int"
             @needs_sym_intern = 1
           end
         end

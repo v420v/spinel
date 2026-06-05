@@ -4120,12 +4120,13 @@ class Compiler
         end
         return "poly_array"
       end
-      if et == "string"
- # Check if ALL elements are strings
+      if base_type(et) == "string"
+ # Check if ALL elements are strings (nullable string elements ride
+ # the same str_array; a NULL slot renders as nil like CRuby).
         all_str = 1
         k = 1
         while k < elems.length
-          if infer_type(elems[k]) != "string"
+          if base_type(infer_type(elems[k])) != "string"
             all_str = 0
           end
           k = k + 1
@@ -9606,10 +9607,19 @@ class Compiler
   end
 
   def emit_sym_runtime
-    if @sym_names.length > 0
+ # The dynamic intern pool (String#to_sym at runtime) is needed even
+ # when the program has no static symbol literals -- emit the table
+ # for either case. A zero-length C array is invalid, so the names
+ # array is declared with at least one (dummy) slot; SP_SYM_COUNT
+ # stays the real count, so the dummy is never read.
+    if @sym_names.length > 0 || @needs_sym_intern == 1
       emit_raw("/* sp_sym intern table */")
       emit_raw("#define SP_SYM_COUNT " + @sym_names.length.to_s)
-      line = "static const char *const sp_sym_names[" + @sym_names.length.to_s + "] = {"
+      decl_len = @sym_names.length
+      if decl_len == 0
+        decl_len = 1
+      end
+      line = "static const char *const sp_sym_names[" + decl_len.to_s + "] = {"
       i = 0
       while i < @sym_names.length
         if i > 0
@@ -9617,6 +9627,9 @@ class Compiler
         end
         line = line + c_string_literal(@sym_names[i])
         i = i + 1
+      end
+      if @sym_names.length == 0
+        line = line + "\"\""
       end
       line = line + "};"
       emit_raw(line)
@@ -16374,9 +16387,17 @@ class Compiler
                   fmt = fmt + "%s"
                   arg_exprs.push("sp_float_to_s(" + compile_expr(inner) + ")")
                 else
-                  if it == "string"
+                  if base_type(it) == "string"
                     fmt = fmt + "%s"
-                    arg_exprs.push(compile_expr(inner))
+                    if is_nullable_type(it) == 1
+ # CRuby renders `"#{nil}"` as "" -- a NULL string? must not
+ # reach %s (glibc prints "(null)", MinGW may fault). The
+ # statement-expression evaluates the (possibly side-effecting)
+ # receiver once.
+                      arg_exprs.push("({ const char *_si = " + compile_expr(inner) + "; _si ? _si : \"\"; })")
+                    else
+                      arg_exprs.push(compile_expr(inner))
+                    end
                   else
                     if it == "bool"
                       fmt = fmt + "%s"
@@ -20137,14 +20158,14 @@ class Compiler
     end
     if @nd_type[nid] == "CallNode" && @nd_name[nid] == "+"
       recv = @nd_receiver[nid]
-      if recv >= 0 && infer_type(recv) == "string"
+      if recv >= 0 && base_type(infer_type(recv)) == "string"
         collect_concat_parts(recv, parts)
         args_id = @nd_arguments[nid]
         if args_id >= 0
           aargs = get_args(args_id)
           if aargs.length > 0
             at = infer_type(aargs[0])
-            if at == "string"
+            if base_type(at) == "string"
               parts.push(compile_expr(aargs[0]))
             elsif at == "int"
               parts.push("sp_int_to_s(" + compile_expr(aargs[0]) + ")")
@@ -20635,7 +20656,7 @@ class Compiler
       if lt == "mutable_str"
         return "sp_str_concat(" + compile_expr(recv) + "->data, " + compile_arg0(nid) + ")"
       end
-      if lt == "string"
+      if base_type(lt) == "string"
         args_id = @nd_arguments[nid]
         if args_id >= 0
           arg_ids = get_args(args_id)
@@ -20809,7 +20830,7 @@ class Compiler
     end
     if mname == "*"
       lt = infer_type(recv)
-      if lt == "string"
+      if base_type(lt) == "string"
         return "sp_str_repeat(" + compile_expr(recv) + ", " + compile_arg0(nid) + ")"
       end
       if lt == "poly"
@@ -20891,7 +20912,7 @@ class Compiler
         @needs_rb_value = 1
         return "sp_poly_mod(" + compile_expr(recv) + ", " + box_expr_to_poly(get_args(@nd_arguments[nid])[0]) + ")"
       end
-      if lt == "string" || lt == "mutable_str"
+      if base_type(lt) == "string" || lt == "mutable_str"
         args_id = @nd_arguments[nid]
         if args_id >= 0
           aargs = get_args(args_id)
@@ -20937,7 +20958,7 @@ class Compiler
           end
         end
       end
-      if lt == "string"
+      if base_type(lt) == "string"
  # Ruby's `"fmt" % val` — single-value form. Arg is cast to match
  # the conversion: (double) for %f, (long long) for integer
  # conversions. Ruby's `%d` is mapped to C's `%lld` when the
@@ -21009,7 +21030,7 @@ class Compiler
         @needs_rb_value = 1
         return "sp_poly_lt(" + box_value_to_poly(lt, compile_expr(recv)) + ", " + box_value_to_poly(at, compile_expr(arg_id)) + ")"
       end
-      if lt == "string"
+      if base_type(lt) == "string"
         cc = try_char_cmp(nid, "<")
         if cc != ""
           return cc
@@ -21037,7 +21058,7 @@ class Compiler
         @needs_rb_value = 1
         return "sp_poly_gt(" + box_value_to_poly(lt, compile_expr(recv)) + ", " + box_value_to_poly(at, compile_expr(arg_id)) + ")"
       end
-      if lt == "string"
+      if base_type(lt) == "string"
         cc = try_char_cmp(nid, ">")
         if cc != ""
           return cc
@@ -21062,7 +21083,7 @@ class Compiler
         @needs_rb_value = 1
         return "sp_poly_le(" + box_value_to_poly(lt, compile_expr(recv)) + ", " + box_value_to_poly(at, compile_expr(arg_id)) + ")"
       end
-      if lt == "string"
+      if base_type(lt) == "string"
         cc = try_char_cmp(nid, "<=")
         if cc != ""
           return cc
@@ -21087,7 +21108,7 @@ class Compiler
         @needs_rb_value = 1
         return "sp_poly_ge(" + box_value_to_poly(lt, compile_expr(recv)) + ", " + box_value_to_poly(at, compile_expr(arg_id)) + ")"
       end
-      if lt == "string"
+      if base_type(lt) == "string"
         cc = try_char_cmp(nid, ">=")
         if cc != ""
           return cc
@@ -21171,7 +21192,7 @@ class Compiler
           lo = compile_expr(aargs[0])
           hi = compile_expr(aargs[1])
           lt = infer_type(recv)
-          if lt == "string"
+          if base_type(lt) == "string"
             return "(strcmp(" + rc + ", " + lo + ") >= 0 && strcmp(" + rc + ", " + hi + ") <= 0)"
           end
  # Comparable#between? on a user type: `self >= min && self <= max`
@@ -21221,7 +21242,7 @@ class Compiler
         val = compile_arg0(nid)
         return "(sp_String_append(" + rc + ", " + val + "), " + rc + ")"
       end
-      if lt == "string"
+      if base_type(lt) == "string"
  # `s << x` on a frozen string literal raises FrozenError per MRI.
  # spinel string literals are always frozen. The mutable_str arm
  # above handles the legal case. Issue #886.
@@ -32327,15 +32348,15 @@ class Compiler
  # passes the scalar to sp_str_eq's const char* param, or the scalar
  # fallthrough compares an mrb_int to a char* -- both fail to compile.
  # Cast both operands to void so their side effects still fire.
-    if (lt == "string" && (at == "int" || at == "float" || at == "bool" || at == "bigint")) ||
-       ((lt == "int" || lt == "float" || lt == "bool" || lt == "bigint") && at == "string")
+    if (base_type(lt) == "string" && (at == "int" || at == "float" || at == "bool" || at == "bigint")) ||
+       ((lt == "int" || lt == "float" || lt == "bool" || lt == "bigint") && base_type(at) == "string")
       if op == "=="
         return "(((void)(" + lc + ")), ((void)(" + rc + ")), FALSE)"
       else
         return "(((void)(" + lc + ")), ((void)(" + rc + ")), TRUE)"
       end
     end
-    if lt == "string"
+    if base_type(lt) == "string"
       if at == "nil"
         if op == "=="
           return "(" + lc + " == NULL)"

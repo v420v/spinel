@@ -123,14 +123,14 @@ static int64_t sc_char_len(const char *src, int64_t pos, int64_t len) {
 }
 
 const char *sp_StringScanner_scan(sp_StringScanner *sc, mrb_regexp_pattern *pat) {
-  if (!sc || !pat) return sp_ext_str_empty();
+  if (!sc || !pat) return NULL;
   int64_t slen = (int64_t)sp_ext_str_byte_len(sc->source);
   int64_t mlen = sc_match_at_pos(pat, sc->source, slen, sc->pos, sc->caps, &sc->ncaps);
   if (mlen < 0) {
     sc->matched = sp_ext_str_empty();
     sc->matched_p = 0;
     sc->ncaps = 0;
-    return sp_ext_str_empty();
+    return NULL;
   }
   char *m = sc_substr(sc->source, sc->pos, mlen);
   sc->last_pos = sc->pos;
@@ -141,14 +141,14 @@ const char *sp_StringScanner_scan(sp_StringScanner *sc, mrb_regexp_pattern *pat)
 }
 
 const char *sp_StringScanner_check(sp_StringScanner *sc, mrb_regexp_pattern *pat) {
-  if (!sc || !pat) return sp_ext_str_empty();
+  if (!sc || !pat) return NULL;
   int64_t slen = (int64_t)sp_ext_str_byte_len(sc->source);
   int64_t mlen = sc_match_at_pos(pat, sc->source, slen, sc->pos, sc->caps, &sc->ncaps);
   if (mlen < 0) {
     sc->matched = sp_ext_str_empty();
     sc->matched_p = 0;
     sc->ncaps = 0;
-    return sp_ext_str_empty();
+    return NULL;
   }
   char *m = sc_substr(sc->source, sc->pos, mlen);
   sc->last_pos = sc->pos;
@@ -166,7 +166,7 @@ const char *sp_StringScanner_scan_until(sp_StringScanner *sc, mrb_regexp_pattern
     sc->matched = sp_ext_str_empty();
     sc->matched_p = 0;
     sc->ncaps = 0;
-    return sp_ext_str_empty();
+    return NULL;
   }
   int64_t consumed = (mstart + mlen) - sc->pos;
   char *taken = sc_substr(sc->source, sc->pos, consumed);
@@ -193,8 +193,8 @@ const char *sp_StringScanner_aref(sp_StringScanner *sc, mrb_int n) {
 }
 
 const char *sp_StringScanner_matched(sp_StringScanner *sc) {
-  if (!sc) return sp_ext_str_empty();
-  return sc->matched ? sc->matched : sp_ext_str_empty();
+  if (!sc || !sc->matched_p) return NULL;
+  return sc->matched ? sc->matched : NULL;
 }
 
 mrb_bool sp_StringScanner_matched_p(sp_StringScanner *sc) {
@@ -225,7 +225,7 @@ const char *sp_StringScanner_getch(sp_StringScanner *sc) {
   if (sc->pos >= slen) {
     sc->matched = sp_ext_str_empty();
     sc->matched_p = 0;
-    return sp_ext_str_empty();
+    return NULL;
   }
   int64_t clen = sc_char_len(sc->source, sc->pos, slen);
   char *c = sc_substr(sc->source, sc->pos, clen);
@@ -295,13 +295,13 @@ const char *sp_StringScanner_string(sp_StringScanner *sc) {
 }
 
 const char *sp_StringScanner_pre_match(sp_StringScanner *sc) {
-  if (!sc) return sp_ext_str_empty();
+  if (!sc || !sc->matched_p) return NULL;
   if (sc->last_pos <= 0) return sp_ext_str_empty();
   return sc_substr(sc->source, 0, sc->last_pos);
 }
 
 const char *sp_StringScanner_post_match(sp_StringScanner *sc) {
-  if (!sc || !sc->matched_p) return sp_ext_str_empty();
+  if (!sc || !sc->matched_p) return NULL;
   int64_t mlen = (int64_t)sp_ext_str_byte_len(sc->matched);
   int64_t start = sc->last_pos + mlen;
   int64_t slen = (int64_t)sp_ext_str_byte_len(sc->source);
