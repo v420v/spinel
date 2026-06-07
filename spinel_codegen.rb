@@ -4613,6 +4613,17 @@ class Compiler
     if name == "<=>"
       return 1
     end
+ # Unary operator methods `def -@` / `def +@`. A `-obj` / `+obj`
+ # whose receiver class defines them dispatches through
+ # compile_obj_operator_expr like the binary operators; without this
+ # they fall through to the numeric negation arm in
+ # compile_operator_expr and the user method is never called.
+    if name == "-@"
+      return 1
+    end
+    if name == "+@"
+      return 1
+    end
     0
   end
 
@@ -5549,6 +5560,14 @@ class Compiler
     end
     if name == "[]="
       return "_aset"
+    end
+ # Unary operator methods. The bare `-@` / `+@` would otherwise emit
+ # the literal `@` (and `-`) into the C identifier (`sp_X_-@`).
+    if name == "-@"
+      return "_uminus"
+    end
+    if name == "+@"
+      return "_uplus"
     end
     result = ""
     i = 0
