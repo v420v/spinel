@@ -9998,6 +9998,16 @@ class Compiler
       return
     end
     collect_cvars_in(root, -1)
+ # Second pass: register cvars whose only appearance is inside a
+ # method body. collect_cvars_in deliberately skips DefNode bodies
+ # to avoid a method-body literal widening a class-body-declared
+ # type. After the first pass all class-body types are settled, so
+ # this pass walks method bodies and registers each cvar target
+ # ONLY IF the name is not already known -- so it can emit a static
+ # slot for a genuinely method-only cvar without ever widening an
+ # established type. No init folding: the value is assigned at call
+ # time, not startup, so the slot keeps its type default.
+    collect_method_cvars_in(root, -1)
   end
 
  # Recursively scan `nid`'s subtree for ClassVariable*WriteNode and
@@ -10091,6 +10101,58 @@ class Compiler
     k = 0
     while k < cs.length
       collect_cvars_in(cs[k], class_idx)
+      k = k + 1
+    end
+  end
+
+ # Register a cvar slot for `qname` ONLY when it isn't already
+ # known. Used by the method-body pass: a genuinely method-only
+ # cvar gets a static slot emitted, but a name already registered
+ # by a class-body write is left untouched so the method-body
+ # write can never widen its established type.
+  def register_cvar_if_absent(qname, t)
+    if find_cvar_idx(qname) >= 0
+      return
+    end
+    register_cvar(qname, t)
+  end
+
+ # Companion to collect_cvars_in that DOES descend into DefNode
+ # bodies. Runs after the main collect pass so every class-body
+ # cvar type is already settled. Registers method-body cvar write
+ # targets only-if-absent, with a type inferred from the rhs (or
+ # int for the compound forms reading nil), so a cvar first
+ # assigned inside a method still gets a static slot. Mirrors
+ # collect_cvars_in's class/module namespace switching.
+  def collect_method_cvars_in(nid, class_idx)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "ClassNode"
+      cp = @nd_constant_path[nid]
+      if cp >= 0
+        cname = const_ref_flat_name(cp)
+        ci = find_class_idx(cname)
+        if ci >= 0
+          collect_method_cvars_in(@nd_body[nid], ci)
+        end
+      end
+      return
+    end
+    if t == "ModuleNode"
+      collect_method_cvars_in(@nd_body[nid], -1)
+      return
+    end
+    if t == "ClassVariableWriteNode" || t == "ClassVariableOperatorWriteNode" || t == "ClassVariableOrWriteNode" || t == "ClassVariableAndWriteNode"
+      qname = cvar_qname(class_idx, @nd_name[nid])
+      register_cvar_if_absent(qname, infer_type(@nd_expression[nid]))
+    end
+    cs = []
+    push_child_ids(nid, cs)
+    k = 0
+    while k < cs.length
+      collect_method_cvars_in(cs[k], class_idx)
       k = k + 1
     end
   end
