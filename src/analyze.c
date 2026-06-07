@@ -292,6 +292,55 @@ static int infer_param_types(Compiler *c) {
   return changed;
 }
 
+/* Name of a block's idx-th required parameter, or NULL. */
+const char *block_param_name(Compiler *c, int block, int idx) {
+  int bp = nt_ref(c->nt, block, "parameters");      /* BlockParametersNode */
+  if (bp < 0) return NULL;
+  int pn = nt_ref(c->nt, bp, "parameters");          /* ParametersNode */
+  if (pn < 0) return NULL;
+  int n = 0;
+  const int *reqs = nt_arr(c->nt, pn, "requireds", &n);
+  if (idx < n) return nt_str(c->nt, reqs[idx], "name");
+  return NULL;
+}
+
+/* Bind block parameter types for supported iteration methods. */
+static int infer_block_params(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    int block = nt_ref(nt, id, "block");
+    if (block < 0) continue;
+    const char *name = nt_str(nt, id, "name");
+    int recv = nt_ref(nt, id, "receiver");
+    if (!name || recv < 0) continue;
+    TyKind rt = infer_type(c, recv);
+    const char *p0 = block_param_name(c, block, 0);
+    if (!p0) continue;
+
+    TyKind pt = TY_UNKNOWN;
+    if ((!strcmp(name, "times") || !strcmp(name, "upto") ||
+         !strcmp(name, "downto") || !strcmp(name, "step")) && rt == TY_INT)
+      pt = TY_INT;
+    else if (!strcmp(name, "each") && rt == TY_RANGE)
+      pt = TY_INT;
+    else if ((!strcmp(name, "each") || !strcmp(name, "map") ||
+              !strcmp(name, "select") || !strcmp(name, "reject") ||
+              !strcmp(name, "find") || !strcmp(name, "each_with_index")) &&
+             ty_is_array(rt))
+      pt = ty_array_elem(rt);
+
+    if (pt == TY_UNKNOWN) continue;
+    Scope *s = comp_scope_of(c, block);
+    LocalVar *lv = scope_local_intern(s, p0);
+    TyKind merged = ty_unify(lv->type, pt);
+    if (merged != lv->type) { lv->type = merged; changed = 1; }
+  }
+  return changed;
+}
+
 /* Value type of an explicit `return expr` (or nil for bare return). */
 static TyKind return_node_type(Compiler *c, int id) {
   int args = nt_ref(c->nt, id, "arguments");
@@ -331,6 +380,7 @@ void analyze_program(Compiler *c) {
     int ch = 0;
     ch |= infer_write_types(c);
     ch |= infer_param_types(c);
+    ch |= infer_block_params(c);
     ch |= infer_return_types(c);
     if (!ch) break;
   }

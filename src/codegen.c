@@ -127,6 +127,21 @@ static void emit_stmts(Compiler *c, int id, Buf *b, int indent);
 static void emit_stmts_tail(Compiler *c, int id, Buf *b, int indent);
 static int  emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent);
 static int  emit_output_call(Compiler *c, int id, Buf *b, int indent);
+static int  emit_iteration_stmt(Compiler *c, int id, Buf *b, int indent);
+
+/* Strip ParenthesesNode wrappers to reach the inner expression. */
+static int unwrap_parens(Compiler *c, int id) {
+  while (id >= 0) {
+    const char *ty = nt_type(c->nt, id);
+    if (!ty || strcmp(ty, "ParenthesesNode")) break;
+    int body = nt_ref(c->nt, id, "body");
+    int n = 0;
+    const int *bd = body >= 0 ? nt_arr(c->nt, body, "body", &n) : NULL;
+    if (n != 1) break;
+    id = bd[0];
+  }
+  return id;
+}
 
 /* ---- calls ---- */
 
@@ -306,6 +321,98 @@ static int emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent) {
     emit_expr(c, argv[0], b); buf_puts(b, ");\n");
     return 1;
   }
+  return 0;
+}
+
+/* Block iteration lowered to an inline C for-loop. Handles n.times,
+   array.each, range.each, n.upto/downto. Returns 1 if handled. */
+static int emit_iteration_stmt(Compiler *c, int id, Buf *b, int indent) {
+  const NodeTable *nt = c->nt;
+  int block = nt_ref(nt, id, "block");
+  if (block < 0) return 0;
+  const char *name = nt_str(nt, id, "name");
+  int recv = nt_ref(nt, id, "receiver");
+  if (!name || recv < 0) return 0;
+  int body = nt_ref(nt, block, "body");
+  const char *p0 = block_param_name(c, block, 0);
+  TyKind rt = comp_ntype(c, recv);
+
+  /* n.times { |i| ... } */
+  if (!strcmp(name, "times") && rt == TY_INT) {
+    int t = ++g_tmp;
+    Buf rb; memset(&rb, 0, sizeof rb);
+    emit_expr(c, recv, &rb);
+    emit_indent(b, indent);
+    buf_printf(b, "for (mrb_int _t%d = 0; _t%d < ", t, t);
+    buf_puts(b, rb.p); buf_printf(b, "; _t%d++) {\n", t);
+    if (p0) { emit_indent(b, indent + 1); buf_printf(b, "lv_%s = _t%d;\n", p0, t); }
+    emit_stmts(c, body, b, indent + 1);
+    emit_indent(b, indent); buf_puts(b, "}\n");
+    free(rb.p);
+    return 1;
+  }
+
+  /* array.each { |x| ... } */
+  if (!strcmp(name, "each") && ty_is_array(rt)) {
+    const char *k = array_kind(rt);
+    if (!k) return 0;
+    int t = ++g_tmp;
+    Buf rb; memset(&rb, 0, sizeof rb);
+    emit_expr(c, recv, &rb);
+    emit_indent(b, indent);
+    buf_printf(b, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(", t, t, k);
+    buf_puts(b, rb.p); buf_printf(b, "); _t%d++) {\n", t);
+    if (p0) {
+      emit_indent(b, indent + 1);
+      buf_printf(b, "lv_%s = sp_%sArray_get(", p0, k);
+      buf_puts(b, rb.p); buf_printf(b, ", _t%d);\n", t);
+    }
+    emit_stmts(c, body, b, indent + 1);
+    emit_indent(b, indent); buf_puts(b, "}\n");
+    free(rb.p);
+    return 1;
+  }
+
+  /* (a..b).each { |i| ... } */
+  if (!strcmp(name, "each") && rt == TY_RANGE && p0) {
+    int rn = unwrap_parens(c, recv);
+    if (nt_type(nt, rn) && !strcmp(nt_type(nt, rn), "RangeNode")) {
+      int left = nt_ref(nt, rn, "left");
+      int right = nt_ref(nt, rn, "right");
+      int excl = (int)(nt_int(nt, rn, "flags", 0) & 4);
+      Buf lb; memset(&lb, 0, sizeof lb); emit_expr(c, left, &lb);
+      Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, right, &rb);
+      emit_indent(b, indent);
+      buf_printf(b, "for (lv_%s = ", p0); buf_puts(b, lb.p);
+      buf_printf(b, "; lv_%s %s ", p0, excl ? "<" : "<="); buf_puts(b, rb.p);
+      buf_printf(b, "; lv_%s++) {\n", p0);
+      emit_stmts(c, body, b, indent + 1);
+      emit_indent(b, indent); buf_puts(b, "}\n");
+      free(lb.p); free(rb.p);
+      return 1;
+    }
+  }
+
+  /* n.upto(m) / n.downto(m) { |i| ... } */
+  if ((!strcmp(name, "upto") || !strcmp(name, "downto")) && rt == TY_INT && p0) {
+    int up = !strcmp(name, "upto");
+    int args = nt_ref(nt, id, "arguments");
+    int argc = 0;
+    const int *argv = NULL;
+    if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
+    if (argc != 1) return 0;
+    Buf lo; memset(&lo, 0, sizeof lo); emit_expr(c, recv, &lo);
+    Buf hi; memset(&hi, 0, sizeof hi); emit_expr(c, argv[0], &hi);
+    emit_indent(b, indent);
+    buf_printf(b, "for (lv_%s = ", p0); buf_puts(b, lo.p);
+    buf_printf(b, "; lv_%s %s ", p0, up ? "<=" : ">="); buf_puts(b, hi.p);
+    buf_printf(b, "; lv_%s%s) {\n", p0, up ? "++" : "--");
+    emit_stmts(c, body, b, indent + 1);
+    emit_indent(b, indent); buf_puts(b, "}\n");
+    free(lo.p); free(hi.p);
+    return 1;
+  }
+
   return 0;
 }
 
@@ -646,6 +753,7 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
 
   if (!strcmp(ty, "CallNode")) {
     if (emit_output_call(c, id, b, indent)) return;
+    if (emit_iteration_stmt(c, id, b, indent)) return;
     if (emit_array_mutate_stmt(c, id, b, indent)) return;
     emit_indent(b, indent);
     emit_expr(c, id, b);

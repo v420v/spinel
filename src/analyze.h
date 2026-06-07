@@ -18,4 +18,7 @@ void analyze_program(Compiler *c);
    reads the cached results via comp_ntype. */
 TyKind infer_type(Compiler *c, int id);
 
+/* Name of a block's idx-th required parameter, or NULL. */
+const char *block_param_name(Compiler *c, int block, int idx);
+
 #endif
