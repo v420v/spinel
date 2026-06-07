@@ -118,6 +118,7 @@ class Compiler
   compiler_state_sa :lambda_var_ret_names, :lambda_var_ret_types, :multi_const_inits, :meth_blk_param_types, :cls_cmeth_blk_param_types
   compiler_state_sa :iexec_block_pnames, :iexec_block_ptypes
   compiler_state_sa :attr_alias_keys, :attr_alias_ivars
+  compiler_state_sa :cls_meth_blk_param_types
 
   compiler_state_ia :meth_body_ids, :meth_rest_index, :meth_kwrest_index, :meth_has_yield, :cls_rest_idxs, :cls_is_value_type
   compiler_state_ia :cls_is_sra, :const_expr_ids, :const_mutated, :gvar_written, :module_body_ids, :ffi_buf_sizes, :ffi_reader_offsets

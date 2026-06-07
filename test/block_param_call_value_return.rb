@@ -26,8 +26,7 @@ end
 puts Runner.new.run { "fixed" }
 puts Runner.new.run { |x| "got" }
 
-# NOTE: an instance &block method whose block body depends on the
-# yielded arg's type (e.g. `run { |x| x.upcase }`) still types the
-# block param as int -- instance-method block-param typing from
-# blk.call args is a separate gap (top-level / singleton methods do
-# propagate it). Tracked under #1362.
+# instance &block method whose block body depends on the yielded arg's
+# type: the block param is typed from blk.call's arg (string here), so
+# string methods resolve.
+puts Runner.new.run { |x| x.upcase }

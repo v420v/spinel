@@ -20230,6 +20230,42 @@ class Compiler
       end
       ci = ci + 1
     end
+ # Instance methods: same per-position blk.call-arg collection for
+ # `&block`-param methods. The top-level (@meth_*) and singleton
+ # (@cls_cmeth_*) loops above did not cover these, so an instance
+ # `def run(&blk); blk.call(x) end`'s block params defaulted to int
+ # and a `run { |x| x.upcase }` block body could not resolve string
+ # methods. Only the proc-param case is populated; yield-using
+ # instance methods keep the codegen scope-walk fallback ("").
+    @cls_meth_blk_param_types = "".split(",", -1)
+    ci = 0
+    while ci < @cls_names.length
+      if ci < @cls_meth_names.length
+        imnames = @cls_meth_names[ci].split(";", -1)
+        im_bodies = @cls_meth_bodies[ci].split(";", -1)
+        im_ptypes = @cls_meth_ptypes[ci].split("|", -1)
+        imidx = 0
+        while imidx < imnames.length
+          if imidx < im_ptypes.length
+            ipts = im_ptypes[imidx].split(",", -1)
+            if ipts.length > 0 && ipts.last == "proc"
+              ipnames = cls_meth_pnames_get(ci, imidx)
+              bpname = ipnames[ipnames.length - 1]
+              acc = "".split(",", -1)
+              body_id = im_bodies[imidx].to_i
+              collect_blk_call_arg_types(body_id, bpname, acc, body_id)
+              @cls_meth_blk_param_types.push(acc.join("|"))
+            else
+              @cls_meth_blk_param_types.push("")
+            end
+          else
+            @cls_meth_blk_param_types.push("")
+          end
+          imidx = imidx + 1
+        end
+      end
+      ci = ci + 1
+    end
   end
 
   def collect_blk_call_arg_types(nid, bpname, acc, body_id = -1)

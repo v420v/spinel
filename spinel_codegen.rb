@@ -11685,6 +11685,29 @@ class Compiler
         ci_cm = ci_cm + 1
       end
     end
+ # Instance methods: flat-indexed parallel to @cls_meth_bodies, the
+ # same shape as the singleton lookup above. Populated by analyze for
+ # `&block`-param instance methods so a literal block's params pick up
+ # blk.call's arg types (e.g. string for `run { |x| x.upcase }`).
+    if @cls_meth_blk_param_types != nil
+      flat_idx_im = 0
+      ci_im = 0
+      while ci_im < @cls_names.length
+        im_bodies_b = ci_im < @cls_meth_bodies.length ? @cls_meth_bodies[ci_im].split(";", -1) : "".split(",", -1)
+        midx_im_b = 0
+        while midx_im_b < im_bodies_b.length
+          if im_bodies_b[midx_im_b].to_i == bid
+            if flat_idx_im < @cls_meth_blk_param_types.length
+              return @cls_meth_blk_param_types[flat_idx_im]
+            end
+            return ""
+          end
+          flat_idx_im = flat_idx_im + 1
+          midx_im_b = midx_im_b + 1
+        end
+        ci_im = ci_im + 1
+      end
+    end
     ""
   end
 
@@ -31482,7 +31505,19 @@ class Compiler
           end
           bp = ""
           if has_proc == 1
-            bp = block_forward_expr(nid)
+ # Source the &block's param types from the callee's analyze-side
+ # blk.call-arg projection so the literal block's params are typed
+ # (e.g. `run { |x| x.upcase }` gets x: string). Look up by the
+ # callee body id, which blk_param_types_for_body now resolves for
+ # instance methods too.
+            blk_types_im = ""
+            if oci2 >= 0 && midx2 >= 0 && oci2 < @cls_meth_bodies.length
+              im_bodies_fw = @cls_meth_bodies[oci2].split(";", -1)
+              if midx2 < im_bodies_fw.length
+                blk_types_im = blk_param_types_for_body(im_bodies_fw[midx2].to_i)
+              end
+            end
+            bp = block_forward_expr(nid, blk_types_im)
             if bp == ""
  # The callee declares &block but the call site provides
  # none — fill the slot with NULL so the C call has the
