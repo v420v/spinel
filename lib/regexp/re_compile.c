@@ -678,7 +678,14 @@ compile_atom(re_compiler *c)
       next_char(c);
       uint16_t id = add_class(c);
       class_add_shorthand(&c->classes[id], ch);
-      emit(c, (ch >= 'A' && ch <= 'Z') ? RE_NCLASS : RE_CLASS, (uint8_t)id, 0);
+      /* class_add_shorthand already builds the directly-matching set for
+         every shorthand -- positive for d/w/s, the explicit complement
+         (plus utf8_any) for D/W/S -- so emit RE_CLASS for all of them.
+         The old `uppercase -> RE_NCLASS` route negated the complement a
+         second time, so top-level \D/\W/\S matched exactly the set they
+         should reject. The `[...]` path was unaffected (no NCLASS wrapper)
+         and stays correct. Mirrors the \h/\H arm below. */
+      emit(c, RE_CLASS, (uint8_t)id, 0);
     }
     else if (ch == 'h' || ch == 'H') {
       /* \h / \H both carry their full positive set (hex digits /
