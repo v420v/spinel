@@ -17934,6 +17934,37 @@ class Compiler
       scan_fiber_free_vars(body, all_plist, all_names, free_vars, free_var_types)
     end
 
+ # `rescue => e` inside the fiber body binds `e` as a fiber-body local,
+ # not a capture of a same-named outer var. scan_fiber_free_vars would
+ # otherwise capture it while compile_rescue_chain emits a bare `lv_e`,
+ # leaving it undeclared in `_fiber_body_N`. Force such names to true
+ # locals (typed `exception`) and drop them from the capture set.
+    rb_names_f = "".split(",", -1)
+    if body >= 0
+      collect_rescue_bound_names(body, rb_names_f)
+    end
+    rbi = 0
+    while rbi < rb_names_f.length
+      rbn = rb_names_f[rbi]
+      new_fv = "".split(",", -1)
+      new_fvt = "".split(",", -1)
+      fvj = 0
+      while fvj < free_vars.length
+        if free_vars[fvj] != rbn
+          new_fv.push(free_vars[fvj])
+          new_fvt.push(free_var_types[fvj])
+        end
+        fvj = fvj + 1
+      end
+      free_vars = new_fv
+      free_var_types = new_fvt
+      if not_in(rbn, local_names) == 1 && not_in(rbn, all_plist) == 1
+        local_names.push(rbn)
+        local_types.push("exception")
+      end
+      rbi = rbi + 1
+    end
+
  # Capture `self` when the body references the enclosing instance
  # (explicit `self`, ivar reads/writes, or no-receiver method calls
  # that resolve to `self.<m>`). Without this, `_fiber_body_N`'s
@@ -42029,6 +42060,47 @@ class Compiler
     k = 0
     while k < conds_lf.length
       scan_lambda_free_vars(conds_lf[k], params, locals, free_vars)
+      k = k + 1
+    end
+  end
+
+ # Collect the names bound by `rescue => e` clauses lexically inside a
+ # proc/lambda/fiber body, without descending into nested closure bodies
+ # (those declare their own). compile_rescue_chain emits `lv_<name> = ...`
+ # assuming the binding is a declared local of the function it lowers
+ # into; but a rescue-bound var is attributed to the *enclosing* scope,
+ # so a closure body never declares it and the body function references
+ # an undeclared `lv_<name>`. Callers declare these as `exception` locals.
+  def collect_rescue_bound_names(nid, acc)
+    if nid < 0
+      return
+    end
+    t = @nd_type[nid]
+    if t == "LambdaNode"
+      return
+    end
+    if t == "CallNode" && @nd_name[nid] == "new"
+      rv = @nd_receiver[nid]
+      if rv >= 0 && constructor_class_name(rv) == "Fiber"
+        return
+      end
+    end
+    rc = @nd_rescue_clause[nid]
+    while rc >= 0
+      ref = @nd_reference[rc]
+      if ref >= 0
+        en = @nd_name[ref]
+        if not_in(en, acc) == 1
+          acc.push(en)
+        end
+      end
+      rc = @nd_subsequent[rc]
+    end
+    cs_rb = []
+    push_child_ids(nid, cs_rb)
+    k = 0
+    while k < cs_rb.length
+      collect_rescue_bound_names(cs_rb[k], acc)
       k = k + 1
     end
   end
