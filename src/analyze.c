@@ -401,7 +401,10 @@ static TyKind infer_uncached(Compiler *c, int id) {
     }
     /* symbol keys -> SymPolyHash (boxed values), regardless of value type */
     if (kt == TY_SYMBOL) return TY_SYM_POLY_HASH;
-    return ty_hash_of(kt, vt);
+    TyKind hv = ty_hash_of(kt, vt);
+    /* string keys with a mixed/unsupported value type -> StrPolyHash */
+    if (hv == TY_UNKNOWN && kt == TY_STRING && vt != TY_UNKNOWN) return TY_STR_POLY_HASH;
+    return hv;
   }
   if (!strcmp(ty, "YieldNode")) {
     /* value of yield = the block body's value at a call site of this method */
@@ -938,10 +941,15 @@ static int infer_write_types(Compiler *c) {
       lv->type = ty_unify(lv->type, ty_array_of(vt));
     }
     else if (kt == TY_STRING) {
+      if (vt == TY_UNKNOWN) continue;
       TyKind hv = ty_hash_of(TY_STRING, vt);
-      if (hv == TY_UNKNOWN) continue;
+      if (hv == TY_UNKNOWN) hv = TY_STR_POLY_HASH;  /* mixed values */
       if (lv->type != TY_UNKNOWN && !ty_is_hash(lv->type)) continue;
-      lv->type = ty_unify(lv->type, hv);
+      /* a str-keyed hash that has seen >1 value type widens to StrPoly */
+      if (lv->type != TY_UNKNOWN && lv->type != hv &&
+          (lv->type == TY_STR_INT_HASH || lv->type == TY_STR_STR_HASH || lv->type == TY_STR_POLY_HASH))
+        hv = TY_STR_POLY_HASH;
+      lv->type = hv;
     }
     else if (kt == TY_SYMBOL) {
       /* symbol key -> SymPolyHash (boxed values) */

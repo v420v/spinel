@@ -28,6 +28,7 @@ typedef enum {
   TY_INT_INT_HASH,
   TY_INT_STR_HASH,
   TY_SYM_POLY_HASH, /* symbol keys, boxed (poly) values */
+  TY_STR_POLY_HASH, /* string keys, boxed (poly) values */
   TY_POLY          /* union / top: a value whose static type widened */
 } TyKind;
 

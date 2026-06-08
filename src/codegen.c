@@ -115,6 +115,7 @@ static const char *c_type_name(TyKind t) {
     case TY_INT_INT_HASH: return "sp_IntIntHash *";
     case TY_INT_STR_HASH: return "sp_IntStrHash *";
     case TY_SYM_POLY_HASH: return "sp_SymPolyHash *";
+    case TY_STR_POLY_HASH: return "sp_StrPolyHash *";
     case TY_POLY:         return "sp_RbVal";
     case TY_POLY_ARRAY:   return "sp_PolyArray *";
     default:             return NULL;
@@ -926,6 +927,27 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         return;
       }
       if (!strcmp(name, "fetch") && argc == 1) {
+        int blk = nt_ref(nt, id, "block");
+        if (blk >= 0) {
+          /* fetch(key) { default } -> has_key? ? get : block-default */
+          TyKind vt = ty_hash_val(rt);
+          int th = ++g_tmp, tk = ++g_tmp;
+          buf_printf(b, "({ %s _t%d = ", c_type_name(rt), th); emit_expr(c, recv, b);
+          buf_printf(b, "; %s _t%d = ", c_type_name(ty_hash_key(rt)), tk); emit_expr(c, argv[0], b);
+          buf_printf(b, "; sp_%sHash_has_key(_t%d, _t%d) ? sp_%sHash_get(_t%d, _t%d) : ", hn, th, tk, hn, th, tk);
+          int bbody = nt_ref(nt, blk, "body");
+          int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
+          int bval = bn > 0 ? bb[bn - 1] : -1;
+          buf_puts(b, "({ ");
+          for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], b, 0);  /* leading stmts */
+          if (bval >= 0) {
+            if (vt == TY_POLY && comp_ntype(c, bval) != TY_POLY) emit_boxed(c, bval, b);
+            else emit_expr(c, bval, b);
+          }
+          else buf_puts(b, vt == TY_POLY ? "sp_box_nil()" : default_value(vt));
+          buf_printf(b, "; }); })");
+          return;
+        }
         buf_printf(b, "sp_%sHash_get(", hn);
         emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
         return;
@@ -1285,7 +1307,7 @@ static int emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent) {
       buf_printf(b, "sp_%sHash_set(", hn);
       emit_expr(c, recv, b); buf_puts(b, ", ");
       emit_expr(c, argv[0], b); buf_puts(b, ", ");
-      if (rt == TY_SYM_POLY_HASH) emit_boxed(c, argv[1], b); else emit_expr(c, argv[1], b);
+      if (rt == TY_SYM_POLY_HASH || rt == TY_STR_POLY_HASH) emit_boxed(c, argv[1], b); else emit_expr(c, argv[1], b);
       buf_puts(b, ");\n");
       return 1;
     }
@@ -1928,7 +1950,7 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     buf_printf(g_pre, "sp_%sHash *_t%d = sp_%sHash_new();\n", hn, t, hn);
     emit_indent(g_pre, g_indent);
     buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", t);
-    int sym_poly = (ht == TY_SYM_POLY_HASH);
+    int sym_poly = (ht == TY_SYM_POLY_HASH || ht == TY_STR_POLY_HASH);
     for (int j = 0; j < n; j++) {
       int key = nt_ref(nt, els[j], "key");
       int val = nt_ref(nt, els[j], "value");
