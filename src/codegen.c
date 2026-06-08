@@ -444,12 +444,15 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (ac == 0) {
       if (g_rescue_cls) buf_printf(b, "sp_raise_cls(%s, %s)", g_rescue_cls, g_rescue_msg);
       else buf_puts(b, "sp_raise((&(\"\\xff\")[1]))");
-    } else if (ac == 1 && nt_type(nt, av[0]) && !strcmp(nt_type(nt, av[0]), "ConstantReadNode")) {
+    }
+    else if (ac == 1 && nt_type(nt, av[0]) && !strcmp(nt_type(nt, av[0]), "ConstantReadNode")) {
       buf_printf(b, "sp_raise_cls(\"%s\", (&(\"\\xff\")[1]))", nt_str(nt, av[0], "name"));
-    } else if (ac >= 2 && nt_type(nt, av[0]) && !strcmp(nt_type(nt, av[0]), "ConstantReadNode")) {
+    }
+    else if (ac >= 2 && nt_type(nt, av[0]) && !strcmp(nt_type(nt, av[0]), "ConstantReadNode")) {
       buf_printf(b, "sp_raise_cls(\"%s\", ", nt_str(nt, av[0], "name"));
       emit_expr(c, av[1], b); buf_puts(b, ")");
-    } else {
+    }
+    else {
       buf_puts(b, "sp_raise("); emit_expr(c, av[0], b); buf_puts(b, ")");
     }
     return;
@@ -2019,7 +2022,8 @@ static void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr, const c
     const char *sv = g_result_var; g_result_var = resultvar;
     emit_stmts_tail(c, stmts, b, indent);
     g_result_var = sv;
-  } else {
+  }
+  else {
     emit_stmts(c, stmts, b, indent);
   }
   g_rescue_cls = save_cls; g_rescue_msg = save_msg;
@@ -2047,22 +2051,40 @@ static void emit_begin(Compiler *c, int id, Buf *b, int indent, const char *resu
   const NodeTable *nt = c->nt;
   int body = nt_ref(nt, id, "statements");
   int rescue = nt_ref(nt, id, "rescue_clause");
+  int else_c = nt_ref(nt, id, "else_clause");
+  int ensure_c = nt_ref(nt, id, "ensure_clause");
+  int else_stmts = else_c >= 0 ? nt_ref(nt, else_c, "statements") : -1;
+  int ensure_stmts = ensure_c >= 0 ? nt_ref(nt, ensure_c, "statements") : -1;
   int fr = ++g_tmp;
 
   emit_indent(b, indent); buf_puts(b, "sp_exc_top++;\n");
   emit_indent(b, indent); buf_puts(b, "if (setjmp(sp_exc_stack[sp_exc_top-1]) == 0) {\n");
-  if (resultvar) {
+  /* body value is the begin value only when there is no else clause */
+  if (resultvar && else_stmts < 0) {
     const char *sv = g_result_var; g_result_var = resultvar;
     emit_stmts_tail(c, body, b, indent + 1);
     g_result_var = sv;
-  } else {
+  }
+  else {
     emit_stmts(c, body, b, indent + 1);
   }
   emit_indent(b, indent + 1); buf_puts(b, "sp_exc_top--;\n");
+  if (else_stmts >= 0) {  /* else runs only on success; its value is the begin value */
+    if (resultvar) {
+      const char *sv = g_result_var; g_result_var = resultvar;
+      emit_stmts_tail(c, else_stmts, b, indent + 1);
+      g_result_var = sv;
+    }
+    else {
+      emit_stmts(c, else_stmts, b, indent + 1);
+    }
+  }
+  if (ensure_stmts >= 0) emit_stmts(c, ensure_stmts, b, indent + 1);
   emit_indent(b, indent); buf_puts(b, "}\n");
   emit_indent(b, indent); buf_puts(b, "else {\n");
   emit_indent(b, indent + 1); buf_puts(b, "sp_exc_top--;\n");
   if (rescue >= 0) emit_rescue(c, rescue, b, indent + 1, fr, resultvar);
+  if (ensure_stmts >= 0) emit_stmts(c, ensure_stmts, b, indent + 1);
   emit_indent(b, indent); buf_puts(b, "}\n");
 }
 

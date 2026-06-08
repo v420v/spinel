@@ -371,7 +371,8 @@ static TyKind infer_uncached(Compiler *c, int id) {
           Scope *cs = comp_scope_of(c, cid);
           if (cs->class_id >= 0) rmi = comp_method_in_chain(c, cs->class_id, cn, NULL);
         }
-      } else {
+      }
+      else {
         TyKind crt = infer_type(c, crecv);
         if (ty_is_object(crt)) rmi = comp_method_in_chain(c, ty_object_class(crt), cn, NULL);
       }
