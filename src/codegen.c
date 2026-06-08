@@ -1358,6 +1358,14 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_puts(b, eq ? ")" : "))");
       return;
     }
+    /* two typed arrays of the same kind: element-wise compare */
+    if (array_kind(rt) && rt == a0) {
+      if (!eq) buf_puts(b, "(!");
+      buf_printf(b, "sp_%sArray_eq(", array_kind(rt));
+      emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
+      buf_puts(b, eq ? ")" : "))");
+      return;
+    }
     /* poly array vs a typed array: box the typed side element-wise */
     if ((rt == TY_POLY_ARRAY && array_kind(a0)) || (a0 == TY_POLY_ARRAY && array_kind(rt))) {
       int polyn = rt == TY_POLY_ARRAY ? recv : argv[0];
