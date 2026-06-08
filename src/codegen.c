@@ -364,6 +364,46 @@ static void emit_method_call(Compiler *c, int id, Buf *b) {
   buf_puts(b, ")");
 }
 
+/* hash.map / collect { |k, v| ... } as an expression -> an array of the block
+   values, built via a loop over the hash entries in the statement prelude. */
+static int emit_hash_collect_expr(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int block = nt_ref(nt, id, "block");
+  const char *name = nt_str(nt, id, "name");
+  int recv = nt_ref(nt, id, "receiver");
+  if (strcmp(name, "map") && strcmp(name, "collect")) return 0;  /* map only for now */
+  TyKind rt = comp_ntype(c, recv);
+  const char *hn = ty_hash_cname(rt);
+  if (!hn) return 0;
+  TyKind restype = comp_ntype(c, id);
+  int res_poly = (restype == TY_POLY_ARRAY);
+  const char *rk = res_poly ? "Poly" : array_kind(restype);
+  if (!rk) return 0;
+  const char *p0 = block_param_name(c, block, 0); if (p0) p0 = rename_local(p0);
+  const char *p1 = block_param_name(c, block, 1); if (p1) p1 = rename_local(p1);
+  int body = nt_ref(nt, block, "body");
+  int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+  if (bn < 1) return 0;
+  int trecv = ++g_tmp, tres = ++g_tmp, ti = ++g_tmp;
+  emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre); buf_printf(g_pre, " _t%d = ", trecv); emit_expr(c, recv, g_pre); buf_puts(g_pre, ";\n");
+  emit_indent(g_pre, g_indent); buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", rk, tres, rk);
+  emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tres);
+  emit_indent(g_pre, g_indent); buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, trecv, ti);
+  if (p0) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = _t%d->order[_t%d];\n", p0, trecv, ti); }
+  if (p1) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = sp_%sHash_get(_t%d, _t%d->order[_t%d]);\n", p1, hn, trecv, trecv, ti); }
+  for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
+  int save = g_indent; g_indent++;
+  Buf vb; memset(&vb, 0, sizeof vb); emit_expr(c, bb[bn - 1], &vb); g_indent = save;
+  emit_indent(g_pre, g_indent + 1);
+  buf_printf(g_pre, "sp_%sArray_push(_t%d, ", rk, tres);
+  if (res_poly && comp_ntype(c, bb[bn - 1]) != TY_POLY) { Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, comp_ntype(c, bb[bn - 1]), vb.p ? vb.p : "", &bx); buf_puts(g_pre, bx.p ? bx.p : ""); free(bx.p); }
+  else buf_puts(g_pre, vb.p ? vb.p : "");
+  buf_puts(g_pre, ");\n"); free(vb.p);
+  emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+  buf_printf(b, "_t%d", tres);
+  return 1;
+}
+
 /* map/select/reject/filter as an expression: build a result array via a
    loop emitted into the statement prelude; the expression value is the
    temp array. Returns 1 if handled. */
@@ -375,6 +415,7 @@ static int emit_collect_expr(Compiler *c, int id, Buf *b) {
   int recv = nt_ref(nt, id, "receiver");
   if (!name || recv < 0) return 0;
   TyKind rt = comp_ntype(c, recv);
+  if (ty_is_hash(rt)) return emit_hash_collect_expr(c, id, b);
   int range_recv = (rt == TY_RANGE);
   if (!ty_is_array(rt) && !range_recv) return 0;
   const char *k = range_recv ? "Int" : (rt == TY_POLY_ARRAY ? "Poly" : array_kind(rt));

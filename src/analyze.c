@@ -539,6 +539,15 @@ static TyKind infer_call(Compiler *c, int id) {
         !strcmp(name, "count")) return TY_INT;
     if (!strcmp(name, "keys"))   return ty_array_of(ty_hash_key(rt));
     if (!strcmp(name, "values")) return ty_array_of(ty_hash_val(rt));
+    {
+      int block = nt_ref(nt, id, "block");
+      if (block >= 0 && (!strcmp(name, "map") || !strcmp(name, "collect"))) {
+        int body = nt_ref(nt, block, "body");
+        int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+        return ty_array_of(bn > 0 ? infer_type(c, bb[bn - 1]) : TY_UNKNOWN);
+      }
+      if (block >= 0 && (!strcmp(name, "select") || !strcmp(name, "filter") || !strcmp(name, "reject"))) return rt;
+    }
     if (!strcmp(name, "merge") || !strcmp(name, "dup") || !strcmp(name, "clone")) return rt;
     if (!strcmp(name, "has_key?") || !strcmp(name, "key?") ||
         !strcmp(name, "include?") || !strcmp(name, "member?") ||
@@ -1736,7 +1745,13 @@ static int infer_block_params(Compiler *c) {
     }
 
     /* hash.each / each_pair { |k, v| } binds two params */
-    if ((!strcmp(name, "each") || !strcmp(name, "each_pair")) && ty_is_hash(rt)) {
+    if ((!strcmp(name, "each") || !strcmp(name, "each_pair") || !strcmp(name, "map") ||
+         !strcmp(name, "collect") || !strcmp(name, "flat_map") || !strcmp(name, "select") ||
+         !strcmp(name, "filter") || !strcmp(name, "reject") || !strcmp(name, "find") ||
+         !strcmp(name, "detect") || !strcmp(name, "sort_by") || !strcmp(name, "min_by") ||
+         !strcmp(name, "max_by") || !strcmp(name, "count") || !strcmp(name, "sum") ||
+         !strcmp(name, "any?") || !strcmp(name, "all?") || !strcmp(name, "none?") ||
+         !strcmp(name, "each_with_index") || !strcmp(name, "each_with_object")) && ty_is_hash(rt)) {
       Scope *hs = comp_scope_of(c, block);
       LocalVar *kp = scope_local_intern(hs, p0); kp->is_block_param = 1;
       TyKind km = ty_unify(kp->type, ty_hash_key(rt));
