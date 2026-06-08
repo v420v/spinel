@@ -1051,6 +1051,43 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     }
   }
 
+  /* respond_to?(:m): compile-time approximation. A universal method set is
+     always true; otherwise consult the receiver's class / class-method chain.
+     Unknown primitive methods answer conservatively false. */
+  if (!strcmp(name, "respond_to?") && recv >= 0 && argc >= 1) {
+    const char *aty = nt_type(nt, argv[0]);
+    const char *qm = NULL;
+    if (aty && !strcmp(aty, "SymbolNode")) qm = nt_str(nt, argv[0], "value");
+    else if (aty && !strcmp(aty, "StringNode")) qm = nt_str(nt, argv[0], "unescaped");
+    if (qm) {
+      static const char *const uni[] = {
+        "to_s", "inspect", "class", "nil?", "dup", "clone", "freeze",
+        "frozen?", "hash", "==", "!=", "equal?", "eql?", "object_id",
+        "respond_to?", "is_a?", "kind_of?", "instance_of?", "itself",
+        "tap", "then", "send", "===", NULL };
+      int yes = 0, resolved = 0;
+      for (int u = 0; uni[u]; u++) if (!strcmp(qm, uni[u])) { yes = resolved = 1; break; }
+      if (!resolved) {
+        const char *rty = nt_type(nt, recv);
+        if (rty && !strcmp(rty, "ConstantReadNode")) {
+          int ci = comp_class_index(c, nt_str(nt, recv, "name"));
+          if (ci >= 0) { resolved = 1; yes = comp_cmethod_in_chain(c, ci, qm, NULL) >= 0; }
+        }
+        else if (ty_is_object(rt)) {
+          int cid = ty_object_class(rt);
+          resolved = 1;
+          yes = comp_method_in_chain(c, cid, qm, NULL) >= 0 ||
+                comp_reader_in_chain(c, cid, qm, NULL) ||
+                comp_writer_in_chain(c, cid, qm, NULL);
+        }
+        /* a primitive/poly/unknown receiver with a non-universal method: we
+           lack a per-type method table, so leave it to the fall-through
+           rather than answer a possibly-wrong false. */
+      }
+      if (resolved) { buf_printf(b, "%d", yes); return; }
+    }
+  }
+
   if ((!strcmp(name, "-@") || !strcmp(name, "+@")) && recv >= 0 && argc == 0) {
     buf_puts(b, name[0] == '-' ? "(-" : "(+");
     emit_expr(c, recv, b); buf_puts(b, ")");

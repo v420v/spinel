@@ -620,6 +620,7 @@ static TyKind infer_call(Compiler *c, int id) {
   if ((!strcmp(name, "-@") || !strcmp(name, "+@")) && recv >= 0 && argc == 0)
     return ty_is_numeric(rt) ? rt : TY_UNKNOWN;
   if (!strcmp(name, "!")) return TY_BOOL;
+  if (!strcmp(name, "respond_to?") && recv >= 0) return TY_BOOL;
 
   if (recv >= 0 && argc == 1 && is_arith_op(name)) {
     if (rt == TY_STRING) {
