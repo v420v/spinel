@@ -293,7 +293,7 @@ static int emit_collect_expr(Compiler *c, int id, Buf *b) {
   TyKind rt = comp_ntype(c, recv);
   int range_recv = (rt == TY_RANGE);
   if (!ty_is_array(rt) && !range_recv) return 0;
-  const char *k = range_recv ? "Int" : array_kind(rt);
+  const char *k = range_recv ? "Int" : (rt == TY_POLY_ARRAY ? "Poly" : array_kind(rt));
   if (!k) return 0;
 
   int is_map = !strcmp(name, "map") || !strcmp(name, "collect");
@@ -302,7 +302,8 @@ static int emit_collect_expr(Compiler *c, int id, Buf *b) {
   if (!is_map && !is_sel && !is_rej) return 0;
 
   TyKind restype = comp_ntype(c, id);
-  const char *rk = array_kind(restype);
+  int res_poly = (restype == TY_POLY_ARRAY);
+  const char *rk = res_poly ? "Poly" : array_kind(restype);
   if (!rk) return 0;
 
   const char *p0 = block_param_name(c, block, 0); if (p0) p0 = rename_local(p0);
@@ -354,7 +355,13 @@ static int emit_collect_expr(Compiler *c, int id, Buf *b) {
   if (is_map) {
     emit_indent(g_pre, bodyIndent);
     buf_printf(g_pre, "sp_%sArray_push(_t%d, ", rk, tres);
-    buf_puts(g_pre, vb.p ? vb.p : ""); buf_puts(g_pre, ");\n");
+    /* a poly result array stores boxed values */
+    if (res_poly && comp_ntype(c, bb[bn - 1]) != TY_POLY) {
+      Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, comp_ntype(c, bb[bn - 1]), vb.p ? vb.p : "", &bx);
+      buf_puts(g_pre, bx.p ? bx.p : ""); free(bx.p);
+    }
+    else buf_puts(g_pre, vb.p ? vb.p : "");
+    buf_puts(g_pre, ");\n");
   }
   else {
     emit_indent(g_pre, bodyIndent);
