@@ -1118,6 +1118,46 @@ static int infer_return_types(Compiler *c) {
   return changed;
 }
 
+/* Mark each method scope reachable iff its name is referenced anywhere as
+   a call name, alias target, or symbol literal. Scope 0 (top level) and
+   every `initialize` are always reachable. */
+static void compute_reachable(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  /* Build the set of referenced names. */
+  char **names = NULL; int n = 0, cap = 0;
+  #define ADD_NAME(NM) do { const char *_nm = (NM); \
+    if (_nm) { int _f = 0; for (int _i = 0; _i < n; _i++) if (!strcmp(names[_i], _nm)) { _f = 1; break; } \
+    if (!_f) { if (n >= cap) { cap = cap ? cap*2 : 32; names = realloc(names, sizeof(char*)*(size_t)cap); } names[n++] = strdup(_nm); } } } while (0)
+
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty) continue;
+    if (!strcmp(ty, "CallNode")) ADD_NAME(nt_str(nt, id, "name"));
+    else if (!strcmp(ty, "SymbolNode")) ADD_NAME(nt_str(nt, id, "value"));
+  }
+  for (int ci = 0; ci < c->nclasses; ci++) {
+    ClassInfo *cls = &c->classes[ci];
+    for (int i = 0; i < cls->naliases; i++) { ADD_NAME(cls->alias_new[i]); ADD_NAME(cls->alias_old[i]); }
+  }
+
+  /* Names that may be invoked implicitly (no explicit CallNode): keep live. */
+  static const char *const implicit[] = {
+    "to_s", "inspect", "==", "<=>", "eql?", "hash", "each", "coerce",
+    "to_str", "to_ary", "to_a", "to_i", "to_int", "to_h", "to_proc", "call", NULL };
+
+  for (int s = 0; s < c->nscopes; s++) {
+    Scope *sc = &c->scopes[s];
+    if (s == 0 || !sc->name || !strcmp(sc->name, "initialize")) { sc->reachable = 1; continue; }
+    sc->reachable = 0;
+    for (int i = 0; implicit[i]; i++) if (!strcmp(implicit[i], sc->name)) { sc->reachable = 1; break; }
+    if (sc->reachable) continue;
+    for (int i = 0; i < n; i++) if (!strcmp(names[i], sc->name)) { sc->reachable = 1; break; }
+  }
+  for (int i = 0; i < n; i++) free(names[i]);
+  free(names);
+  #undef ADD_NAME
+}
+
 void analyze_program(Compiler *c) {
   /* scope 0 = top level */
   Scope *top = comp_scope_new(c, NULL, -1);
@@ -1178,6 +1218,13 @@ void analyze_program(Compiler *c) {
     ch |= infer_return_types(c);
     if (!ch) break;
   }
+
+  /* Reachability: an instance/free method is live only if its name is
+     referenced somewhere -- as a call name, an alias target, or a symbol
+     literal (covering send/method/define_method). Names never mentioned
+     are dead code; skipping them avoids type-checking uninvoked methods
+     (e.g. a never-called method with an uninferrable param). */
+  compute_reachable(c);
 
   /* finalize: gc-root needs + full node type cache */
   for (int s = 0; s < c->nscopes; s++)

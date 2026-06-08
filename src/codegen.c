@@ -2633,14 +2633,14 @@ char *codegen_program(const NodeTable *nt) {
   if (c->nclasses > 0) buf_puts(&b, "\n");
 
   /* method prototypes (scope 0 is top-level) */
-  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields) continue; emit_method_signature(c, &c->scopes[s], &b); buf_puts(&b, ";\n"); }
+  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable) continue; emit_method_signature(c, &c->scopes[s], &b); buf_puts(&b, ";\n"); }
   /* constructor prototypes + definitions (after method protos: new calls initialize) */
   for (int i = 0; i < c->nclasses; i++) {
     buf_printf(&b, "static sp_%s *sp_%s_new();\n", c->classes[i].name, c->classes[i].name);
   }
   if (c->nscopes > 1 || c->nclasses > 0) buf_puts(&b, "\n");
   for (int i = 0; i < c->nclasses; i++) emit_class_new(c, &c->classes[i], &b);
-  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields) continue; emit_method(c, &c->scopes[s], &b); }
+  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable) continue; emit_method(c, &c->scopes[s], &b); }
 
   /* global variables and top-level constants (file-scope statics) */
   for (int i = 0; i < c->ngvars; i++) {
