@@ -134,7 +134,27 @@ static TyKind infer_call(Compiler *c, int id) {
     ClassInfo *sc = &c->classes[ty_object_class(rt)];
     if (!strcmp(name, "to_a") || !strcmp(name, "values") ||
         !strcmp(name, "deconstruct") || !strcmp(name, "members")) return TY_POLY_ARRAY;
-    if (!strcmp(name, "to_h")) return TY_SYM_POLY_HASH;
+    if (!strcmp(name, "to_h")) {
+      int block = nt_ref(nt, id, "block");
+      if (block >= 0) {
+        /* to_h { |k,v| [nk, nv] }: hash type from the block's pair */
+        int bbody = nt_ref(nt, block, "body");
+        int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
+        int last = bn > 0 ? bb[bn - 1] : -1;
+        if (last >= 0 && nt_type(nt, last) && !strcmp(nt_type(nt, last), "ArrayNode")) {
+          int en = 0; const int *els = nt_arr(nt, last, "elements", &en);
+          if (en == 2) {
+            TyKind kt = infer_type(c, els[0]), vt = infer_type(c, els[1]);
+            if (kt == TY_SYMBOL) return TY_SYM_POLY_HASH;
+            if (kt == TY_STRING && vt == TY_STRING) return TY_STR_STR_HASH;
+            if (kt == TY_STRING) return TY_STR_POLY_HASH;
+            TyKind h = ty_hash_of(kt, vt);
+            return h != TY_UNKNOWN ? h : TY_STR_POLY_HASH;
+          }
+        }
+      }
+      return TY_SYM_POLY_HASH;
+    }
     if (!strcmp(name, "dig") && argc >= 1) {
       int mi = struct_member_idx(c, sc, argv[0]);
       if (mi >= 0) {
@@ -1305,6 +1325,19 @@ static int infer_block_params(Compiler *c) {
     const char *name = nt_str(nt, id, "name");
     int recv = nt_ref(nt, id, "receiver");
     if (!name) continue;
+
+    /* struct.to_h { |k, v| ... }: k is a member symbol, v its (poly) value */
+    if (recv >= 0 && !strcmp(name, "to_h")) {
+      TyKind rt0 = infer_type(c, recv);
+      if (ty_is_object(rt0) && c->classes[ty_object_class(rt0)].is_struct) {
+        const char *kp = block_param_name(c, block, 0);
+        const char *vp = block_param_name(c, block, 1);
+        Scope *bs = comp_scope_of(c, block);
+        if (kp) { LocalVar *l = scope_local_intern(bs, kp); l->is_block_param = 1; if (l->type != TY_SYMBOL) { l->type = TY_SYMBOL; changed = 1; } }
+        if (vp) { LocalVar *l = scope_local_intern(bs, vp); l->is_block_param = 1; if (l->type != TY_POLY) { l->type = TY_POLY; changed = 1; } }
+        continue;
+      }
+    }
 
     /* call to a user yielding method: block params take the yield arg types */
     {

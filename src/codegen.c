@@ -915,18 +915,51 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       return;
     }
     if (!strcmp(name, "to_h") && argc == 0) {
+      int block = nt_ref(nt, id, "block");
       int t = ++g_tmp, rh = ++g_tmp;
       Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
-      buf_printf(b, "({ sp_%s *_t%d = %s; sp_SymPolyHash *_t%d = sp_SymPolyHash_new(); SP_GC_ROOT(_t%d);",
-                 sc->name, t, rb.p ? rb.p : "", rh, rh);
-      for (int i = 0; i < sc->nivars; i++) {
-        buf_printf(b, " sp_SymPolyHash_set(_t%d, (sp_sym)%d, ", rh, comp_sym_intern(c, sc->ivars[i] + 1));
-        Buf fb; memset(&fb, 0, sizeof fb); buf_printf(&fb, "_t%d->iv_%s", t, sc->ivars[i] + 1);
-        emit_boxed_text(c, sc->ivar_types[i], fb.p, b); free(fb.p);
-        buf_puts(b, ");");
+      TyKind res = comp_ntype(c, id);
+      const char *hn = ty_hash_cname(res);
+      if (!hn) hn = "SymPoly";
+      buf_printf(b, "({ sp_%s *_t%d = %s; sp_%sHash *_t%d = sp_%sHash_new(); SP_GC_ROOT(_t%d);",
+                 sc->name, t, rb.p ? rb.p : "", hn, rh, hn, rh);
+      free(rb.p);
+      if (block >= 0) {
+        /* to_h { |k, v| [nk, nv] }: per member, bind k/v then set hash[nk] = nv */
+        const char *kp = block_param_name(c, block, 0); if (kp) kp = rename_local(kp);
+        const char *vp = block_param_name(c, block, 1); if (vp) vp = rename_local(vp);
+        int bbody = nt_ref(nt, block, "body");
+        int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
+        int last = bn > 0 ? bb[bn - 1] : -1;
+        int ke = -1, ve = -1;
+        if (last >= 0 && nt_type(nt, last) && !strcmp(nt_type(nt, last), "ArrayNode")) {
+          int en = 0; const int *els = nt_arr(nt, last, "elements", &en);
+          if (en == 2) { ke = els[0]; ve = els[1]; }
+        }
+        TyKind kt = ty_hash_key(res), vt = ty_hash_val(res);
+        for (int i = 0; i < sc->nivars; i++) {
+          if (kp) buf_printf(b, " lv_%s = (sp_sym)%d;", kp, comp_sym_intern(c, sc->ivars[i] + 1));
+          if (vp) {
+            char fb[300]; snprintf(fb, sizeof fb, "_t%d->iv_%s", t, sc->ivars[i] + 1);
+            buf_printf(b, " lv_%s = ", vp); emit_boxed_text(c, sc->ivar_types[i], fb, b); buf_puts(b, ";");
+          }
+          buf_printf(b, " sp_%sHash_set(_t%d, ", hn, rh);
+          if (ke >= 0) emit_expr(c, ke, b); else buf_puts(b, "0");
+          buf_puts(b, ", ");
+          if (ve >= 0) { if (vt == TY_POLY && comp_ntype(c, ve) != TY_POLY) emit_boxed(c, ve, b); else emit_expr(c, ve, b); }
+          else buf_puts(b, "0");
+          buf_puts(b, ");");
+        }
+      }
+      else {
+        for (int i = 0; i < sc->nivars; i++) {
+          buf_printf(b, " sp_SymPolyHash_set(_t%d, (sp_sym)%d, ", rh, comp_sym_intern(c, sc->ivars[i] + 1));
+          char fb[300]; snprintf(fb, sizeof fb, "_t%d->iv_%s", t, sc->ivars[i] + 1);
+          emit_boxed_text(c, sc->ivar_types[i], fb, b);
+          buf_puts(b, ");");
+        }
       }
       buf_printf(b, " _t%d; })", rh);
-      free(rb.p);
       return;
     }
     if ((!strcmp(name, "members")) && argc == 0) {
@@ -3520,7 +3553,16 @@ char *codegen_program(const NodeTable *nt) {
   for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable) continue; emit_method_signature(c, &c->scopes[s], &b); buf_puts(&b, ";\n"); }
   /* constructor prototypes + definitions (after method protos: new calls initialize) */
   for (int i = 0; i < c->nclasses; i++) {
-    buf_printf(&b, "static sp_%s *sp_%s_new();\n", c->classes[i].name, c->classes[i].name);
+    ClassInfo *ci = &c->classes[i];
+    if (ci->is_struct) {
+      /* struct constructor takes typed member params -- the prototype must
+         match the definition (an empty () prototype + a _Bool param differ) */
+      buf_printf(&b, "static sp_%s *sp_%s_new(", ci->name, ci->name);
+      for (int m = 0; m < ci->nivars; m++) { if (m) buf_puts(&b, ", "); emit_ctype(c, ci->ivar_types[m], &b); }
+      if (ci->nivars == 0) buf_puts(&b, "void");
+      buf_puts(&b, ");\n");
+    }
+    else buf_printf(&b, "static sp_%s *sp_%s_new();\n", ci->name, ci->name);
   }
   if (c->nscopes > 1 || c->nclasses > 0) buf_puts(&b, "\n");
   for (int i = 0; i < c->nclasses; i++) emit_class_new(c, &c->classes[i], &b);
