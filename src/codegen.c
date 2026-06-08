@@ -1640,6 +1640,33 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     }
     return;
   }
+  if (!strcmp(ty, "MultiWriteNode")) {
+    int ln = 0;
+    const int *lefts = nt_arr(nt, id, "lefts", &ln);
+    int value = nt_ref(nt, id, "value");
+    const char *vty = nt_type(nt, value);
+    int en = 0;
+    const int *els = (vty && !strcmp(vty, "ArrayNode")) ? nt_arr(nt, value, "elements", &en) : NULL;
+    if (!els || en < ln) unsupported(c, id, "multiple assignment");
+    /* evaluate all RHS values into temps first (so `a, b = b, a` swaps) */
+    int base = g_tmp + 1;
+    for (int i = 0; i < ln; i++) {
+      int t = ++g_tmp;
+      Buf vb; memset(&vb, 0, sizeof vb); emit_expr(c, els[i], &vb);
+      emit_indent(b, indent);
+      emit_ctype(c, comp_ntype(c, els[i]), b);
+      buf_printf(b, " _t%d = ", t);
+      buf_puts(b, vb.p ? vb.p : ""); buf_puts(b, ";\n"); free(vb.p);
+    }
+    for (int i = 0; i < ln; i++) {
+      const char *lty = nt_type(nt, lefts[i]);
+      if (lty && !strcmp(lty, "LocalVariableTargetNode")) {
+        emit_indent(b, indent);
+        buf_printf(b, "lv_%s = _t%d;\n", nt_str(nt, lefts[i], "name"), base + i);
+      }
+    }
+    return;
+  }
   if (!strcmp(ty, "ClassNode") || !strcmp(ty, "ModuleNode")) { return; } /* methods emitted separately */
   if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) {
     emit_indent(b, indent); emit_super(c, id, b); buf_puts(b, ";\n"); return;

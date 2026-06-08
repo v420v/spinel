@@ -698,6 +698,28 @@ static int infer_write_types(Compiler *c) {
     lv->type = ty_unify(lv->type, newt);
   }
 
+  /* Multiple assignment `a, b = e0, e1`: each target gets its element's
+     type (the RHS ArrayNode is a tuple here, not an array value). */
+  for (int id = 0; id < nt->count; id++) {
+    if (strcmp(nt_type(nt, id) ? nt_type(nt, id) : "", "MultiWriteNode")) continue;
+    int ln = 0;
+    const int *lefts = nt_arr(nt, id, "lefts", &ln);
+    int value = nt_ref(nt, id, "value");
+    const char *vty = nt_type(nt, value);
+    if (!vty || strcmp(vty, "ArrayNode")) continue;
+    int en = 0;
+    const int *els = nt_arr(nt, value, "elements", &en);
+    for (int i = 0; i < ln && i < en; i++) {
+      if (strcmp(nt_type(nt, lefts[i]) ? nt_type(nt, lefts[i]) : "", "LocalVariableTargetNode")) continue;
+      const char *lnm = nt_str(nt, lefts[i], "name");
+      TyKind et = infer_type(c, els[i]);
+      if (et == TY_NIL) continue;
+      LocalVar *lv = lnm ? scope_local(comp_scope_of(c, id), lnm) : NULL;
+      if (!lv || lv->is_param || lv->is_block_param) continue;
+      lv->type = ty_unify(lv->type, et);
+    }
+  }
+
   /* Fold container usage into the local type: `a << x` / `a.push(x)` /
      `a[i] = x` on a local `a` promotes it to an array of x's type (this is
      how an empty `[]` gets its element type). Part of the same recompute
