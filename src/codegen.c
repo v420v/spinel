@@ -1932,6 +1932,11 @@ static void emit_call(Compiler *c, int id, Buf *b) {
 
   /* array value methods */
   if (recv >= 0 && ty_is_array(rt)) {
+    if (!strcmp(name, "pack") && argc == 1 && (rt == TY_INT_ARRAY || rt == TY_POLY_ARRAY)) {
+      buf_printf(b, "sp_%sArray_pack(", rt == TY_POLY_ARRAY ? "Poly" : "Int");
+      emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+      return;
+    }
     /* values_at(i, j, ...) -> fresh same-kind array of the picked elements
        (works for typed and poly arrays alike) */
     if (!strcmp(name, "values_at") && argc >= 1) {
