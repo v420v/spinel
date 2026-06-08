@@ -1333,6 +1333,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
                !strcmp(name, "ceil") || !strcmp(name, "round")) buf_printf(b, "(%s)", r);
       else if (!strcmp(name, "abs"))    buf_printf(b, "((%s) < 0 ? -(%s) : (%s))", r, r, r);
       else if (!strcmp(name, "chr"))    buf_printf(b, "sp_int_chr(%s)", r);
+      else if (!strcmp(name, "[]") && argc == 1) { buf_printf(b, "(((%s) >> (", r); emit_expr(c, argv[0], b); buf_puts(b, ")) & 1)"); }
       else if (!strcmp(name, "even?"))  buf_printf(b, "((%s) %% 2 == 0)", r);
       else if (!strcmp(name, "odd?"))   buf_printf(b, "((%s) %% 2 != 0)", r);
       else if (!strcmp(name, "zero?"))  buf_printf(b, "((%s) == 0)", r);
@@ -1359,6 +1360,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
            !strcmp(name, "round") || !strcmp(name, "truncate"))) {
         if (ndig > 0)
           buf_printf(b, "({ double _f = pow(10, %d); %s((%s) * _f) / _f; })", ndig, cfn, r);
+        else if (ndig < 0)  /* round to a power of ten left of the decimal -> Integer */
+          buf_printf(b, "({ double _f = pow(10, %d); (mrb_int)(%s((%s) / _f) * _f); })", -ndig, cfn, r);
         else
           buf_printf(b, "((mrb_int)%s(%s))", cfn, r);
       }
