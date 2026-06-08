@@ -585,7 +585,7 @@ static TyKind infer_call(Compiler *c, int id) {
         !strcmp(name, "oct") || !strcmp(name, "ord") || !strcmp(name, "casecmp")) return TY_INT;
     if (!strcmp(name, "casecmp?")) return TY_BOOL;
     if (!strcmp(name, "to_f"))  return TY_FLOAT;
-    if (!strcmp(name, "split") || !strcmp(name, "lines")) return TY_STR_ARRAY;
+    if (!strcmp(name, "split") || !strcmp(name, "lines") || !strcmp(name, "scan")) return TY_STR_ARRAY;
     if (!strcmp(name, "each_char") || !strcmp(name, "each_line") || !strcmp(name, "each_byte")) return TY_STRING;
     if (!strcmp(name, "bytes")) return TY_INT_ARRAY;
     if (!strcmp(name, "gsub") || !strcmp(name, "sub") || !strcmp(name, "tr") ||

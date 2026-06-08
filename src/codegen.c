@@ -97,6 +97,17 @@ static int re_engine_flags(int pf) {
   if (pf & 16) f |= 6;
   return f;
 }
+/* True if a regex source contains a capturing group: an unescaped '(' that
+   isn't the start of a non-capturing/extension group '(?...'. scan returns
+   nested arrays for capturing patterns, which the str_array path can't model. */
+static int re_has_captures(const char *src) {
+  for (const char *p = src; *p; p++) {
+    if (*p == '\\') { if (p[1]) p++; continue; }
+    if (*p == '(' && p[1] != '?') return 1;
+  }
+  return 0;
+}
+
 /* Find or add a RegularExpressionNode literal; returns its table index, or
    -1 if the node isn't a static regex literal. */
 static int re_lit_index(Compiler *c, int nid) {
@@ -2102,7 +2113,19 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     int handled = 1;
 
     if (rt == TY_STRING) {
-      if      (!strcmp(name, "to_sym") || !strcmp(name, "intern")) buf_printf(b, "sp_sym_intern(%s)", r);
+      /* string methods taking a regex-literal argument route to the engine */
+      if ((!strcmp(name, "gsub") || !strcmp(name, "sub")) && argc == 2 && re_lit_index(c, argv[0]) >= 0) {
+        buf_printf(b, "sp_re_%s(sp_re_pat_%d, %s, ", name, re_lit_index(c, argv[0]), r);
+        emit_expr(c, argv[1], b); buf_puts(b, ")");
+      }
+      else if (!strcmp(name, "split") && argc == 1 && re_lit_index(c, argv[0]) >= 0) {
+        buf_printf(b, "sp_re_split(sp_re_pat_%d, %s)", re_lit_index(c, argv[0]), r);
+      }
+      else if (!strcmp(name, "scan") && argc == 1 && re_lit_index(c, argv[0]) >= 0 &&
+               !re_has_captures(nt_str(c->nt, argv[0], "unescaped"))) {
+        buf_printf(b, "sp_re_scan(sp_re_pat_%d, %s)", re_lit_index(c, argv[0]), r);
+      }
+      else if (!strcmp(name, "to_sym") || !strcmp(name, "intern")) buf_printf(b, "sp_sym_intern(%s)", r);
       else if (!strcmp(name, "length") || !strcmp(name, "size")) buf_printf(b, "sp_str_length(%s)", r);
       else if (!strcmp(name, "upcase"))     buf_printf(b, "sp_str_upcase(%s)", r);
       else if (!strcmp(name, "downcase"))   buf_printf(b, "sp_str_downcase(%s)", r);
