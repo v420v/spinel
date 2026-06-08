@@ -382,10 +382,13 @@ static void emit_dispatch(Compiler *c, int cid, const char *name,
     free(ab.p);
   }
 
+  /* The aliased name may differ from the defining method's real name. */
+  const char *mname = m ? m->name : name;
+
   int virtual = dispatch_impl_count(c, cid, name) > 1 && is_scalar_ret(ret);
 
   if (!virtual) {
-    buf_printf(b, "sp_%s_%s((sp_%s *)%s", c->classes[defcls].name, name, c->classes[defcls].name, selfptr);
+    buf_printf(b, "sp_%s_%s((sp_%s *)%s", c->classes[defcls].name, mname, c->classes[defcls].name, selfptr);
     for (int k = 0; k < np; k++) buf_printf(b, ", _t%d", atmp[k]);
     buf_puts(b, ")");
     free(atmp);
@@ -400,14 +403,15 @@ static void emit_dispatch(Compiler *c, int cid, const char *name,
   for (int k = 0; k < c->nclasses; k++) {
     if (!is_descendant(c, k, cid)) continue;
     int kd = -1;
-    if (comp_method_in_chain(c, k, name, &kd) < 0) continue;
+    int kmi = comp_method_in_chain(c, k, name, &kd);
+    if (kmi < 0) continue;
     buf_printf(b, " case %d: _t%d = sp_%s_%s((sp_%s *)%s", k, rtmp,
-               c->classes[kd].name, name, c->classes[kd].name, selfptr);
+               c->classes[kd].name, c->scopes[kmi].name, c->classes[kd].name, selfptr);
     for (int a = 0; a < np; a++) buf_printf(b, ", _t%d", atmp[a]);
     buf_puts(b, "); break;");
   }
   buf_printf(b, " default: _t%d = sp_%s_%s((sp_%s *)%s", rtmp,
-             c->classes[defcls].name, name, c->classes[defcls].name, selfptr);
+             c->classes[defcls].name, mname, c->classes[defcls].name, selfptr);
   for (int a = 0; a < np; a++) buf_printf(b, ", _t%d", atmp[a]);
   buf_printf(b, "); break; } _t%d; })", rtmp);
   free(atmp);

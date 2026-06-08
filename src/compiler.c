@@ -140,6 +140,7 @@ int comp_method_in_class(Compiler *c, int class_id, const char *name) {
 }
 
 int comp_method_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
+  name = comp_resolve_alias(c, class_id, name);
   for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent) {
     int mi = comp_method_in_class(c, cid, name);
     if (mi >= 0) { if (def_class) *def_class = cid; return mi; }
@@ -170,12 +171,44 @@ void comp_add_writer(ClassInfo *ci, const char *name) {
 int comp_is_reader(ClassInfo *ci, const char *name) { return name_in(ci->readers, ci->nreaders, name); }
 int comp_is_writer(ClassInfo *ci, const char *name) { return name_in(ci->writers, ci->nwriters, name); }
 
+void comp_add_alias(ClassInfo *ci, const char *new_name, const char *old_name) {
+  if (!new_name || !old_name) return;
+  for (int i = 0; i < ci->naliases; i++)
+    if (strcmp(ci->alias_new[i], new_name) == 0) return;
+  if (ci->naliases >= ci->caliases) {
+    ci->caliases = ci->caliases ? ci->caliases * 2 : 4;
+    ci->alias_new = realloc(ci->alias_new, sizeof(char *) * (size_t)ci->caliases);
+    ci->alias_old = realloc(ci->alias_old, sizeof(char *) * (size_t)ci->caliases);
+  }
+  ci->alias_new[ci->naliases] = strdup(new_name);
+  ci->alias_old[ci->naliases] = strdup(old_name);
+  ci->naliases++;
+}
+
+const char *comp_resolve_alias(Compiler *c, int class_id, const char *name) {
+  if (!name) return name;
+  /* Follow alias links (chain-aware), guarding against cycles. */
+  for (int hops = 0; hops < 32; hops++) {
+    const char *next = NULL;
+    for (int cid = class_id; cid >= 0 && !next; cid = c->classes[cid].parent) {
+      ClassInfo *ci = &c->classes[cid];
+      for (int i = 0; i < ci->naliases; i++)
+        if (strcmp(ci->alias_new[i], name) == 0) { next = ci->alias_old[i]; break; }
+    }
+    if (!next) return name;
+    name = next;
+  }
+  return name;
+}
+
 int comp_reader_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
+  name = comp_resolve_alias(c, class_id, name);
   for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent)
     if (comp_is_reader(&c->classes[cid], name)) { if (def_class) *def_class = cid; return 1; }
   return 0;
 }
 int comp_writer_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
+  name = comp_resolve_alias(c, class_id, name);
   for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent)
     if (comp_is_writer(&c->classes[cid], name)) { if (def_class) *def_class = cid; return 1; }
   return 0;

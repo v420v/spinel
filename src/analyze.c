@@ -549,6 +549,40 @@ static void register_attrs(Compiler *c) {
   }
 }
 
+/* Collect `alias new old` (AliasMethodNode) and `alias_method :new, :old`
+   (CallNode) statements in class bodies into the class alias table. */
+static void register_aliases(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  for (int ci = 0; ci < c->nclasses; ci++) {
+    ClassInfo *cls = &c->classes[ci];
+    int body = nt_ref(nt, cls->def_node, "body");
+    int n = 0;
+    const int *stmts = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
+    for (int k = 0; k < n; k++) {
+      int s = stmts[k];
+      const char *sty = nt_type(nt, s);
+      if (!sty) continue;
+      if (!strcmp(sty, "AliasMethodNode")) {
+        int nn = nt_ref(nt, s, "new_name");
+        int on = nt_ref(nt, s, "old_name");
+        const char *nw = nn >= 0 ? nt_str(nt, nn, "value") : NULL;
+        const char *od = on >= 0 ? nt_str(nt, on, "value") : NULL;
+        comp_add_alias(cls, nw, od);
+      }
+      else if (!strcmp(sty, "CallNode")) {
+        const char *nm = nt_str(nt, s, "name");
+        if (!nm || strcmp(nm, "alias_method")) continue;
+        int args = nt_ref(nt, s, "arguments");
+        int an = 0;
+        const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+        if (an >= 2 && nt_type(nt, argv[0]) && !strcmp(nt_type(nt, argv[0]), "SymbolNode") &&
+            nt_type(nt, argv[1]) && !strcmp(nt_type(nt, argv[1]), "SymbolNode"))
+          comp_add_alias(cls, nt_str(nt, argv[0], "value"), nt_str(nt, argv[1], "value"));
+      }
+    }
+  }
+}
+
 static int is_c_ident(const char *s) {
   if (!s || !*s) return 0;
   for (const char *p = s; *p; p++)
@@ -931,7 +965,7 @@ static int infer_param_types(Compiler *c) {
     /* obj.method -> instance method params */
     TyKind rt = infer_type(c, recv);
     if (ty_is_object(rt))
-      changed |= bind_call_params(c, id, comp_method_in_class(c, ty_object_class(rt), name));
+      changed |= bind_call_params(c, id, comp_method_in_chain(c, ty_object_class(rt), name, NULL));
   }
   return changed;
 }
@@ -1092,6 +1126,7 @@ void analyze_program(Compiler *c) {
   walk_scope(c, c->nt->root_id, 0, -1);
   register_locals(c);
   register_attrs(c);
+  register_aliases(c);
   register_globals_consts(c);
 
   /* rescue variables (`rescue => e`) are typed as exception objects */

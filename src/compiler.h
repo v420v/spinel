@@ -49,6 +49,9 @@ typedef struct {
   int nreaders, creaders;
   char **writers;      /* attr writer base names (no '@', no '=') */
   int nwriters, cwriters;
+  char **alias_new;    /* `alias new old`: alias_new[i] redirects to alias_old[i] */
+  char **alias_old;
+  int naliases, caliases;
 } ClassInfo;
 
 typedef struct {
@@ -109,6 +112,10 @@ void       comp_add_reader(ClassInfo *ci, const char *name);
 void       comp_add_writer(ClassInfo *ci, const char *name);
 int        comp_is_reader(ClassInfo *ci, const char *name);
 int        comp_is_writer(ClassInfo *ci, const char *name);
+void       comp_add_alias(ClassInfo *ci, const char *new_name, const char *old_name);
+/* Resolve `name` through the class's (chain-aware) alias table to the
+   underlying method/attr name. Returns `name` unchanged if not aliased. */
+const char *comp_resolve_alias(Compiler *c, int class_id, const char *name);
 
 /* Node type cache. */
 static inline TyKind comp_ntype(const Compiler *c, int id) {
