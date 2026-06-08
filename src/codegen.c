@@ -412,6 +412,14 @@ static void emit_call(Compiler *c, int id, Buf *b) {
      when a block is present) */
   if (recv < 0 && !strcmp(name, "block_given?")) { buf_puts(b, g_block_id >= 0 ? "1" : "0"); return; }
 
+  /* Kernel conversions */
+  if (recv < 0 && comp_method_index(c, name) < 0) {
+    int args = nt_ref(nt, id, "arguments");
+    int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
+    if (!strcmp(name, "Integer") && ac == 1) { buf_puts(b, "sp_str_to_i_strict("); emit_expr(c, av[0], b); buf_puts(b, ")"); return; }
+    if (!strcmp(name, "Float") && ac == 1) { buf_puts(b, "atof("); emit_expr(c, av[0], b); buf_puts(b, ")"); return; }
+  }
+
   if (recv < 0 && comp_method_index(c, name) >= 0) { emit_method_call(c, id, b); return; }
 
   /* identity methods -> the receiver itself */

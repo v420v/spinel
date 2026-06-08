@@ -107,6 +107,9 @@ static TyKind infer_call(Compiler *c, int id) {
   if (recv < 0) {
     int mi = comp_method_index(c, name);
     if (mi >= 0) return c->scopes[mi].ret;
+    /* Kernel conversions */
+    if (!strcmp(name, "Integer") && argc == 1) return TY_INT;
+    if (!strcmp(name, "Float") && argc == 1) return TY_FLOAT;
   }
 
   /* array receiver methods */
