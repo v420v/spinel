@@ -2812,6 +2812,9 @@ static void emit_puts_one(Compiler *c, int arg, Buf *b, int indent) {
            ({ int _n = 0; nt_arr(c->nt, arg, "elements", &_n); _n == 0; })) {
     buf_puts(b, "(void)0;  /* puts [] prints nothing */\n");
   }
+  else if (t == TY_NIL) {
+    buf_puts(b, "(void)("); emit_expr(c, arg, b); buf_puts(b, "); putchar('\\n');  /* puts nil */\n");
+  }
   else {
     unsupported(c, arg, "puts argument");
   }
