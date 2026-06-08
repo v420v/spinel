@@ -838,7 +838,7 @@ static int infer_write_types(Compiler *c) {
       newt = infer_type(c, nt_ref(nt, id, "value"));
       /* a `x = nil` write doesn't pin the type: nil is the absent/default
          value, so the variable takes its non-nil assignments' type */
-      if (newt == TY_NIL) newt = TY_UNKNOWN;
+      if (newt == TY_NIL) newt = TY_POLY;
     }
     else if (!strcmp(ty, "LocalVariableOperatorWriteNode")) {
       nm = nt_str(nt, id, "name");
