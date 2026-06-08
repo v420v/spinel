@@ -115,20 +115,40 @@ static TyKind proc_node_ret(Compiler *c, int create) {
   return bn > 0 ? infer_type(c, bb[bn - 1]) : TY_NIL;
 }
 
-/* The return type of a proc-typed expression's `.call`. Resolves the proc's
-   create site (literal directly, or via a local's recorded proc_ret). */
-static TyKind proc_call_ret(Compiler *c, int recv) {
+/* The body return type (`#call`'s result) of a proc-valued expression, or
+   TY_UNKNOWN if not statically known. Resolves a literal directly, a local's
+   recorded proc_ret, and a method call's recorded ret_proc_ret. */
+static TyKind proc_ret_of(Compiler *c, int node) {
   const NodeTable *nt = c->nt;
-  const char *ty = nt_type(nt, recv);
-  if (!ty) return TY_POLY;
+  const char *ty = nt_type(nt, node);
+  if (!ty) return TY_UNKNOWN;
+  if (!strcmp(ty, "LambdaNode") || is_proc_literal(c, node)) return proc_node_ret(c, node);
   if (!strcmp(ty, "LocalVariableReadNode")) {
-    Scope *s = comp_scope_of(c, recv);
-    LocalVar *lv = scope_local(s, nt_str(nt, recv, "name"));
-    if (lv && (TyKind)lv->proc_ret != TY_UNKNOWN) return (TyKind)lv->proc_ret;
-    return TY_POLY;
+    Scope *s = comp_scope_of(c, node);
+    LocalVar *lv = scope_local(s, nt_str(nt, node, "name"));
+    return lv ? (TyKind)lv->proc_ret : TY_UNKNOWN;
   }
-  if (!strcmp(ty, "LambdaNode") || is_proc_literal(c, recv)) return proc_node_ret(c, recv);
-  return TY_POLY;
+  if (!strcmp(ty, "CallNode")) {
+    /* a method call that returns a proc -> the callee's recorded proc return */
+    int recv = nt_ref(nt, node, "receiver");
+    const char *name = nt_str(nt, node, "name");
+    int mi = -1;
+    if (recv < 0) {
+      mi = comp_method_index(c, name);
+      if (mi < 0) { Scope *self = comp_scope_of(c, node); if (self->class_id >= 0) mi = comp_method_in_chain(c, self->class_id, name, NULL); }
+    } else {
+      TyKind rt = infer_type(c, recv);
+      if (ty_is_object(rt)) mi = comp_method_in_chain(c, ty_object_class(rt), name, NULL);
+    }
+    if (mi >= 0) return (TyKind)c->scopes[mi].ret_proc_ret;
+  }
+  return TY_UNKNOWN;
+}
+
+/* The return type of a proc-typed expression's `.call`; poly when unknown. */
+static TyKind proc_call_ret(Compiler *c, int recv) {
+  TyKind r = proc_ret_of(c, recv);
+  return r == TY_UNKNOWN ? TY_POLY : r;
 }
 
 static TyKind infer_call(Compiler *c, int id) {
@@ -1185,10 +1205,8 @@ static int infer_write_types(Compiler *c) {
        a later slice. */
     if (lv->type == TY_PROC && !strcmp(ty, "LocalVariableWriteNode")) {
       int vnode = nt_ref(nt, id, "value");
-      if (vnode >= 0 && is_proc_create(c, vnode)) {
-        TyKind pr = proc_node_ret(c, vnode);
-        if (pr != TY_UNKNOWN && (TyKind)lv->proc_ret != pr) { lv->proc_ret = (int)pr; changed = 1; }
-      }
+      TyKind pr = vnode >= 0 ? proc_ret_of(c, vnode) : TY_UNKNOWN;
+      if (pr != TY_UNKNOWN && (TyKind)lv->proc_ret != pr) { lv->proc_ret = (int)pr; changed = 1; }
     }
   }
 
@@ -1303,6 +1321,12 @@ static int bind_call_params(Compiler *c, int call_id, int mi) {
     if (!p) continue;
     TyKind merged = ty_unify(p->type, at);
     if (merged != p->type) { p->type = merged; changed = 1; }
+    /* a proc passed as an argument carries its body return type to the param,
+       so `f.call(...)` inside the method knows its result type */
+    if (merged == TY_PROC) {
+      TyKind pr = proc_ret_of(c, argv[k]);
+      if (pr != TY_UNKNOWN && p->proc_ret != (int)pr) { p->proc_ret = (int)pr; changed = 1; }
+    }
   }
   return changed;
 }
@@ -1657,6 +1681,24 @@ static int infer_return_types(Compiler *c) {
         r = ty_unify(r, return_node_type(c, id));
     }
     if (r != sc->ret) { sc->ret = r; changed = 1; }
+    /* When the method returns a proc, record the proc's body return type so a
+       caller's `m.call(...)` resolves its result type (factory pattern). */
+    if (r == TY_PROC) {
+      TyKind pr = TY_UNKNOWN;
+      if (sc->body >= 0) {
+        int bn = 0; const int *bb = nt_arr(nt, sc->body, "body", &bn);
+        if (bn > 0) pr = proc_ret_of(c, bb[bn - 1]);
+      }
+      for (int id = 0; id < nt->count; id++) {
+        const char *ty = nt_type(nt, id);
+        if (ty && !strcmp(ty, "ReturnNode") && comp_scope_of(c, id) == sc) {
+          int a = nt_ref(nt, id, "arguments"); int an = 0;
+          const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+          if (an > 0) pr = ty_unify(pr == TY_UNKNOWN ? TY_UNKNOWN : pr, proc_ret_of(c, av[0]));
+        }
+      }
+      if (pr != TY_UNKNOWN && sc->ret_proc_ret != (int)pr) { sc->ret_proc_ret = (int)pr; changed = 1; }
+    }
   }
   return changed;
 }

@@ -38,6 +38,8 @@ typedef struct {
   int nrequired;    /* count of leading required params */
 
   TyKind ret;       /* inferred return type */
+  int ret_proc_ret; /* when ret==TY_PROC: the returned proc's body return type
+                       (TyKind), so a caller's `m.call` knows the result type */
 
   LocalVar *locals; /* params + body locals */
   int nlocals, clocals;
