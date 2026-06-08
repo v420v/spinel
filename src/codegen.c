@@ -2508,7 +2508,32 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     }
     return;
   }
-  if (!strcmp(ty, "ClassNode") || !strcmp(ty, "ModuleNode")) { return; } /* methods emitted separately */
+  if (!strcmp(ty, "ClassNode") || !strcmp(ty, "ModuleNode")) {
+    /* Run the body's side-effecting statements at the definition site
+       (top-to-bottom, like CRuby). Method/attr/alias declarations are
+       handled elsewhere; everything else (puts, constant writes, nested
+       class/module bodies) executes inline here. */
+    int body = nt_ref(nt, id, "body");
+    int n = 0;
+    const int *stmts = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
+    for (int k = 0; k < n; k++) {
+      const char *sty = nt_type(nt, stmts[k]);
+      if (!sty) continue;
+      if (!strcmp(sty, "DefNode") || !strcmp(sty, "AliasMethodNode")) continue;
+      /* A receiver-less call in a class body is, by default, a declaration
+         macro (attr_*, include, private, an FFI/DSL directive) -- skip it.
+         Only run the genuine side-effecting ones: output calls and calls
+         that resolve to a user-defined method. */
+      if (!strcmp(sty, "CallNode") && nt_ref(nt, stmts[k], "receiver") < 0) {
+        const char *cn = nt_str(nt, stmts[k], "name");
+        int is_output = cn && (!strcmp(cn, "puts") || !strcmp(cn, "print") || !strcmp(cn, "p"));
+        int is_user = cn && comp_method_index(c, cn) >= 0;
+        if (!is_output && !is_user) continue;
+      }
+      emit_stmt(c, stmts[k], b, indent);
+    }
+    return;
+  }
   if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) {
     emit_indent(b, indent); emit_super(c, id, b); buf_puts(b, ";\n"); return;
   }
