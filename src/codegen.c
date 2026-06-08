@@ -75,6 +75,15 @@ static const char *g_result_var = NULL;
    can be boxed when the method returns poly but the value is concrete. */
 static TyKind g_ret_type = TY_UNKNOWN;
 
+/* First-class Proc support: each `proc {}` / `lambda {}` / `->{}` literal
+   lowers to a standalone `static mrb_int _proc_N(void *cap, mrb_int *args)`
+   function (the ABI sp_proc_call expects). Definitions accumulate in g_procs
+   and prototypes in g_proc_protos during the main emission pass, then are
+   flushed ahead of the method/main bodies that reference them. */
+static Buf g_procs;
+static Buf g_proc_protos;
+static int g_proc_counter = 0;
+
 /* Emit the lead of a tail value: `return ` or `<result> = `. */
 static void emit_tail_lead(Buf *b) {
   if (g_result_var) buf_printf(b, "%s = ", g_result_var);
@@ -120,6 +129,7 @@ static const char *c_type_name(TyKind t) {
     case TY_STR_POLY_HASH: return "sp_StrPolyHash *";
     case TY_POLY:         return "sp_RbVal";
     case TY_POLY_ARRAY:   return "sp_PolyArray *";
+    case TY_PROC:         return "sp_Proc *";
     default:             return NULL;
   }
 }
@@ -127,7 +137,7 @@ static int is_scalar_ret(TyKind t) {
   return t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_STRING ||
          t == TY_SYMBOL || t == TY_RANGE || t == TY_TIME || t == TY_STRINGIO || t == TY_EXCEPTION ||
          t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY ||
-         t == TY_POLY || t == TY_POLY_ARRAY ||
+         t == TY_POLY || t == TY_POLY_ARRAY || t == TY_PROC ||
          ty_is_hash(t) || ty_is_object(t);
 }
 static const char *default_value(TyKind t) {
@@ -145,6 +155,7 @@ static const char *default_value(TyKind t) {
     case TY_FLOAT_ARRAY:
     case TY_STR_ARRAY:
     case TY_POLY_ARRAY: return "NULL";
+    case TY_PROC:    return "NULL";
     case TY_POLY:    return "sp_box_nil()";
     default:        return (ty_is_hash(t) || ty_is_object(t)) ? "NULL" : "0";
   }
@@ -209,6 +220,7 @@ static void emit_super(Compiler *c, int id, Buf *b);
 static void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const char *lead, Buf *out);
 static void emit_boxed(Compiler *c, int node, Buf *b);
 static void emit_boxed_text(Compiler *c, TyKind t, const char *expr, Buf *b);
+static void emit_proc_literal(Compiler *c, int create, Buf *b);
 
 /* Strip ParenthesesNode wrappers to reach the inner expression. */
 static int unwrap_parens(Compiler *c, int id) {
@@ -503,6 +515,25 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   const int *argv = NULL;
   if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
   if (!name) unsupported(c, id, "call (no name)");
+
+  /* proc {} / lambda {} / Proc.new {} literal -> a first-class Proc value */
+  if (comp_ntype(c, id) == TY_PROC && nt_ref(nt, id, "block") >= 0) {
+    emit_proc_literal(c, id, b);
+    return;
+  }
+
+  /* <proc>.call(args) / .() / [] -> sp_proc_call with the mrb_int[] ABI.
+     (A `&block`-param `.call` is handled earlier by the inline path, whose
+     receiver name matches g_block_param_name; this is the escaped-value case.) */
+  if (recv >= 0 && comp_ntype(c, recv) == TY_PROC &&
+      (!strcmp(name, "call") || !strcmp(name, "()") || !strcmp(name, "[]"))) {
+    buf_puts(b, "sp_proc_call(");
+    emit_expr(c, recv, b);
+    buf_puts(b, ", (mrb_int[16]){");
+    for (int k = 0; k < argc; k++) { if (k) buf_puts(b, ", "); emit_expr(c, argv[k], b); }
+    buf_puts(b, "})");
+    return;
+  }
 
   /* block_given? -> true inside an inlined yielding method (we only inline
      when a block is present) */
@@ -3463,7 +3494,7 @@ static void emit_stmts_tail(Compiler *c, int id, Buf *b, int indent) {
 /* ---- declarations ---- */
 
 /* Heap-managed types need a GC root for their local slot. */
-static int needs_root(TyKind t) { return t == TY_STRING || ty_is_array(t) || ty_is_hash(t) || ty_is_object(t) || t == TY_EXCEPTION || t == TY_POLY; }
+static int needs_root(TyKind t) { return t == TY_STRING || ty_is_array(t) || ty_is_hash(t) || ty_is_object(t) || t == TY_EXCEPTION || t == TY_POLY || t == TY_PROC; }
 
 /* Emit `node` boxed into an sp_RbVal. Idempotent: an already-poly value is
    passed through unboxed (double-boxing is a classic silent-corruption bug). */
@@ -3656,6 +3687,153 @@ static void emit_method(Compiler *c, Scope *s, Buf *b) {
   buf_puts(b, "}\n");
 }
 
+/* ---- first-class Proc ---- */
+
+/* Block bodies don't get their own Scope: a block's params and the locals it
+   assigns live in the ENCLOSING scope (the inline model). To emit a proc body
+   as a standalone function we therefore work over the body SUBTREE, not a
+   scope: its bound names are the block params plus the locals it writes; a
+   read of any other name is a captured/free variable. */
+typedef struct { const char **v; int n, cap; } NameSet;
+static int nameset_has(NameSet *s, const char *nm) {
+  for (int i = 0; i < s->n; i++) if (!strcmp(s->v[i], nm)) return 1;
+  return 0;
+}
+static void nameset_add(NameSet *s, const char *nm) {
+  if (!nm || nameset_has(s, nm)) return;
+  if (s->n >= s->cap) { s->cap = s->cap ? s->cap * 2 : 8; s->v = realloc(s->v, sizeof(char *) * (size_t)s->cap); }
+  s->v[s->n++] = nm;
+}
+
+/* True if `id` starts a nested block/lambda whose locals belong to it, not to
+   the proc we're walking -- recursion stops there. */
+static int is_nested_block(const char *ty) {
+  return ty && (!strcmp(ty, "BlockNode") || !strcmp(ty, "LambdaNode"));
+}
+
+/* Collect the local names WRITTEN in the proc body subtree (the proc's own
+   locals), not descending into nested blocks. */
+static void proc_collect_locals(Compiler *c, int id, NameSet *locals) {
+  if (id < 0) return;
+  const char *ty = nt_type(c->nt, id);
+  if (!ty) return;
+  if (!strcmp(ty, "LocalVariableWriteNode") || !strcmp(ty, "LocalVariableTargetNode") ||
+      !strcmp(ty, "LocalVariableOperatorWriteNode") || !strcmp(ty, "LocalVariableOrWriteNode") ||
+      !strcmp(ty, "LocalVariableAndWriteNode"))
+    nameset_add(locals, nt_str(c->nt, id, "name"));
+  int nr = nt_num_refs(c->nt, id);
+  for (int i = 0; i < nr; i++) {
+    int ch = nt_ref_at(c->nt, id, i);
+    if (ch >= 0 && !is_nested_block(nt_type(c->nt, ch))) proc_collect_locals(c, ch, locals);
+  }
+  int na = nt_num_arrs(c->nt, id);
+  for (int i = 0; i < na; i++) {
+    int n = 0; const int *ids = nt_arr_at(c->nt, id, i, &n);
+    for (int k = 0; k < n; k++)
+      if (ids[k] >= 0 && !is_nested_block(nt_type(c->nt, ids[k]))) proc_collect_locals(c, ids[k], locals);
+  }
+}
+
+/* True if a LocalVariableReadNode in the subtree reads a name not in `bound`
+   (block params + the proc's own locals) -- i.e. a captured variable. */
+static int proc_subtree_has_free(Compiler *c, int id, NameSet *bound) {
+  if (id < 0) return 0;
+  const char *ty = nt_type(c->nt, id);
+  if (!ty) return 0;
+  if (!strcmp(ty, "LocalVariableReadNode") && !nameset_has(bound, nt_str(c->nt, id, "name"))) return 1;
+  int nr = nt_num_refs(c->nt, id);
+  for (int i = 0; i < nr; i++) {
+    int ch = nt_ref_at(c->nt, id, i);
+    if (ch >= 0 && !is_nested_block(nt_type(c->nt, ch)) && proc_subtree_has_free(c, ch, bound)) return 1;
+  }
+  int na = nt_num_arrs(c->nt, id);
+  for (int i = 0; i < na; i++) {
+    int n = 0; const int *ids = nt_arr_at(c->nt, id, i, &n);
+    for (int k = 0; k < n; k++)
+      if (ids[k] >= 0 && !is_nested_block(nt_type(c->nt, ids[k])) && proc_subtree_has_free(c, ids[k], bound)) return 1;
+  }
+  return 0;
+}
+
+/* Lower a `proc {}` / `lambda {}` / `Proc.new {}` literal: emit a standalone
+   `static mrb_int _proc_N(void *cap, mrb_int *args)` (sp_proc_call's ABI) into
+   g_procs, and emit the boxing `sp_proc_new_meta(...)` value into `b`. */
+static void emit_proc_literal(Compiler *c, int create, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int block = nt_ref(nt, create, "block");
+  if (block < 0) { unsupported(c, create, "proc literal without a block"); return; }
+
+  Scope *bs = comp_scope_of(c, block);  /* enclosing scope: holds block params + locals */
+  int body = nt_ref(nt, block, "body");
+
+  int arity = 0;
+  while (block_param_name(c, block, arity)) arity++;
+
+  /* bound names = block params + locals the proc body writes */
+  NameSet bound = {0}, locals = {0};
+  for (int k = 0; k < arity; k++) nameset_add(&bound, block_param_name(c, block, k));
+  proc_collect_locals(c, body, &locals);
+  for (int i = 0; i < locals.n; i++) nameset_add(&bound, locals.v[i]);
+  if (proc_subtree_has_free(c, body, &bound)) {
+    free(bound.v); free(locals.v);
+    unsupported(c, create, "proc capturing outer variables (closures: later slice)");
+    return;
+  }
+
+  const char *cn = nt_str(nt, create, "name");
+  int is_lambda = cn && !strcmp(cn, "lambda");
+
+  /* body return type = last statement's type */
+  TyKind ret = TY_NIL;
+  { int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+    if (bn > 0) ret = comp_ntype(c, bb[bn - 1]); }
+  /* The proc fn returns mrb_int (the ABI). Until pointer/poly return
+     laundering lands (later slice), only mrb_int-shaped returns are safe. */
+  if (!(ret == TY_INT || ret == TY_BOOL || ret == TY_NIL)) {
+    free(bound.v); free(locals.v);
+    unsupported(c, create, "proc with non-integer return (later slice)");
+    return;
+  }
+
+  int pid = ++g_proc_counter;
+  buf_printf(&g_proc_protos, "static mrb_int _proc_%d(void *_cap, mrb_int *args);\n", pid);
+
+  /* Save every emission global: the proc body is a fresh function context. */
+  Buf *sv_pre = g_pre; int sv_indent = g_indent, sv_nren = g_nren, sv_block = g_block_id;
+  const char *sv_bpn = g_block_param_name, *sv_self = g_self, *sv_rv = g_result_var;
+  TyKind sv_rt = g_ret_type;
+  g_pre = NULL; g_indent = 0; g_nren = 0; g_block_id = -1; g_block_param_name = NULL;
+  g_self = "self"; g_result_var = NULL; g_ret_type = ret;
+
+  Buf *pb = &g_procs;
+  buf_printf(pb, "static mrb_int _proc_%d(void *_cap, mrb_int *args) {\n", pid);
+  buf_puts(pb, "    SP_GC_SAVE();\n");
+  buf_puts(pb, "    (void)_cap; (void)args;\n");
+  for (int k = 0; k < arity; k++) {
+    const char *p = block_param_name(c, block, k);
+    LocalVar *lv = scope_local(bs, p);
+    TyKind pt = lv ? lv->type : TY_INT;
+    buf_puts(pb, "    "); emit_ctype(c, pt, pb);
+    /* slice 1: params are int-shaped; args[k] is already mrb_int */
+    buf_printf(pb, " lv_%s = args[%d];\n", p, k);
+  }
+  for (int i = 0; i < locals.n; i++) {
+    LocalVar *lv = scope_local(bs, locals.v[i]);
+    if (lv && !lv->is_block_param) declare_local(c, pb, lv, 0);
+  }
+  emit_stmts_tail(c, body, pb, 1);
+  buf_puts(pb, "  return 0;\n");
+  buf_puts(pb, "}\n");
+
+  g_pre = sv_pre; g_indent = sv_indent; g_nren = sv_nren; g_block_id = sv_block;
+  g_block_param_name = sv_bpn; g_self = sv_self; g_result_var = sv_rv; g_ret_type = sv_rt;
+
+  free(bound.v); free(locals.v);
+
+  buf_printf(b, "sp_proc_new_meta((void *)_proc_%d, NULL, NULL, %d, %s, %d, NULL, NULL)",
+             pid, arity, is_lambda ? "TRUE" : "FALSE", arity);
+}
+
 /* Emit the struct + the constructor (sp_<Class>_new) for one class. */
 static void emit_class_struct(Compiler *c, ClassInfo *ci, Buf *b) {
   buf_printf(b, "typedef struct sp_%s_s sp_%s;\n", ci->name, ci->name);
@@ -3781,6 +3959,9 @@ char *codegen_program(const NodeTable *nt) {
   analyze_program(c);
 
   Buf b; memset(&b, 0, sizeof b);
+  memset(&g_procs, 0, sizeof g_procs);
+  memset(&g_proc_protos, 0, sizeof g_proc_protos);
+  g_proc_counter = 0;
   buf_puts(&b, "/* Generated by Spinel AOT compiler */\n");
   buf_puts(&b, "#include \"sp_runtime.h\"\n");
   {
@@ -3829,10 +4010,9 @@ char *codegen_program(const NodeTable *nt) {
     else buf_printf(&b, "static sp_%s *sp_%s_new();\n", ci->name, ci->name);
   }
   if (c->nscopes > 1 || c->nclasses > 0) buf_puts(&b, "\n");
-  for (int i = 0; i < c->nclasses; i++) emit_class_new(c, &c->classes[i], &b);
-  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable) continue; emit_method(c, &c->scopes[s], &b); }
 
-  /* global variables and top-level constants (file-scope statics) */
+  /* global variables and top-level constants (file-scope statics) -- emitted
+     ahead of the proc functions so a proc body may reference them by name. */
   for (int i = 0; i < c->ngvars; i++) {
     LocalVar *lv = &c->gvars[i];
     if (!is_scalar_ret(lv->type)) continue;
@@ -3851,12 +4031,28 @@ char *codegen_program(const NodeTable *nt) {
   }
   if (c->ngvars || c->nconsts) buf_puts(&b, "\n");
 
-  buf_puts(&b, "int main(int argc,char**argv){\n");
-  buf_puts(&b, "    SP_GC_SAVE();\n");
-  emit_scope_decls(c, &c->scopes[0], &b);
-  buf_puts(&b, "\n");
-  emit_stmts(c, c->scopes[0].body, &b, 1);
-  buf_puts(&b, "  return 0;\n}\n");
+  /* Constructor defs, method defs, and main go into a separate buffer. Any
+     proc literals they contain accumulate static functions into g_procs /
+     g_proc_protos; we splice those in ahead of these bodies, since a proc
+     function must be declared before the body that references it. */
+  Buf body; memset(&body, 0, sizeof body);
+  for (int i = 0; i < c->nclasses; i++) emit_class_new(c, &c->classes[i], &body);
+  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable) continue; emit_method(c, &c->scopes[s], &body); }
+
+  buf_puts(&body, "int main(int argc,char**argv){\n");
+  buf_puts(&body, "    SP_GC_SAVE();\n");
+  emit_scope_decls(c, &c->scopes[0], &body);
+  buf_puts(&body, "\n");
+  emit_stmts(c, c->scopes[0].body, &body, 1);
+  buf_puts(&body, "  return 0;\n}\n");
+
+  if (g_proc_protos.len) { buf_puts(&b, g_proc_protos.p); buf_puts(&b, "\n"); }
+  if (g_procs.len) { buf_puts(&b, g_procs.p); buf_puts(&b, "\n"); }
+  buf_puts(&b, body.p ? body.p : "");
+  free(body.p);
+  free(g_procs.p); free(g_proc_protos.p);
+  memset(&g_procs, 0, sizeof g_procs);
+  memset(&g_proc_protos, 0, sizeof g_proc_protos);
 
   comp_free(c);
   return b.p;

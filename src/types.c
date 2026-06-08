@@ -25,6 +25,7 @@ const char *ty_name(TyKind t) {
     case TY_INT_STR_HASH: return "int_str_hash";
     case TY_SYM_POLY_HASH: return "sym_poly_hash";
     case TY_STR_POLY_HASH: return "str_poly_hash";
+    case TY_PROC:    return "proc";
     case TY_POLY:    return "poly";
   }
   return "?";

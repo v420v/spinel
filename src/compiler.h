@@ -18,6 +18,8 @@ typedef struct {
   int gc_root;      /* scratch during analysis; rooting is type-derived in codegen */
   int is_param;     /* declared as a method parameter (C function param) */
   int is_block_param; /* bound by a block; typed by block-param inference */
+  int proc_ret;     /* when type==TY_PROC: the proc's body return type (TyKind),
+                       TY_UNKNOWN if not statically known */
 } LocalVar;
 
 typedef struct {

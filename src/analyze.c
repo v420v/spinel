@@ -77,6 +77,52 @@ static TyKind method_call_ret(Compiler *c, int mi, int call_id) {
   return c->scopes[mi].ret;
 }
 
+/* 1 if `id` is a proc/lambda literal: `proc {}` / `lambda {}` (CallNode with
+   no receiver and a block) or `Proc.new {}`. */
+static int is_proc_literal(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, id);
+  if (!ty || strcmp(ty, "CallNode")) return 0;
+  if (nt_ref(nt, id, "block") < 0) return 0;
+  const char *name = nt_str(nt, id, "name");
+  int recv = nt_ref(nt, id, "receiver");
+  if (recv < 0 && name && (!strcmp(name, "proc") || !strcmp(name, "lambda"))) return 1;
+  if (recv >= 0 && name && !strcmp(name, "new") && nt_type(nt, recv) &&
+      !strcmp(nt_type(nt, recv), "ConstantReadNode") && nt_str(nt, recv, "name") &&
+      !strcmp(nt_str(nt, recv, "name"), "Proc")) return 1;
+  return 0;
+}
+
+/* The body return type of a proc-creating node (proc/lambda CallNode literal,
+   or a LambdaNode). The last statement of the block/lambda body is the value. */
+static TyKind proc_node_ret(Compiler *c, int create) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, create);
+  int body;
+  if (ty && !strcmp(ty, "LambdaNode")) body = nt_ref(nt, create, "body");
+  else { int blk = nt_ref(nt, create, "block"); body = blk >= 0 ? nt_ref(nt, blk, "body") : -1; }
+  if (body < 0) return TY_NIL;
+  int bn = 0;
+  const int *bb = nt_arr(nt, body, "body", &bn);
+  return bn > 0 ? infer_type(c, bb[bn - 1]) : TY_NIL;
+}
+
+/* The return type of a proc-typed expression's `.call`. Resolves the proc's
+   create site (literal directly, or via a local's recorded proc_ret). */
+static TyKind proc_call_ret(Compiler *c, int recv) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, recv);
+  if (!ty) return TY_POLY;
+  if (!strcmp(ty, "LocalVariableReadNode")) {
+    Scope *s = comp_scope_of(c, recv);
+    LocalVar *lv = scope_local(s, nt_str(nt, recv, "name"));
+    if (lv && (TyKind)lv->proc_ret != TY_UNKNOWN) return (TyKind)lv->proc_ret;
+    return TY_POLY;
+  }
+  if (!strcmp(ty, "LambdaNode") || is_proc_literal(c, recv)) return proc_node_ret(c, recv);
+  return TY_POLY;
+}
+
 static TyKind infer_call(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -89,6 +135,14 @@ static TyKind infer_call(Compiler *c, int id) {
 
   TyKind rt = recv >= 0 ? infer_type(c, recv) : TY_UNKNOWN;
   TyKind a0 = argc >= 1 ? infer_type(c, argv[0]) : TY_UNKNOWN;
+
+  /* proc {} / lambda {} / Proc.new {} -> a first-class Proc value */
+  if (is_proc_literal(c, id)) return TY_PROC;
+
+  /* <proc>.call(args) / .() / [] -> the proc's recorded body return type */
+  if (recv >= 0 && rt == TY_PROC &&
+      (!strcmp(name, "call") || !strcmp(name, "()") || !strcmp(name, "[]")))
+    return proc_call_ret(c, recv);
 
   /* identity methods: return the receiver unchanged */
   if (recv >= 0 && argc == 0 &&
@@ -1116,6 +1170,17 @@ static int infer_write_types(Compiler *c) {
       continue;
     }
     lv->type = ty_unify(lv->type, newt);
+    /* Record the proc's body return type so `<var>.call(...)` knows the
+       result type (e.g. `sq = proc { |x| x*x }; sq.call(5)` -> int). Only
+       a direct proc literal RHS carries it; escape-through-return/param is
+       a later slice. */
+    if (lv->type == TY_PROC && !strcmp(ty, "LocalVariableWriteNode")) {
+      int vnode = nt_ref(nt, id, "value");
+      if (vnode >= 0 && is_proc_literal(c, vnode)) {
+        TyKind pr = proc_node_ret(c, vnode);
+        if (pr != TY_UNKNOWN && (TyKind)lv->proc_ret != pr) { lv->proc_ret = (int)pr; changed = 1; }
+      }
+    }
   }
 
   /* Multiple assignment `a, b = e0, e1`: each target gets its element's
@@ -1402,6 +1467,21 @@ static int infer_block_params(Compiler *c) {
     const char *name = nt_str(nt, id, "name");
     int recv = nt_ref(nt, id, "receiver");
     if (!name) continue;
+
+    /* proc {} / lambda {} / Proc.new {}: type the literal's block params.
+       Without call-site arg-type inference (a later slice) default required
+       params to int -- covers the common arithmetic proc and is overridden
+       by any stronger inference that runs first. */
+    if (is_proc_literal(c, id)) {
+      Scope *bs = comp_scope_of(c, block);
+      for (int k = 0; ; k++) {
+        const char *bp = block_param_name(c, block, k);
+        if (!bp) break;
+        LocalVar *lv = scope_local_intern(bs, bp); lv->is_block_param = 1;
+        if (lv->type == TY_UNKNOWN) { lv->type = TY_INT; changed = 1; }
+      }
+      continue;
+    }
 
     /* StringIO.open(args) { |io| ... }: io is a StringIO */
     if (recv >= 0 && !strcmp(name, "open") && nt_type(nt, recv) &&
