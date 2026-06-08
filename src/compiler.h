@@ -63,6 +63,11 @@ typedef struct {
 
   ClassInfo *classes;
   int nclasses, cclasses;
+
+  LocalVar *gvars;    /* global variables ($g), name without '$' */
+  int ngvars, cgvars;
+  LocalVar *consts;   /* top-level constants (FOO) */
+  int nconsts, cconsts;
 } Compiler;
 
 Compiler *comp_new(const NodeTable *nt);
@@ -79,6 +84,12 @@ LocalVar *scope_local_intern(Scope *s, const char *name);
 
 /* Symbol intern table. comp_sym_intern returns the symbol's id. */
 int comp_sym_intern(Compiler *c, const char *name);
+
+/* Global variables and top-level constants. *_intern finds or creates. */
+LocalVar *comp_gvar(Compiler *c, const char *name);
+LocalVar *comp_gvar_intern(Compiler *c, const char *name);
+LocalVar *comp_const(Compiler *c, const char *name);
+LocalVar *comp_const_intern(Compiler *c, const char *name);
 
 /* Classes. */
 ClassInfo *comp_class_new(Compiler *c, const char *name, int def_node);

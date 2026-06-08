@@ -38,10 +38,33 @@ void comp_free(Compiler *c) {
     free(c->classes[i].writers);
   }
   free(c->classes);
+  for (int i = 0; i < c->ngvars; i++) free(c->gvars[i].name);
+  free(c->gvars);
+  for (int i = 0; i < c->nconsts; i++) free(c->consts[i].name);
+  free(c->consts);
   free(c->nscope);
   free(c->ntype);
   free(c);
 }
+
+static LocalVar *lv_find(LocalVar *arr, int n, const char *name) {
+  for (int i = 0; i < n; i++) if (strcmp(arr[i].name, name) == 0) return &arr[i];
+  return NULL;
+}
+static LocalVar *lv_intern(LocalVar **arr, int *n, int *cap, const char *name) {
+  LocalVar *lv = lv_find(*arr, *n, name);
+  if (lv) return lv;
+  if (*n >= *cap) { *cap = *cap ? *cap * 2 : 8; *arr = realloc(*arr, sizeof(LocalVar) * (size_t)*cap); }
+  lv = &(*arr)[(*n)++];
+  memset(lv, 0, sizeof(*lv));
+  lv->name = strdup(name);
+  lv->type = TY_UNKNOWN;
+  return lv;
+}
+LocalVar *comp_gvar(Compiler *c, const char *name) { return lv_find(c->gvars, c->ngvars, name); }
+LocalVar *comp_gvar_intern(Compiler *c, const char *name) { return lv_intern(&c->gvars, &c->ngvars, &c->cgvars, name); }
+LocalVar *comp_const(Compiler *c, const char *name) { return lv_find(c->consts, c->nconsts, name); }
+LocalVar *comp_const_intern(Compiler *c, const char *name) { return lv_intern(&c->consts, &c->nconsts, &c->cconsts, name); }
 
 int comp_sym_intern(Compiler *c, const char *name) {
   for (int i = 0; i < c->nsymbols; i++)

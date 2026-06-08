@@ -1118,6 +1118,16 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     buf_printf(b, "self->iv_%s", nm + 1);
     return;
   }
+  if (!strcmp(ty, "GlobalVariableReadNode")) {
+    const char *nm = nt_str(nt, id, "name");
+    if (nm && comp_gvar(c, nm + 1)) { buf_printf(b, "gv_%s", nm + 1); return; }
+    unsupported(c, id, "global variable read");
+  }
+  if (!strcmp(ty, "ConstantReadNode")) {
+    const char *nm = nt_str(nt, id, "name");
+    if (nm && comp_const(c, nm)) { buf_printf(b, "cst_%s", nm); return; }
+    unsupported(c, id, "constant read");
+  }
   if (!strcmp(ty, "ParenthesesNode")) {
     int body = nt_ref(nt, id, "body");
     int n = 0;
@@ -1598,6 +1608,38 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     }
     return;
   }
+  if (!strcmp(ty, "GlobalVariableWriteNode") || !strcmp(ty, "ConstantWriteNode")) {
+    const char *nm = nt_str(nt, id, "name");
+    int isg = ty[0] == 'G';
+    const char *pfx = isg ? "gv" : "cst";
+    const char *key = isg ? nm + 1 : nm;
+    LocalVar *lv = isg ? comp_gvar(c, key) : comp_const(c, key);
+    if (!lv) { /* not registered (non-ident name or class const) -> ignore */ return; }
+    int v = nt_ref(nt, id, "value");
+    emit_indent(b, indent);
+    buf_printf(b, "%s_%s = ", pfx, key);
+    const char *vty = nt_type(nt, v);
+    if (vty && !strcmp(vty, "NilNode")) buf_puts(b, lv->type == TY_RANGE ? "(sp_Range){0}" : default_value(lv->type));
+    else emit_expr(c, v, b);
+    buf_puts(b, ";\n");
+    return;
+  }
+  if (!strcmp(ty, "GlobalVariableOperatorWriteNode")) {
+    const char *nm = nt_str(nt, id, "name");
+    LocalVar *lv = nm ? comp_gvar(c, nm + 1) : NULL;
+    if (!lv) return;
+    const char *op = nt_str(nt, id, "binary_operator");
+    int v = nt_ref(nt, id, "value");
+    emit_indent(b, indent);
+    if (lv->type == TY_STRING && op && !strcmp(op, "+")) {
+      buf_printf(b, "gv_%s = sp_str_concat(gv_%s, ", nm + 1, nm + 1);
+      emit_expr(c, v, b); buf_puts(b, ");\n");
+    } else {
+      buf_printf(b, "gv_%s %s= ", nm + 1, op ? op : "+");
+      emit_expr(c, v, b); buf_puts(b, ";\n");
+    }
+    return;
+  }
   if (!strcmp(ty, "ClassNode") || !strcmp(ty, "ModuleNode")) { return; } /* methods emitted separately */
   if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) {
     emit_indent(b, indent); emit_super(c, id, b); buf_puts(b, ";\n"); return;
@@ -1891,6 +1933,25 @@ char *codegen_program(const NodeTable *nt) {
   if (c->nscopes > 1 || c->nclasses > 0) buf_puts(&b, "\n");
   for (int i = 0; i < c->nclasses; i++) emit_class_new(c, &c->classes[i], &b);
   for (int s = 1; s < c->nscopes; s++) emit_method(c, &c->scopes[s], &b);
+
+  /* global variables and top-level constants (file-scope statics) */
+  for (int i = 0; i < c->ngvars; i++) {
+    LocalVar *lv = &c->gvars[i];
+    if (!is_scalar_ret(lv->type)) continue;
+    buf_puts(&b, "static ");
+    emit_ctype(c, lv->type, &b);
+    buf_printf(&b, " gv_%s = %s;\n", lv->name,
+               lv->type == TY_RANGE ? "{0}" : default_value(lv->type));
+  }
+  for (int i = 0; i < c->nconsts; i++) {
+    LocalVar *lv = &c->consts[i];
+    if (!is_scalar_ret(lv->type)) continue;
+    buf_puts(&b, "static ");
+    emit_ctype(c, lv->type, &b);
+    buf_printf(&b, " cst_%s = %s;\n", lv->name,
+               lv->type == TY_RANGE ? "{0}" : default_value(lv->type));
+  }
+  if (c->ngvars || c->nconsts) buf_puts(&b, "\n");
 
   buf_puts(&b, "int main(int argc,char**argv){\n");
   buf_puts(&b, "    SP_GC_SAVE();\n");

@@ -269,6 +269,16 @@ static TyKind infer_uncached(Compiler *c, int id) {
     LocalVar *lv = nm ? scope_local(s, nm) : NULL;
     return lv ? lv->type : TY_UNKNOWN;
   }
+  if (!strcmp(ty, "GlobalVariableReadNode")) {
+    const char *nm = nt_str(nt, id, "name");
+    LocalVar *lv = nm ? comp_gvar(c, nm + 1) : NULL;
+    return lv ? lv->type : TY_UNKNOWN;
+  }
+  if (!strcmp(ty, "ConstantReadNode")) {
+    const char *nm = nt_str(nt, id, "name");
+    LocalVar *lv = nm ? comp_const(c, nm) : NULL;
+    return lv ? lv->type : TY_UNKNOWN;
+  }
   if (!strcmp(ty, "InstanceVariableReadNode")) {
     const char *nm = nt_str(nt, id, "name");
     Scope *s = comp_scope_of(c, id);
@@ -472,6 +482,66 @@ static void register_attrs(Compiler *c) {
       }
     }
   }
+}
+
+static int is_c_ident(const char *s) {
+  if (!s || !*s) return 0;
+  for (const char *p = s; *p; p++)
+    if (!((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+          (*p >= '0' && *p <= '9') || *p == '_')) return 0;
+  return 1;
+}
+
+/* Register global variables ($g) and top-level constants (FOO). */
+static void register_globals_consts(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty) continue;
+    if (!strcmp(ty, "GlobalVariableWriteNode") || !strcmp(ty, "GlobalVariableReadNode") ||
+        !strcmp(ty, "GlobalVariableOperatorWriteNode") || !strcmp(ty, "GlobalVariableTargetNode")) {
+      const char *nm = nt_str(nt, id, "name");
+      if (nm && nm[0] == '$' && is_c_ident(nm + 1)) comp_gvar_intern(c, nm + 1);
+    } else if (!strcmp(ty, "ConstantWriteNode")) {
+      const char *nm = nt_str(nt, id, "name");
+      if (nm && is_c_ident(nm)) comp_const_intern(c, nm);
+    }
+  }
+}
+
+static int infer_global_const_types(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty) continue;
+    LocalVar *lv = NULL;
+    TyKind vt = TY_UNKNOWN;
+    if (!strcmp(ty, "GlobalVariableWriteNode")) {
+      const char *nm = nt_str(nt, id, "name");
+      if (nm) lv = comp_gvar(c, nm + 1);
+      vt = infer_type(c, nt_ref(nt, id, "value"));
+      if (vt == TY_NIL) continue;
+    } else if (!strcmp(ty, "GlobalVariableOperatorWriteNode")) {
+      const char *nm = nt_str(nt, id, "name");
+      if (nm) lv = comp_gvar(c, nm + 1);
+      TyKind cur = lv ? lv->type : TY_UNKNOWN;
+      TyKind v = infer_type(c, nt_ref(nt, id, "value"));
+      if (cur == TY_STRING) vt = TY_STRING;
+      else if (ty_is_numeric(cur) && ty_is_numeric(v)) vt = (cur == TY_FLOAT || v == TY_FLOAT) ? TY_FLOAT : TY_INT;
+      else vt = cur;
+    } else if (!strcmp(ty, "ConstantWriteNode")) {
+      const char *nm = nt_str(nt, id, "name");
+      if (nm) lv = comp_const(c, nm);
+      vt = infer_type(c, nt_ref(nt, id, "value"));
+    } else {
+      continue;
+    }
+    if (!lv) continue;
+    TyKind merged = ty_unify(lv->type, vt);
+    if (merged != lv->type) { lv->type = merged; changed = 1; }
+  }
+  return changed;
 }
 
 /* Resolve each class's superclass index from its ClassNode. */
@@ -847,6 +917,7 @@ void analyze_program(Compiler *c) {
   walk_scope(c, c->nt->root_id, 0, -1);
   register_locals(c);
   register_attrs(c);
+  register_globals_consts(c);
   resolve_parents(c);
   inherit_members(c);
 
@@ -867,6 +938,7 @@ void analyze_program(Compiler *c) {
     ch |= infer_block_params(c);
     ch |= infer_ivar_types(c);
     ch |= infer_inherited_ivars(c);
+    ch |= infer_global_const_types(c);
     ch |= infer_return_types(c);
     if (!ch) break;
   }
