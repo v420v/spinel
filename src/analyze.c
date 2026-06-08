@@ -1138,8 +1138,9 @@ static int infer_param_types(Compiler *c) {
             int args = nt_ref(nt, id, "arguments");
             int an = 0;
             const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
-            for (int a = 0; a < an && a < cls->nivars; a++) {
-              TyKind at = infer_type(c, argv[a]);
+            for (int a = 0; a < cls->nivars; a++) {
+              /* a member not supplied at this construction can be nil */
+              TyKind at = a < an ? infer_type(c, argv[a]) : TY_NIL;
               TyKind m = ty_unify(cls->ivar_types[a], at);
               if (m != cls->ivar_types[a]) { cls->ivar_types[a] = m; changed = 1; }
             }

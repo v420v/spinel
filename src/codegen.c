@@ -2836,9 +2836,16 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
               int args = nt_ref(nt, id, "arguments");
               int an = 0; const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
               if (an >= 1) {
+                int rc = ty_object_class(rt);
+                char ivn[256]; snprintf(ivn, sizeof ivn, "@%s", base);
+                int defc = -1; comp_writer_in_chain(c, rc, base, &defc);
+                int iv = comp_ivar_index(&c->classes[defc < 0 ? rc : defc], ivn);
+                TyKind ivt = iv >= 0 ? c->classes[defc < 0 ? rc : defc].ivar_types[iv] : TY_UNKNOWN;
                 emit_indent(b, indent);
                 buf_puts(b, "("); emit_expr(c, recv, b); buf_printf(b, ")->iv_%s = ", base);
-                emit_expr(c, argv[0], b); buf_puts(b, ";\n");
+                if (ivt == TY_POLY && comp_ntype(c, argv[0]) != TY_POLY) emit_boxed(c, argv[0], b);
+                else emit_expr(c, argv[0], b);
+                buf_puts(b, ";\n");
                 return;
               }
             }
