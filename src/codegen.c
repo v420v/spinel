@@ -65,6 +65,15 @@ static const char *g_self = "self";
 /* While emitting a rescue handler: the C var names holding the caught
    exception's class/message, so a bare `raise` can re-raise. */
 static const char *g_rescue_cls = NULL, *g_rescue_msg = NULL;
+/* When set, tail positions assign to this var instead of `return`ing
+   (used to give a begin/rescue a value). */
+static const char *g_result_var = NULL;
+
+/* Emit the lead of a tail value: `return ` or `<result> = `. */
+static void emit_tail_lead(Buf *b) {
+  if (g_result_var) buf_printf(b, "%s = ", g_result_var);
+  else buf_puts(b, "return ");
+}
 
 static const char *rename_local(const char *nm) {
   for (int i = 0; i < g_nren; i++)
@@ -1957,7 +1966,7 @@ static int rescue_is_catchall_name(const char *n) {
 
 /* Emit one rescue clause (and its `subsequent` chain) inside the handler
    branch. Frame counter `fr` makes the saved cls/msg vars unique. */
-static void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr) {
+static void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr, const char *resultvar) {
   const NodeTable *nt = c->nt;
   int nexc = 0;
   const int *exc = nt_arr(nt, id, "exceptions", &nexc);
@@ -2006,7 +2015,13 @@ static void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr) {
     emit_indent(b, indent);
     buf_printf(b, "lv_%s = sp_exc_new(_rcls_%d, _rmsg_%d);\n", nt_str(nt, ref, "name"), rc, rc);
   }
-  emit_stmts(c, stmts, b, indent);
+  if (resultvar) {
+    const char *sv = g_result_var; g_result_var = resultvar;
+    emit_stmts_tail(c, stmts, b, indent);
+    g_result_var = sv;
+  } else {
+    emit_stmts(c, stmts, b, indent);
+  }
   g_rescue_cls = save_cls; g_rescue_msg = save_msg;
 
   if (!catchall) {
@@ -2015,7 +2030,7 @@ static void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr) {
     buf_puts(b, "}\n");
     emit_indent(b, indent);
     buf_puts(b, "else {\n");
-    if (sub >= 0) emit_rescue(c, sub, b, indent + 1, fr);
+    if (sub >= 0) emit_rescue(c, sub, b, indent + 1, fr, resultvar);
     else {
       emit_indent(b, indent + 1);
       buf_printf(b, "sp_raise_cls(_rcls_%d, _rmsg_%d);\n", rc, rc);
@@ -2025,8 +2040,10 @@ static void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr) {
   }
 }
 
-/* begin/body/rescue (ensure/else deferred) via the setjmp exception model. */
-static void emit_begin(Compiler *c, int id, Buf *b, int indent) {
+/* begin/body/rescue (ensure/else deferred) via the setjmp exception model.
+   When resultvar != NULL, the body's and rescue handlers' values are
+   assigned to it (begin/rescue as an expression). */
+static void emit_begin(Compiler *c, int id, Buf *b, int indent, const char *resultvar) {
   const NodeTable *nt = c->nt;
   int body = nt_ref(nt, id, "statements");
   int rescue = nt_ref(nt, id, "rescue_clause");
@@ -2034,12 +2051,18 @@ static void emit_begin(Compiler *c, int id, Buf *b, int indent) {
 
   emit_indent(b, indent); buf_puts(b, "sp_exc_top++;\n");
   emit_indent(b, indent); buf_puts(b, "if (setjmp(sp_exc_stack[sp_exc_top-1]) == 0) {\n");
-  emit_stmts(c, body, b, indent + 1);
+  if (resultvar) {
+    const char *sv = g_result_var; g_result_var = resultvar;
+    emit_stmts_tail(c, body, b, indent + 1);
+    g_result_var = sv;
+  } else {
+    emit_stmts(c, body, b, indent + 1);
+  }
   emit_indent(b, indent + 1); buf_puts(b, "sp_exc_top--;\n");
   emit_indent(b, indent); buf_puts(b, "}\n");
   emit_indent(b, indent); buf_puts(b, "else {\n");
   emit_indent(b, indent + 1); buf_puts(b, "sp_exc_top--;\n");
-  if (rescue >= 0) emit_rescue(c, rescue, b, indent + 1, fr);
+  if (rescue >= 0) emit_rescue(c, rescue, b, indent + 1, fr, resultvar);
   emit_indent(b, indent); buf_puts(b, "}\n");
 }
 
@@ -2252,7 +2275,7 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
   if (!strcmp(ty, "WhileNode"))  { emit_while(c, id, b, indent, 0); return; }
   if (!strcmp(ty, "UntilNode"))  { emit_while(c, id, b, indent, 1); return; }
   if (!strcmp(ty, "CaseNode"))   { emit_case(c, id, b, indent); return; }
-  if (!strcmp(ty, "BeginNode"))  { emit_begin(c, id, b, indent); return; }
+  if (!strcmp(ty, "BeginNode"))  { emit_begin(c, id, b, indent, NULL); return; }
   if (!strcmp(ty, "ReturnNode")) { emit_return(c, id, b, indent); return; }
   if (!strcmp(ty, "DefNode"))    { return; } /* emitted separately */
 
@@ -2272,6 +2295,19 @@ static void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
   if (!strcmp(ty, "IfNode"))     { emit_if(c, id, b, indent, 0, 1); return; }
   if (!strcmp(ty, "UnlessNode")) { emit_if(c, id, b, indent, 1, 1); return; }
   if (!strcmp(ty, "ReturnNode")) { emit_return(c, id, b, indent); return; }
+  if (!strcmp(ty, "BeginNode")) {
+    /* begin/rescue value -> a temp, assigned in both branches, then tail */
+    TyKind rt = comp_ntype(c, id);
+    if (is_scalar_ret(rt)) {
+      int t = ++g_tmp;
+      char rv[32]; snprintf(rv, sizeof rv, "_t%d", t);
+      emit_indent(b, indent); emit_ctype(c, rt, b);
+      buf_printf(b, " _t%d = %s;\n", t, rt == TY_RANGE ? "(sp_Range){0}" : default_value(rt));
+      emit_begin(c, id, b, indent, rv);
+      emit_indent(b, indent); emit_tail_lead(b); buf_printf(b, "_t%d;\n", t);
+      return;
+    }
+  }
 
   /* statements that don't produce a usable tail value: emit normally;
      the trailing default return covers the method's value. */
@@ -2284,9 +2320,9 @@ static void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
     return;
   }
 
-  /* a value expression: return it */
+  /* a value expression: return it (or assign to the begin/rescue result) */
   emit_indent(b, indent);
-  buf_puts(b, "return ");
+  emit_tail_lead(b);
   emit_expr(c, id, b);
   buf_puts(b, ";\n");
 }

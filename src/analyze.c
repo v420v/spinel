@@ -397,6 +397,16 @@ static TyKind infer_uncached(Compiler *c, int id) {
     if (lt == TY_BOOL && rt == TY_BOOL) return TY_BOOL;
     return ty_unify(lt, rt);  /* value form: a || b -> common type */
   }
+  if (!strcmp(ty, "BeginNode")) {
+    /* value = body value unified with each rescue handler's value */
+    int body = nt_ref(nt, id, "statements");
+    TyKind r = body >= 0 ? infer_type(c, body) : TY_NIL;
+    for (int rs = nt_ref(nt, id, "rescue_clause"); rs >= 0; rs = nt_ref(nt, rs, "subsequent")) {
+      int st = nt_ref(nt, rs, "statements");
+      r = ty_unify(r, st >= 0 ? infer_type(c, st) : TY_NIL);
+    }
+    return r;
+  }
   if (!strcmp(ty, "CallNode")) return infer_call(c, id);
 
   return TY_UNKNOWN;
