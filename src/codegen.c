@@ -254,6 +254,8 @@ static void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const ch
 static void emit_boxed(Compiler *c, int node, Buf *b);
 static void emit_boxed_text(Compiler *c, TyKind t, const char *expr, Buf *b);
 static void emit_proc_literal(Compiler *c, int create, Buf *b);
+static int proc_slot_is_direct(TyKind t);
+static int proc_slot_is_ptr(TyKind t);
 
 /* Strip ParenthesesNode wrappers to reach the inner expression. */
 static int unwrap_parens(Compiler *c, int id) {
@@ -560,11 +562,20 @@ static void emit_call(Compiler *c, int id, Buf *b) {
      receiver name matches g_block_param_name; this is the escaped-value case.) */
   if (recv >= 0 && comp_ntype(c, recv) == TY_PROC &&
       (!strcmp(name, "call") || !strcmp(name, "()") || !strcmp(name, "[]"))) {
+    TyKind rty = comp_ntype(c, id);          /* the call's result = proc's body return */
+    int unbox_ptr = proc_slot_is_ptr(rty);
+    if (unbox_ptr) { buf_puts(b, "("); emit_ctype(c, rty, b); buf_puts(b, ")(uintptr_t)("); }
     buf_puts(b, "sp_proc_call(");
     emit_expr(c, recv, b);
     buf_puts(b, ", (mrb_int[16]){");
-    for (int k = 0; k < argc; k++) { if (k) buf_puts(b, ", "); emit_expr(c, argv[k], b); }
+    for (int k = 0; k < argc; k++) {
+      if (k) buf_puts(b, ", ");
+      /* a heap-pointer argument is laundered into the mrb_int slot */
+      if (proc_slot_is_ptr(comp_ntype(c, argv[k]))) { buf_puts(b, "(mrb_int)(uintptr_t)("); emit_expr(c, argv[k], b); buf_puts(b, ")"); }
+      else emit_expr(c, argv[k], b);
+    }
     buf_puts(b, "})");
+    if (unbox_ptr) buf_puts(b, ")");
     return;
   }
 
@@ -3832,6 +3843,13 @@ static int proc_body_node(Compiler *c, int create) {
   return block >= 0 ? nt_ref(c->nt, block, "body") : -1;
 }
 
+/* Proc args + return ride the mrb_int slot of sp_proc_call. A value that fits
+   an mrb_int directly (int/bool/symbol/nil) needs no conversion; a heap pointer
+   (string/array/hash/object) is laundered through (mrb_int)(uintptr_t). Other
+   shapes (float, poly, range, time) don't fit the slot and defer. */
+static int proc_slot_is_direct(TyKind t) { return t == TY_INT || t == TY_BOOL || t == TY_SYMBOL || t == TY_NIL || t == TY_UNKNOWN; }
+static int proc_slot_is_ptr(TyKind t) { return t == TY_STRING || ty_is_array(t) || ty_is_hash(t) || ty_is_object(t); }
+
 /* Lower a `proc {}` / `lambda {}` / `Proc.new {}` / `->(){}` literal: emit a
    standalone `static mrb_int _proc_N(void *cap, mrb_int *args)` (sp_proc_call's
    ABI) into g_procs, and emit the boxing `sp_proc_new_meta(...)` value into `b`. */
@@ -3884,11 +3902,14 @@ static void emit_proc_literal(Compiler *c, int create, Buf *b) {
   TyKind ret = TY_NIL;
   { int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
     if (bn > 0) ret = comp_ntype(c, bb[bn - 1]); }
-  /* The proc fn returns mrb_int (the ABI). Until pointer/poly return
-     laundering lands (later slice), only mrb_int-shaped returns are safe. */
-  if (!(ret == TY_INT || ret == TY_BOOL || ret == TY_NIL)) {
+  /* The proc fn returns mrb_int (the ABI); a string return is laundered through
+     (mrb_int)(uintptr_t). Array/hash/object returns construct via the statement
+     prelude (not available in this manual return path) and defer for now, as do
+     float/poly/range/time, which don't fit the slot. */
+  int ret_ptr = (ret == TY_STRING);
+  if (!proc_slot_is_direct(ret) && !ret_ptr) {
     free(params.v); free(used.v); free(locals.v); free(caps.v);
-    unsupported(c, create, "proc with non-integer return (later slice)");
+    unsupported(c, create, "proc with array/hash/object/float/poly return (later slice)");
     return;
   }
 
@@ -3932,17 +3953,29 @@ static void emit_proc_literal(Compiler *c, int create, Buf *b) {
     const char *p = proc_param_name(c, create, k);
     LocalVar *lv = scope_local(bs, p);
     TyKind pt = lv ? lv->type : TY_INT;
-    buf_puts(pb, "    "); emit_ctype(c, pt, pb);
-    /* params are int-shaped here; args[k] is already mrb_int */
-    buf_printf(pb, " lv_%s = args[%d];\n", p, k);
+    buf_puts(pb, "    "); emit_ctype(c, pt, pb); buf_printf(pb, " lv_%s = ", p);
+    /* a heap-pointer param is laundered back from the mrb_int slot */
+    if (proc_slot_is_ptr(pt)) { buf_puts(pb, "("); emit_ctype(c, pt, pb); buf_printf(pb, ")(uintptr_t)args[%d];\n", k); }
+    else buf_printf(pb, "args[%d];\n", k);
   }
   for (int i = 0; i < locals.n; i++) {
     LocalVar *lv = scope_local(bs, locals.v[i]);
     /* a celled local is a captured var (accessed via _cap), not a fn-local */
     if (lv && !lv->is_block_param && !lv->is_cell) declare_local(c, pb, lv, 0);
   }
-  emit_stmts_tail(c, body, pb, 1);
-  buf_puts(pb, "  return 0;\n");
+  if (ret_ptr) {
+    /* launder a heap-pointer return through the mrb_int slot: emit the body's
+       leading statements, then `return (mrb_int)(uintptr_t)(<value>)`. */
+    int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+    for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], pb, 1);
+    buf_puts(pb, "  return (mrb_int)(uintptr_t)(");
+    if (bn > 0) emit_expr(c, bb[bn - 1], pb); else buf_puts(pb, "0");
+    buf_puts(pb, ");\n");
+  }
+  else {
+    emit_stmts_tail(c, body, pb, 1);
+    buf_puts(pb, "  return 0;\n");
+  }
   buf_puts(pb, "}\n");
 
   g_pre = sv_pre; g_indent = sv_indent; g_nren = sv_nren; g_block_id = sv_block;
