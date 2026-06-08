@@ -761,17 +761,21 @@ static int infer_write_types(Compiler *c) {
       const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
       if (name && (!strcmp(name, "push") || !strcmp(name, "<<")) && an == 1) {
         is_push = 1; vt = infer_type(c, argv[0]);
-      } else if (name && !strcmp(name, "[]=") && an == 2) {
+      }
+      else if (name && !strcmp(name, "[]=") && an == 2) {
         kt = infer_type(c, argv[0]); vt = infer_type(c, argv[1]);
-      } else continue;
-    } else if (!strcmp(ty, "IndexOperatorWriteNode")) {
+      }
+      else continue;
+    }
+    else if (!strcmp(ty, "IndexOperatorWriteNode")) {
       recv = nt_ref(nt, id, "receiver");
       int args = nt_ref(nt, id, "arguments");
       int an = 0;
       const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
       if (an != 1) continue;
       kt = infer_type(c, argv[0]); vt = infer_type(c, nt_ref(nt, id, "value"));
-    } else {
+    }
+    else {
       continue;
     }
     if (recv < 0 || strcmp(nt_type(nt, recv) ? nt_type(nt, recv) : "", "LocalVariableReadNode")) continue;
@@ -784,7 +788,8 @@ static int infer_write_types(Compiler *c) {
       if (vt == TY_UNKNOWN) continue;
       if (lv->type != TY_UNKNOWN && !ty_is_array(lv->type)) continue;
       lv->type = ty_unify(lv->type, ty_array_of(vt));
-    } else if (kt == TY_STRING) {
+    }
+    else if (kt == TY_STRING) {
       TyKind hv = ty_hash_of(TY_STRING, vt);
       if (hv == TY_UNKNOWN) continue;
       if (lv->type != TY_UNKNOWN && !ty_is_hash(lv->type)) continue;
@@ -927,7 +932,8 @@ static int infer_block_params(Compiler *c) {
           Scope *self = comp_scope_of(c, id);
           if (self->class_id >= 0) mi = comp_method_in_chain(c, self->class_id, name, NULL);
         }
-      } else {
+      }
+      else {
         TyKind rt0 = infer_type(c, recv);
         if (ty_is_object(rt0)) mi = comp_method_in_chain(c, ty_object_class(rt0), name, NULL);
       }

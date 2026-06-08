@@ -1063,7 +1063,8 @@ static int emit_inline_call(Compiler *c, int id, Buf *b, int indent) {
       if (encl->class_id >= 0) { mi = comp_method_in_chain(c, encl->class_id, name, NULL); implicit_self = 1; }
       else return 0;
     }
-  } else {
+  }
+  else {
     TyKind rt = comp_ntype(c, recv);     /* instance method */
     if (!ty_is_object(rt)) return 0;
     recv_class = ty_object_class(rt);
@@ -1091,7 +1092,8 @@ static int emit_inline_call(Compiler *c, int id, Buf *b, int indent) {
     if (rty && (!strcmp(rty, "LocalVariableReadNode") || !strcmp(rty, "InstanceVariableReadNode") || !strcmp(rty, "SelfNode"))) {
       buf_printf(b, "sp_%s *_t%d = &", c->classes[recv_class].name, st);
       emit_expr(c, recv, b);
-    } else {
+    }
+    else {
       buf_printf(b, "sp_%s _t%da = ", c->classes[recv_class].name, st);
       emit_expr(c, recv, b);
       buf_printf(b, "; sp_%s *_t%d = &_t%da", c->classes[recv_class].name, st, st);
@@ -1659,7 +1661,8 @@ static void emit_assign(Compiler *c, int id, Buf *b, int indent) {
       buf_printf(b, "sp_%sHash_new_with_default(", hcn);
       emit_expr(c, hash_new_default, b);
       buf_puts(b, ")");
-    } else {
+    }
+    else {
       buf_printf(b, "sp_%sHash_new()", hcn);
     }
   }
@@ -1882,7 +1885,8 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
       buf_printf(b, "lv_%s = ", bp);
       if (k < yc) {
         emit_expr(c, yargs[k], b);
-      } else {
+      }
+      else {
         LocalVar *bl = scope_local(bsc, bp);
         TyKind bt = bl ? bl->type : TY_INT;
         buf_puts(b, bt == TY_RANGE ? "(sp_Range){0}" : default_value(bt));
