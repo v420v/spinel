@@ -606,6 +606,24 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     buf_puts(b, "sp_proc_parameters("); emit_expr(c, recv, b); buf_puts(b, ")"); return;
   }
 
+  /* `arr << x` / push / append in value position: mutate, then yield the array
+     (statement position is handled earlier by emit_array_mutate_stmt). */
+  if (recv >= 0 && (!strcmp(name, "<<") || !strcmp(name, "push") || !strcmp(name, "append")) &&
+      argc >= 1 && ty_is_array(comp_ntype(c, recv))) {
+    TyKind art = comp_ntype(c, recv);
+    const char *k = (art == TY_POLY_ARRAY) ? "Poly" : array_kind(art);
+    int t = ++g_tmp;
+    buf_puts(b, "({ ");
+    emit_ctype(c, art, b); buf_printf(b, " _t%d = ", t); emit_expr(c, recv, b); buf_puts(b, "; ");
+    for (int a = 0; a < argc; a++) {
+      buf_printf(b, "sp_%sArray_push(_t%d, ", k, t);
+      if (art == TY_POLY_ARRAY) emit_boxed(c, argv[a], b); else emit_expr(c, argv[a], b);
+      buf_puts(b, "); ");
+    }
+    buf_printf(b, "_t%d; })", t);
+    return;
+  }
+
   /* at_exit { ... } -> register the block as a Proc; main()'s tail runs the
      hooks in reverse order. The registration expression evaluates to the proc. */
   if (recv < 0 && !strcmp(name, "at_exit") && nt_ref(nt, id, "block") >= 0) {

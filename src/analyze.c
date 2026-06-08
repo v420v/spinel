@@ -1350,34 +1350,53 @@ static int infer_write_types(Compiler *c) {
     else {
       continue;
     }
-    if (recv < 0 || strcmp(nt_type(nt, recv) ? nt_type(nt, recv) : "", "LocalVariableReadNode")) continue;
-    const char *rnm = nt_str(nt, recv, "name");
-    LocalVar *lv = rnm ? scope_local(comp_scope_of(c, recv), rnm) : NULL;
-    if (!lv || lv->is_param || lv->is_block_param) continue;
+    if (recv < 0) continue;
+    const char *rty = nt_type(nt, recv);
+    /* fold into a local's type or an ivar's type (an empty `@buf=[]` filled by
+       `@buf << x` infers its element type the same way a local does) */
+    TyKind *slot = NULL;
+    if (rty && !strcmp(rty, "LocalVariableReadNode")) {
+      const char *rnm = nt_str(nt, recv, "name");
+      LocalVar *lv = rnm ? scope_local(comp_scope_of(c, recv), rnm) : NULL;
+      if (!lv || lv->is_param || lv->is_block_param) continue;
+      slot = &lv->type;
+    }
+    else if (rty && !strcmp(rty, "InstanceVariableReadNode")) {
+      const char *inm = nt_str(nt, recv, "name");
+      Scope *s = comp_scope_of(c, recv);
+      if (s->class_id < 0) continue;
+      ClassInfo *ci = &c->classes[s->class_id];
+      int iv = inm ? comp_ivar_index(ci, inm) : -1;
+      if (iv < 0) continue;
+      slot = &ci->ivar_types[iv];
+    }
+    else continue;
 
+    TyKind before = *slot;
     if (is_push || kt == TY_INT) {
       /* array (a known string's `<<` is append, not push -- don't pollute) */
       if (vt == TY_UNKNOWN) continue;
-      if (lv->type != TY_UNKNOWN && !ty_is_array(lv->type)) continue;
-      lv->type = ty_unify(lv->type, ty_array_of(vt));
+      if (*slot != TY_UNKNOWN && !ty_is_array(*slot)) continue;
+      *slot = ty_unify(*slot, ty_array_of(vt));
     }
     else if (kt == TY_STRING) {
       if (vt == TY_UNKNOWN) continue;
       TyKind hv = ty_hash_of(TY_STRING, vt);
       if (hv == TY_UNKNOWN) hv = TY_STR_POLY_HASH;  /* mixed values */
-      if (lv->type != TY_UNKNOWN && !ty_is_hash(lv->type)) continue;
+      if (*slot != TY_UNKNOWN && !ty_is_hash(*slot)) continue;
       /* a str-keyed hash that has seen >1 value type widens to StrPoly */
-      if (lv->type != TY_UNKNOWN && lv->type != hv &&
-          (lv->type == TY_STR_INT_HASH || lv->type == TY_STR_STR_HASH || lv->type == TY_STR_POLY_HASH))
+      if (*slot != TY_UNKNOWN && *slot != hv &&
+          (*slot == TY_STR_INT_HASH || *slot == TY_STR_STR_HASH || *slot == TY_STR_POLY_HASH))
         hv = TY_STR_POLY_HASH;
-      lv->type = hv;
+      *slot = hv;
     }
     else if (kt == TY_SYMBOL) {
       /* symbol key -> SymPolyHash (boxed values) */
       if (vt == TY_UNKNOWN) continue;
-      if (lv->type != TY_UNKNOWN && lv->type != TY_SYM_POLY_HASH) continue;
-      lv->type = TY_SYM_POLY_HASH;
+      if (*slot != TY_UNKNOWN && *slot != TY_SYM_POLY_HASH) continue;
+      *slot = TY_SYM_POLY_HASH;
     }
+    if (*slot != before) changed = 1;
   }
 
   /* detect change vs the stashed old types */
