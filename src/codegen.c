@@ -318,6 +318,18 @@ static int struct_kwarg_value(Compiler *c, int kwh, const char *name) {
   return -1;
 }
 
+/* Value-equality family: operands in the same nonzero family compare by value;
+   different nonzero families are never == (Ruby does no cross-type coercion,
+   except int/float which share family 1). 0 = not a simple comparable type. */
+static int eq_family(TyKind t) {
+  if (ty_is_numeric(t)) return 1;
+  if (t == TY_STRING) return 2;
+  if (t == TY_BOOL) return 3;
+  if (t == TY_SYMBOL) return 4;
+  if (t == TY_RANGE) return 5;
+  return 0;
+}
+
 static void emit_method_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -1017,38 +1029,35 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else { buf_puts(b, "(("); emit_expr(c, other, b); buf_printf(b, "), %d)", eq ? 0 : 1); }
       return;
     }
-    if (rt == TY_STRING || a0 == TY_STRING) {
-      buf_puts(b, eq ? "sp_str_eq(" : "(!sp_str_eq(");
-      emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
-      buf_puts(b, eq ? ")" : "))");
-      return;
-    }
-    if (ty_is_numeric(rt) || rt == TY_BOOL || rt == TY_SYMBOL) {
-      buf_puts(b, "(");
-      emit_expr(c, recv, b);
-      buf_printf(b, " %s ", eq ? "==" : "!=");
-      emit_expr(c, argv[0], b);
-      buf_puts(b, ")");
-      return;
-    }
     if (rt == TY_POLY_ARRAY && a0 == TY_POLY_ARRAY) {
       buf_puts(b, eq ? "sp_PolyArray_eq(" : "(!sp_PolyArray_eq(");
       emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
       buf_puts(b, eq ? ")" : "))");
       return;
     }
-    if (rt == TY_RANGE && a0 == TY_RANGE) {
-      buf_puts(b, eq ? "sp_range_eq(" : "(!sp_range_eq(");
-      emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
-      buf_puts(b, eq ? ")" : "))");
-      return;
-    }
-    if (rt == TY_RANGE || a0 == TY_RANGE) { buf_puts(b, eq ? "0" : "1"); return; }  /* range vs non-range */
+    /* a poly operand compares dynamically (covers string-vs-poly etc.) */
     if (rt == TY_POLY || a0 == TY_POLY) {
       buf_puts(b, eq ? "sp_poly_eq(" : "(!sp_poly_eq(");
       emit_boxed(c, recv, b); buf_puts(b, ", "); emit_boxed(c, argv[0], b);
       buf_puts(b, eq ? ")" : "))");
       return;
+    }
+    {
+      int fr = eq_family(rt), fa = eq_family(a0);
+      /* same comparable family: compare by value */
+      if (fr && fa && fr == fa) {
+        if (fr == 2) { buf_puts(b, eq ? "sp_str_eq(" : "(!sp_str_eq("); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, eq ? ")" : "))"); }
+        else if (fr == 5) { buf_puts(b, eq ? "sp_range_eq(" : "(!sp_range_eq("); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, eq ? ")" : "))"); }
+        else { buf_puts(b, "("); emit_expr(c, recv, b); buf_printf(b, " %s ", eq ? "==" : "!="); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+        return;
+      }
+      /* two different concrete types are never == in Ruby (no coercion);
+         still evaluate both operands for their side effects */
+      if (fr && fa) {
+        buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, "), (");
+        emit_expr(c, argv[0], b); buf_printf(b, "), %d)", eq ? 0 : 1);
+        return;
+      }
     }
     unsupported(c, id, "equality");
   }
