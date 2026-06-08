@@ -1159,11 +1159,13 @@ static int emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent) {
     emit_expr(c, argv[1], b); buf_puts(b, ");\n");
     return 1;
   }
-  if ((!strcmp(name, "push") || !strcmp(name, "<<")) && argc == 1) {
-    emit_indent(b, indent);
-    buf_printf(b, "sp_%sArray_push(", k);
-    emit_expr(c, recv, b); buf_puts(b, ", ");
-    emit_expr(c, argv[0], b); buf_puts(b, ");\n");
+  if ((!strcmp(name, "push") || !strcmp(name, "<<") || !strcmp(name, "append")) && argc >= 1) {
+    for (int a = 0; a < argc; a++) {
+      emit_indent(b, indent);
+      buf_printf(b, "sp_%sArray_push(", k);
+      emit_expr(c, recv, b); buf_puts(b, ", ");
+      emit_expr(c, argv[a], b); buf_puts(b, ");\n");
+    }
     return 1;
   }
   return 0;
