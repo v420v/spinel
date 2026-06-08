@@ -1005,8 +1005,10 @@ static void register_attrs(Compiler *c) {
       if (!sty || strcmp(sty, "CallNode")) continue;
       const char *nm = nt_str(nt, s, "name");
       if (!nm) continue;
-      int reader = !strcmp(nm, "attr_reader") || !strcmp(nm, "attr_accessor");
-      int writer = !strcmp(nm, "attr_writer") || !strcmp(nm, "attr_accessor");
+      int accessor = !strcmp(nm, "attr_accessor") ||
+                     !strcmp(nm, "attribute") || !strcmp(nm, "attributes");
+      int reader = !strcmp(nm, "attr_reader") || accessor;
+      int writer = !strcmp(nm, "attr_writer") || accessor;
       if (!reader && !writer) continue;
       int args = nt_ref(nt, s, "arguments");
       int an = 0;
