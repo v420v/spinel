@@ -664,6 +664,47 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     }
   }
 
+  /* StringIO.open(args) { |io| body } -> run the block with a fresh IO,
+     return the block's value, then close. */
+  if (recv >= 0 && !strcmp(name, "open") && nt_type(nt, recv) &&
+      !strcmp(nt_type(nt, recv), "ConstantReadNode") && nt_str(nt, recv, "name") &&
+      !strcmp(nt_str(nt, recv, "name"), "StringIO")) {
+    int block = nt_ref(nt, id, "block");
+    if (block < 0) {
+      /* no block: behaves like StringIO.new */
+      if (argc == 0) buf_puts(b, "sp_StringIO_new()");
+      else if (argc == 1) { buf_puts(b, "sp_StringIO_new_s("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else { buf_puts(b, "sp_StringIO_new_sm("); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")"); }
+      return;
+    }
+    const char *fp = block_param_name(c, block, 0); if (fp) fp = rename_local(fp);
+    int bbody = nt_ref(nt, block, "body");
+    int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
+    TyKind res = comp_ntype(c, id);
+    int rv = ++g_tmp;
+    int scalar = is_scalar_ret(res);
+    buf_puts(b, "({ ");
+    if (fp) {
+      buf_printf(b, "lv_%s = ", fp);
+      if (argc == 0) buf_puts(b, "sp_StringIO_new()");
+      else if (argc == 1) { buf_puts(b, "sp_StringIO_new_s("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else { buf_puts(b, "sp_StringIO_new_sm("); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")"); }
+      buf_puts(b, "; ");
+    }
+    /* leading statements first, then capture the last as the value */
+    for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], b, 0);
+    if (scalar && bn > 0) {
+      emit_ctype(c, res, b); buf_printf(b, " _t%d = ", rv);
+      if (res == TY_POLY && comp_ntype(c, bb[bn - 1]) != TY_POLY) emit_boxed(c, bb[bn - 1], b);
+      else emit_expr(c, bb[bn - 1], b);
+      buf_puts(b, "; ");
+    }
+    else if (bn > 0) emit_stmt(c, bb[bn - 1], b, 0);
+    if (fp) buf_printf(b, "sp_StringIO_close(lv_%s); ", fp);
+    buf_printf(b, "%s; })", scalar && bn > 0 ? ({ static char _tb[16]; snprintf(_tb, sizeof _tb, "_t%d", rv); _tb; }) : "0");
+    return;
+  }
+
   /* Time class constructors */
   if (recv >= 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode") &&
       nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "Time")) {
@@ -1096,7 +1137,11 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     else if (!strcmp(name, "puts") && argc == 1) { buf_printf(b, "sp_StringIO_puts(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
     else if (!strcmp(name, "print") && argc == 1) { buf_printf(b, "sp_StringIO_print(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
     else if ((!strcmp(name, "write") || !strcmp(name, "<<")) && argc == 1) { buf_printf(b, "sp_StringIO_write(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
-    else if (!strcmp(name, "putc") && argc == 1) { buf_printf(b, "sp_StringIO_putc(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+    else if (!strcmp(name, "putc") && argc == 1) {
+      if (comp_ntype(c, argv[0]) == TY_STRING) { buf_printf(b, "sp_StringIO_putc(%s, (mrb_int)(unsigned char)(", r); emit_expr(c, argv[0], b); buf_puts(b, ")[0])"); }
+      else { buf_printf(b, "sp_StringIO_putc(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+    }
+    else if (!strcmp(name, "fsync") || !strcmp(name, "fileno") || !strcmp(name, "pid")) buf_printf(b, "((void)(%s), 0)", r);
     else if (!strcmp(name, "read") && argc == 0) buf_printf(b, "sp_StringIO_read(%s)", r);
     else if (!strcmp(name, "read") && argc == 1) { buf_printf(b, "sp_StringIO_read_n(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
     else if (!strcmp(name, "gets")) buf_printf(b, "sp_box_nullable_str(sp_StringIO_gets(%s))", r);

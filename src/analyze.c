@@ -92,6 +92,19 @@ static TyKind infer_call(Compiler *c, int id) {
     }
   }
 
+  /* StringIO.open(args) { |io| body } -> the block body's value */
+  if (recv >= 0 && !strcmp(name, "open") && nt_type(nt, recv) &&
+      !strcmp(nt_type(nt, recv), "ConstantReadNode") && nt_str(nt, recv, "name") &&
+      !strcmp(nt_str(nt, recv, "name"), "StringIO")) {
+    int block = nt_ref(nt, id, "block");
+    int bbody = block >= 0 ? nt_ref(nt, block, "body") : -1;
+    if (bbody >= 0) {
+      int bn = 0; const int *bb = nt_arr(nt, bbody, "body", &bn);
+      return bn > 0 ? infer_type(c, bb[bn - 1]) : TY_NIL;
+    }
+    return TY_STRINGIO;
+  }
+
   /* StringIO instance methods */
   if (recv >= 0 && rt == TY_STRINGIO) {
     if (!strcmp(name, "string") || !strcmp(name, "read")) return TY_STRING;
@@ -1337,6 +1350,16 @@ static int infer_block_params(Compiler *c) {
     const char *name = nt_str(nt, id, "name");
     int recv = nt_ref(nt, id, "receiver");
     if (!name) continue;
+
+    /* StringIO.open(args) { |io| ... }: io is a StringIO */
+    if (recv >= 0 && !strcmp(name, "open") && nt_type(nt, recv) &&
+        !strcmp(nt_type(nt, recv), "ConstantReadNode") && nt_str(nt, recv, "name") &&
+        !strcmp(nt_str(nt, recv, "name"), "StringIO")) {
+      const char *p0 = block_param_name(c, block, 0);
+      if (p0) { LocalVar *l = scope_local_intern(comp_scope_of(c, block), p0); l->is_block_param = 1;
+                if (l->type != TY_STRINGIO) { l->type = TY_STRINGIO; changed = 1; } }
+      continue;
+    }
 
     /* struct.to_h { |k, v| ... }: k is a member symbol, v its (poly) value */
     if (recv >= 0 && !strcmp(name, "to_h")) {
