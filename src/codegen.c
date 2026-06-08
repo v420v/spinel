@@ -2680,6 +2680,9 @@ static void emit_assign(Compiler *c, int id, Buf *b, int indent) {
     /* `a = []` -> a new array of the variable's resolved element type */
     buf_printf(b, "sp_%sArray_new()", array_kind(lv->type));
   }
+  else if (is_empty_array && lv && lv->type == TY_POLY_ARRAY) {
+    buf_puts(b, "sp_PolyArray_new()");
+  }
   else if ((is_empty_hash || is_hash_new) && lv && ty_hash_cname(lv->type)) {
     const char *hcn = ty_hash_cname(lv->type);
     if (is_hash_new && hash_new_default >= 0) {
