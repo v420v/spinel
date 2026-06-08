@@ -142,6 +142,13 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "[]="))                         return ty_array_elem(rt);
   }
 
+  /* exception receiver methods */
+  if (recv >= 0 && rt == TY_EXCEPTION) {
+    if (!strcmp(name, "message") || !strcmp(name, "to_s") ||
+        !strcmp(name, "to_str") || !strcmp(name, "inspect") ||
+        !strcmp(name, "full_message")) return TY_STRING;
+  }
+
   /* range receiver methods */
   if (recv >= 0 && rt == TY_RANGE) {
     if (!strcmp(name, "to_a"))      return TY_INT_ARRAY;
@@ -1075,6 +1082,20 @@ void analyze_program(Compiler *c) {
   register_locals(c);
   register_attrs(c);
   register_globals_consts(c);
+
+  /* rescue variables (`rescue => e`) are typed as exception objects */
+  for (int id = 0; id < c->nt->count; id++) {
+    const char *ty = nt_type(c->nt, id);
+    if (!ty || strcmp(ty, "RescueNode")) continue;
+    int ref = nt_ref(c->nt, id, "reference");
+    if (ref < 0 || strcmp(nt_type(c->nt, ref) ? nt_type(c->nt, ref) : "", "LocalVariableTargetNode")) continue;
+    const char *nm = nt_str(c->nt, ref, "name");
+    if (!nm) continue;
+    LocalVar *lv = scope_local_intern(comp_scope_of(c, ref), nm);
+    lv->type = TY_EXCEPTION;
+    lv->is_block_param = 1;  /* set externally; don't reset in the fixpoint */
+  }
+
   resolve_parents(c);
   inherit_members(c);
 

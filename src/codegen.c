@@ -62,6 +62,9 @@ static int  g_block_id = -1;
 /* The C expression for `self` (a pointer). Overridden while inlining an
    instance method at a call site (where there is no real `self` param). */
 static const char *g_self = "self";
+/* While emitting a rescue handler: the C var names holding the caught
+   exception's class/message, so a bare `raise` can re-raise. */
+static const char *g_rescue_cls = NULL, *g_rescue_msg = NULL;
 
 static const char *rename_local(const char *nm) {
   for (int i = 0; i < g_nren; i++)
@@ -88,6 +91,7 @@ static const char *c_type_name(TyKind t) {
     case TY_STRING:      return "const char *";
     case TY_SYMBOL:      return "sp_sym";
     case TY_RANGE:       return "sp_Range";
+    case TY_EXCEPTION:   return "sp_Exception *";
     case TY_INT_ARRAY:   return "sp_IntArray *";
     case TY_FLOAT_ARRAY: return "sp_FloatArray *";
     case TY_STR_ARRAY:   return "sp_StrArray *";
@@ -100,7 +104,7 @@ static const char *c_type_name(TyKind t) {
 }
 static int is_scalar_ret(TyKind t) {
   return t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_STRING ||
-         t == TY_SYMBOL || t == TY_RANGE ||
+         t == TY_SYMBOL || t == TY_RANGE || t == TY_EXCEPTION ||
          t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY ||
          ty_is_hash(t) || ty_is_object(t);
 }
@@ -112,6 +116,7 @@ static const char *default_value(TyKind t) {
     case TY_STRING: return "(&(\"\\xff\")[1])";
     case TY_SYMBOL: return "((sp_sym)-1)";
     case TY_RANGE:  return "(sp_Range){0}";
+    case TY_EXCEPTION: return "NULL";
     case TY_INT_ARRAY:
     case TY_FLOAT_ARRAY:
     case TY_STR_ARRAY: return "NULL";
@@ -421,6 +426,33 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
     if (!strcmp(name, "Integer") && ac == 1) { buf_puts(b, "sp_str_to_i_strict("); emit_expr(c, av[0], b); buf_puts(b, ")"); return; }
     if (!strcmp(name, "Float") && ac == 1) { buf_puts(b, "atof("); emit_expr(c, av[0], b); buf_puts(b, ")"); return; }
+  }
+
+  /* raise */
+  if (recv < 0 && !strcmp(name, "raise")) {
+    int args = nt_ref(nt, id, "arguments");
+    int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
+    if (ac == 0) {
+      if (g_rescue_cls) buf_printf(b, "sp_raise_cls(%s, %s)", g_rescue_cls, g_rescue_msg);
+      else buf_puts(b, "sp_raise((&(\"\\xff\")[1]))");
+    } else if (ac == 1 && nt_type(nt, av[0]) && !strcmp(nt_type(nt, av[0]), "ConstantReadNode")) {
+      buf_printf(b, "sp_raise_cls(\"%s\", (&(\"\\xff\")[1]))", nt_str(nt, av[0], "name"));
+    } else if (ac >= 2 && nt_type(nt, av[0]) && !strcmp(nt_type(nt, av[0]), "ConstantReadNode")) {
+      buf_printf(b, "sp_raise_cls(\"%s\", ", nt_str(nt, av[0], "name"));
+      emit_expr(c, av[1], b); buf_puts(b, ")");
+    } else {
+      buf_puts(b, "sp_raise("); emit_expr(c, av[0], b); buf_puts(b, ")");
+    }
+    return;
+  }
+
+  /* exception object methods */
+  if (recv >= 0 && comp_ntype(c, recv) == TY_EXCEPTION) {
+    if (!strcmp(name, "message") || !strcmp(name, "to_s") || !strcmp(name, "to_str") ||
+        !strcmp(name, "inspect") || !strcmp(name, "full_message")) {
+      buf_puts(b, "sp_exc_message("); emit_expr(c, recv, b); buf_puts(b, ")");
+      return;
+    }
   }
 
   if (recv < 0 && comp_method_index(c, name) >= 0) { emit_method_call(c, id, b); return; }
@@ -1903,6 +1935,100 @@ static void emit_return(Compiler *c, int id, Buf *b, int indent) {
 static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent);
 static void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent);
 
+/* A rescue type name that conventionally catches "anything" in tests. */
+static int rescue_is_catchall_name(const char *n) {
+  return n && (!strcmp(n, "StandardError") || !strcmp(n, "Exception") ||
+               !strcmp(n, "RuntimeError"));
+}
+
+/* Emit one rescue clause (and its `subsequent` chain) inside the handler
+   branch. Frame counter `fr` makes the saved cls/msg vars unique. */
+static void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr) {
+  const NodeTable *nt = c->nt;
+  int nexc = 0;
+  const int *exc = nt_arr(nt, id, "exceptions", &nexc);
+  int ref = nt_ref(nt, id, "reference");
+  int stmts = nt_ref(nt, id, "statements");
+  int sub = nt_ref(nt, id, "subsequent");
+
+  int rc = ++g_tmp;
+  emit_indent(b, indent);
+  buf_printf(b, "const char *_rcls_%d = (const char *)sp_last_exc_cls; (void)_rcls_%d;\n", rc, rc);
+  emit_indent(b, indent);
+  buf_printf(b, "const char *_rmsg_%d = sp_exc_msg[sp_exc_top]; (void)_rmsg_%d;\n", rc, rc);
+
+  /* type-match condition: catch-all when no types or a StandardError-ish
+     type; otherwise exact class-name match */
+  int catchall = (nexc == 0);
+  for (int i = 0; i < nexc; i++) {
+    const char *en = nt_type(nt, exc[i]);
+    if (en && !strcmp(en, "ConstantReadNode") && rescue_is_catchall_name(nt_str(nt, exc[i], "name")))
+      catchall = 1;
+  }
+
+  const char *save_cls = g_rescue_cls, *save_msg = g_rescue_msg;
+  static char clsbuf[32], msgbuf[32];
+  snprintf(clsbuf, sizeof clsbuf, "_rcls_%d", rc);
+  snprintf(msgbuf, sizeof msgbuf, "_rmsg_%d", rc);
+
+  if (!catchall) {
+    emit_indent(b, indent);
+    buf_puts(b, "if (");
+    int first = 1;
+    for (int i = 0; i < nexc; i++) {
+      const char *en = nt_type(nt, exc[i]);
+      if (!en || strcmp(en, "ConstantReadNode")) continue;
+      if (!first) buf_puts(b, " || ");
+      first = 0;
+      buf_printf(b, "sp_str_eq(_rcls_%d, \"%s\")", rc, nt_str(nt, exc[i], "name"));
+    }
+    if (first) buf_puts(b, "1");  /* no usable type -> always */
+    buf_puts(b, ") {\n");
+    indent++;
+  }
+
+  g_rescue_cls = clsbuf; g_rescue_msg = msgbuf;
+  if (ref >= 0 && nt_type(nt, ref) && !strcmp(nt_type(nt, ref), "LocalVariableTargetNode")) {
+    emit_indent(b, indent);
+    buf_printf(b, "lv_%s = sp_exc_new(_rcls_%d, _rmsg_%d);\n", nt_str(nt, ref, "name"), rc, rc);
+  }
+  emit_stmts(c, stmts, b, indent);
+  g_rescue_cls = save_cls; g_rescue_msg = save_msg;
+
+  if (!catchall) {
+    indent--;
+    emit_indent(b, indent);
+    buf_puts(b, "}\n");
+    emit_indent(b, indent);
+    buf_puts(b, "else {\n");
+    if (sub >= 0) emit_rescue(c, sub, b, indent + 1, fr);
+    else {
+      emit_indent(b, indent + 1);
+      buf_printf(b, "sp_raise_cls(_rcls_%d, _rmsg_%d);\n", rc, rc);
+    }
+    emit_indent(b, indent);
+    buf_puts(b, "}\n");
+  }
+}
+
+/* begin/body/rescue (ensure/else deferred) via the setjmp exception model. */
+static void emit_begin(Compiler *c, int id, Buf *b, int indent) {
+  const NodeTable *nt = c->nt;
+  int body = nt_ref(nt, id, "statements");
+  int rescue = nt_ref(nt, id, "rescue_clause");
+  int fr = ++g_tmp;
+
+  emit_indent(b, indent); buf_puts(b, "sp_exc_top++;\n");
+  emit_indent(b, indent); buf_puts(b, "if (setjmp(sp_exc_stack[sp_exc_top-1]) == 0) {\n");
+  emit_stmts(c, body, b, indent + 1);
+  emit_indent(b, indent + 1); buf_puts(b, "sp_exc_top--;\n");
+  emit_indent(b, indent); buf_puts(b, "}\n");
+  emit_indent(b, indent); buf_puts(b, "else {\n");
+  emit_indent(b, indent + 1); buf_puts(b, "sp_exc_top--;\n");
+  if (rescue >= 0) emit_rescue(c, rescue, b, indent + 1, fr);
+  emit_indent(b, indent); buf_puts(b, "}\n");
+}
+
 /* Wrap a line-emitting statement so any expression preludes are flushed
    before the line itself. */
 static void emit_with_prelude(Compiler *c, int id, Buf *b, int indent,
@@ -2112,6 +2238,7 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
   if (!strcmp(ty, "WhileNode"))  { emit_while(c, id, b, indent, 0); return; }
   if (!strcmp(ty, "UntilNode"))  { emit_while(c, id, b, indent, 1); return; }
   if (!strcmp(ty, "CaseNode"))   { emit_case(c, id, b, indent); return; }
+  if (!strcmp(ty, "BeginNode"))  { emit_begin(c, id, b, indent); return; }
   if (!strcmp(ty, "ReturnNode")) { emit_return(c, id, b, indent); return; }
   if (!strcmp(ty, "DefNode"))    { return; } /* emitted separately */
 
@@ -2184,58 +2311,60 @@ static void emit_stmts_tail(Compiler *c, int id, Buf *b, int indent) {
 /* ---- declarations ---- */
 
 /* Heap-managed types need a GC root for their local slot. */
-static int needs_root(TyKind t) { return t == TY_STRING || ty_is_array(t) || ty_is_hash(t) || ty_is_object(t); }
+static int needs_root(TyKind t) { return t == TY_STRING || ty_is_array(t) || ty_is_hash(t) || ty_is_object(t) || t == TY_EXCEPTION; }
 
-static void declare_local(Compiler *c, Buf *b, LocalVar *lv) {
-  switch (lv->type) {
-    case TY_INT:    buf_printf(b, "    mrb_int lv_%s = 0;\n", lv->name); break;
-    case TY_FLOAT:  buf_printf(b, "    mrb_float lv_%s = 0.0;\n", lv->name); break;
-    case TY_BOOL:   buf_printf(b, "    mrb_bool lv_%s = 0;\n", lv->name); break;
-    case TY_STRING:
-      buf_printf(b, "    const char * lv_%s = (&(\"\\xff\")[1]);\n", lv->name);
-      buf_printf(b, "    SP_GC_ROOT(lv_%s);\n", lv->name);
-      break;
-    case TY_SYMBOL:
-      buf_printf(b, "    sp_sym lv_%s = ((sp_sym)-1);\n", lv->name);
-      break;
-    case TY_RANGE:
-      buf_printf(b, "    sp_Range lv_%s = {0};\n", lv->name);
-      break;
-    case TY_INT_ARRAY:
-    case TY_FLOAT_ARRAY:
-    case TY_STR_ARRAY:
-      buf_printf(b, "    %s lv_%s = NULL;\n", c_type_name(lv->type), lv->name);
-      buf_printf(b, "    SP_GC_ROOT(lv_%s);\n", lv->name);
-      break;
+/* `vol` makes the local volatile (required for locals live across a setjmp
+   in a begin/rescue). Pointers need the volatile on the pointer itself
+   (T * volatile), value types take a leading qualifier. */
+static void declare_local(Compiler *c, Buf *b, LocalVar *lv, int vol) {
+  TyKind t = lv->type;
+  Buf cty; memset(&cty, 0, sizeof cty);
+  const char *init = "0";
+  int ptr = 0, root = needs_root(t);
+  switch (t) {
+    case TY_INT:    buf_puts(&cty, "mrb_int"); init = "0"; break;
+    case TY_FLOAT:  buf_puts(&cty, "mrb_float"); init = "0.0"; break;
+    case TY_BOOL:   buf_puts(&cty, "mrb_bool"); init = "0"; break;
+    case TY_SYMBOL: buf_puts(&cty, "sp_sym"); init = "((sp_sym)-1)"; break;
+    case TY_RANGE:  buf_puts(&cty, "sp_Range"); init = "{0}"; break;
+    case TY_STRING: buf_puts(&cty, "const char *"); init = "(&(\"\\xff\")[1])"; ptr = 1; break;
     default:
-      if (ty_is_hash(lv->type)) {
-        buf_printf(b, "    %s lv_%s = NULL;\n", c_type_name(lv->type), lv->name);
-        buf_printf(b, "    SP_GC_ROOT(lv_%s);\n", lv->name);
-        break;
+      if (is_scalar_ret(t) && t != TY_UNKNOWN) { emit_ctype(c, t, &cty); init = "NULL"; ptr = 1; }
+      else {
+        fprintf(stderr, "spinelc: local '%s' has unsupported type %s\n", lv->name, ty_name(t));
+        exit(1);
       }
-      if (ty_is_object(lv->type)) {
-        buf_puts(b, "    ");
-        emit_ctype(c, lv->type, b);   /* "sp_<Class> *" */
-        buf_printf(b, " lv_%s = NULL;\n", lv->name);
-        buf_printf(b, "    SP_GC_ROOT(lv_%s);\n", lv->name);
-        break;
-      }
-      fprintf(stderr, "spinelc: local '%s' has unsupported type %s\n",
-              lv->name, ty_name(lv->type));
-      exit(1);
   }
+  buf_puts(b, "    ");
+  if (vol && !ptr) buf_puts(b, "volatile ");
+  buf_puts(b, cty.p ? cty.p : "");
+  if (vol && ptr) buf_puts(b, "volatile ");  /* cty ends with "* "; -> "* volatile " */
+  buf_printf(b, " lv_%s = %s;\n", lv->name, init);
+  if (root) buf_printf(b, "    SP_GC_ROOT(lv_%s);\n", lv->name);
+  free(cty.p);
+}
+
+/* Does scope index `si` contain a begin/rescue (so its locals need volatile)? */
+static int scope_has_begin(Compiler *c, int si) {
+  for (int id = 0; id < c->nt->count; id++) {
+    const char *ty = nt_type(c->nt, id);
+    if (ty && (!strcmp(ty, "BeginNode") || !strcmp(ty, "RescueNode")) && c->nscope[id] == si)
+      return 1;
+  }
+  return 0;
 }
 
 /* Declare a scope's locals. Params are already C function parameters, so
    they only need a GC root; body locals get a full declaration. */
 static void emit_scope_decls(Compiler *c, Scope *s, Buf *b) {
+  int vol = scope_has_begin(c, (int)(s - c->scopes));
   for (int i = 0; i < s->nlocals; i++) {
     LocalVar *lv = &s->locals[i];
     if (lv->is_param) {
       if (needs_root(lv->type)) buf_printf(b, "    SP_GC_ROOT(lv_%s);\n", lv->name);
     }
     else {
-      declare_local(c, b, lv);
+      declare_local(c, b, lv, vol);
     }
   }
 }
