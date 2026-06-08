@@ -259,6 +259,7 @@ static void emit_boxed_text(Compiler *c, TyKind t, const char *expr, Buf *b);
 static void emit_proc_literal(Compiler *c, int create, Buf *b);
 static int proc_slot_is_direct(TyKind t);
 static int proc_slot_is_ptr(TyKind t);
+static void emit_case_expr(Compiler *c, int id, Buf *b);
 
 /* Strip ParenthesesNode wrappers to reach the inner expression. */
 static int unwrap_parens(Compiler *c, int id) {
@@ -2495,6 +2496,7 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     return;
   }
   if (!strcmp(ty, "LambdaNode")) { emit_proc_literal(c, id, b); return; }
+  if (!strcmp(ty, "CaseNode")) { emit_case_expr(c, id, b); return; }
 
   if (!strcmp(ty, "RangeNode")) {
     int left = nt_ref(nt, id, "left");
@@ -3071,6 +3073,64 @@ static void emit_case(Compiler *c, int id, Buf *b, int indent) {
     emit_indent(b, indent);
     buf_puts(b, "}\n");
   }
+}
+
+/* Emit `_crN = <branch's last value>` (boxed to the case's result type when
+   that is poly), after the branch's leading statements. */
+static void emit_case_branch_value(Compiler *c, int stmts, TyKind rt, int cr, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int n = 0;
+  const int *bb = stmts >= 0 ? nt_arr(nt, stmts, "body", &n) : NULL;
+  for (int k = 0; k < n - 1; k++) emit_stmt(c, bb[k], b, 0);
+  buf_printf(b, "_cr%d = ", cr);
+  if (n > 0) { if (rt == TY_POLY) emit_boxed(c, bb[n - 1], b); else emit_expr(c, bb[n - 1], b); }
+  else buf_puts(b, rt == TY_POLY ? "sp_box_nil()" : default_value(rt));
+  buf_puts(b, "; ");
+}
+
+/* `case` in expression position: a GCC statement-expression yielding the
+   matched branch's value (or the result type's nil/default on no match). */
+static void emit_case_expr(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  TyKind rt = comp_ntype(c, id);
+  int pred = nt_ref(nt, id, "predicate");
+  int nw = 0;
+  const int *whens = nt_arr(nt, id, "conditions", &nw);
+  int else_c = nt_ref(nt, id, "else_clause");
+  int cr = ++g_tmp;
+  buf_puts(b, "({ ");
+  emit_ctype(c, rt, b);
+  buf_printf(b, " _cr%d = %s; ", cr, rt == TY_RANGE ? "(sp_Range){0}" : default_value(rt));
+  int t = -1;
+  TyKind pt = TY_UNKNOWN;
+  if (pred >= 0) {
+    pt = comp_ntype(c, pred);
+    t = ++g_tmp;
+    emit_ctype(c, pt, b); buf_printf(b, " _t%d = ", t); emit_expr(c, pred, b); buf_puts(b, "; ");
+  }
+  for (int w = 0; w < nw; w++) {
+    int wn = whens[w];
+    int wc = 0;
+    const int *conds = nt_arr(nt, wn, "conditions", &wc);
+    buf_puts(b, w == 0 ? "if (" : "else if (");
+    for (int j = 0; j < wc; j++) {
+      if (j) buf_puts(b, " || ");
+      if (pred >= 0) {
+        if (pt == TY_STRING) { buf_printf(b, "sp_str_eq(_t%d, ", t); emit_expr(c, conds[j], b); buf_puts(b, ")"); }
+        else { buf_printf(b, "(_t%d == ", t); emit_expr(c, conds[j], b); buf_puts(b, ")"); }
+      }
+      else { buf_puts(b, "("); emit_expr(c, conds[j], b); buf_puts(b, ")"); }
+    }
+    buf_puts(b, ") { ");
+    emit_case_branch_value(c, nt_ref(nt, wn, "statements"), rt, cr, b);
+    buf_puts(b, "} ");
+  }
+  if (else_c >= 0) {
+    buf_puts(b, "else { ");
+    emit_case_branch_value(c, nt_ref(nt, else_c, "statements"), rt, cr, b);
+    buf_puts(b, "} ");
+  }
+  buf_printf(b, "_cr%d; })", cr);
 }
 
 static void emit_while(Compiler *c, int id, Buf *b, int indent, int is_until) {
