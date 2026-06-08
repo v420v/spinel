@@ -171,6 +171,7 @@ static int  emit_output_call(Compiler *c, int id, Buf *b, int indent);
 static int  emit_iteration_stmt(Compiler *c, int id, Buf *b, int indent);
 static int  emit_inline_call(Compiler *c, int id, Buf *b, int indent);
 static int  emit_inline_expr(Compiler *c, int id, Buf *b);
+static void emit_cond(Compiler *c, int id, Buf *b);
 static int  needs_root(TyKind t);
 static void emit_index_op_write(Compiler *c, int id, Buf *b, int indent);
 static void emit_super(Compiler *c, int id, Buf *b);
@@ -1499,6 +1500,34 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     }
     buf_printf(b, "_t%d", t);
     return;
+  }
+  if (!strcmp(ty, "IfNode") || !strcmp(ty, "UnlessNode")) {
+    /* if/unless as a value: a ternary when both branches are single
+       value-expressions */
+    int pred = nt_ref(nt, id, "predicate");
+    int then_b = nt_ref(nt, id, "statements");
+    int sub = nt_ref(nt, id, "subsequent");
+    int is_unless = !strcmp(ty, "UnlessNode");
+    int tn = 0;
+    const int *tb = then_b >= 0 ? nt_arr(nt, then_b, "body", &tn) : NULL;
+    int else_stmts = -1;
+    if (sub >= 0 && nt_type(nt, sub) && !strcmp(nt_type(nt, sub), "ElseNode"))
+      else_stmts = nt_ref(nt, sub, "statements");
+    int en = 0;
+    const int *eb = else_stmts >= 0 ? nt_arr(nt, else_stmts, "body", &en) : NULL;
+    if (tn == 1 && en == 1) {
+      buf_puts(b, "(");
+      if (is_unless) buf_puts(b, "!(");
+      emit_cond(c, pred, b);
+      if (is_unless) buf_puts(b, ")");
+      buf_puts(b, " ? ");
+      emit_expr(c, tb[0], b);
+      buf_puts(b, " : ");
+      emit_expr(c, eb[0], b);
+      buf_puts(b, ")");
+      return;
+    }
+    unsupported(c, id, "if/unless expression");
   }
   if (!strcmp(ty, "CallNode")) { emit_call(c, id, b); return; }
   if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) { emit_super(c, id, b); return; }
