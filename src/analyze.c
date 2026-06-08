@@ -397,6 +397,15 @@ void analyze_program(Compiler *c) {
   walk_scope(c, c->nt->root_id, 0);
   register_locals(c);
 
+  /* intern every symbol literal so codegen can emit the id table */
+  for (int id = 0; id < c->nt->count; id++) {
+    const char *ty = nt_type(c->nt, id);
+    if (ty && !strcmp(ty, "SymbolNode")) {
+      const char *v = nt_str(c->nt, id, "value");
+      if (v) comp_sym_intern(c, v);
+    }
+  }
+
   for (int iter = 0; iter < 128; iter++) {
     int ch = 0;
     ch |= infer_write_types(c);

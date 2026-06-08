@@ -24,9 +24,22 @@ void comp_free(Compiler *c) {
     free(sc->pnames);
   }
   free(c->scopes);
+  for (int i = 0; i < c->nsymbols; i++) free(c->symbols[i]);
+  free(c->symbols);
   free(c->nscope);
   free(c->ntype);
   free(c);
+}
+
+int comp_sym_intern(Compiler *c, const char *name) {
+  for (int i = 0; i < c->nsymbols; i++)
+    if (strcmp(c->symbols[i], name) == 0) return i;
+  if (c->nsymbols >= c->csymbols) {
+    c->csymbols = c->csymbols ? c->csymbols * 2 : 8;
+    c->symbols = realloc(c->symbols, sizeof(char *) * (size_t)c->csymbols);
+  }
+  c->symbols[c->nsymbols] = strdup(name);
+  return c->nsymbols++;
 }
 
 Scope *comp_scope_new(Compiler *c, const char *name, int def_node) {

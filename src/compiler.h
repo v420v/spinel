@@ -40,6 +40,9 @@ typedef struct {
 
   Scope *scopes;    /* scope[0] = top level */
   int nscopes, cscopes;
+
+  char **symbols;   /* interned symbol names; index = sp_sym id */
+  int nsymbols, csymbols;
 } Compiler;
 
 Compiler *comp_new(const NodeTable *nt);
@@ -53,6 +56,9 @@ int    comp_method_index(Compiler *c, const char *name); /* -1 if none */
 /* Locals within a scope. */
 LocalVar *scope_local(Scope *s, const char *name);
 LocalVar *scope_local_intern(Scope *s, const char *name);
+
+/* Symbol intern table. comp_sym_intern returns the symbol's id. */
+int comp_sym_intern(Compiler *c, const char *name);
 
 /* Node type cache. */
 static inline TyKind comp_ntype(const Compiler *c, int id) {

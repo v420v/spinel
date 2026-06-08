@@ -67,6 +67,7 @@ static const char *c_type_name(TyKind t) {
     case TY_FLOAT:       return "mrb_float";
     case TY_BOOL:        return "mrb_bool";
     case TY_STRING:      return "const char *";
+    case TY_SYMBOL:      return "sp_sym";
     case TY_INT_ARRAY:   return "sp_IntArray *";
     case TY_FLOAT_ARRAY: return "sp_FloatArray *";
     case TY_STR_ARRAY:   return "sp_StrArray *";
@@ -75,6 +76,7 @@ static const char *c_type_name(TyKind t) {
 }
 static int is_scalar_ret(TyKind t) {
   return t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_STRING ||
+         t == TY_SYMBOL ||
          t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY;
 }
 static const char *default_value(TyKind t) {
@@ -83,6 +85,7 @@ static const char *default_value(TyKind t) {
     case TY_FLOAT:  return "0.0";
     case TY_BOOL:   return "0";
     case TY_STRING: return "(&(\"\\xff\")[1])";
+    case TY_SYMBOL: return "((sp_sym)-1)";
     case TY_INT_ARRAY:
     case TY_FLOAT_ARRAY:
     case TY_STR_ARRAY: return "NULL";
@@ -242,7 +245,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_puts(b, eq ? ")" : "))");
       return;
     }
-    if (ty_is_numeric(rt) || rt == TY_BOOL) {
+    if (ty_is_numeric(rt) || rt == TY_BOOL || rt == TY_SYMBOL) {
       buf_puts(b, "(");
       emit_expr(c, recv, b);
       buf_printf(b, " %s ", eq ? "==" : "!=");
@@ -285,6 +288,15 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         return;
       }
     }
+  }
+
+  /* symbol receiver methods */
+  if (recv >= 0 && rt == TY_SYMBOL) {
+    if (!strcmp(name, "to_s") || !strcmp(name, "id2name") || !strcmp(name, "name")) {
+      buf_puts(b, "sp_sym_to_s("); emit_expr(c, recv, b); buf_puts(b, ")");
+      return;
+    }
+    if (!strcmp(name, "to_sym")) { emit_expr(c, recv, b); return; }
   }
 
   /* scalar receiver methods: evaluate the receiver once into rs, then
@@ -515,6 +527,9 @@ static void emit_interp(Compiler *c, int id, Buf *b) {
       } else if (t == TY_BOOL) {
         buf_puts(&fmt, "%s"); buf_puts(&argbuf, "(");
         emit_expr(c, expr, &argbuf); buf_puts(&argbuf, " ? \"true\" : \"false\")");
+      } else if (t == TY_SYMBOL) {
+        buf_puts(&fmt, "%s"); buf_puts(&argbuf, "sp_sym_to_s(");
+        emit_expr(c, expr, &argbuf); buf_puts(&argbuf, ")");
       } else {
         free(fmt.p); free(argbuf.p);
         unsupported(c, pid, "interpolation value");
@@ -556,6 +571,11 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
   if (!strcmp(ty, "InterpolatedStringNode")) { emit_interp(c, id, b); return; }
   if (!strcmp(ty, "TrueNode"))  { buf_puts(b, "1"); return; }
   if (!strcmp(ty, "FalseNode")) { buf_puts(b, "0"); return; }
+  if (!strcmp(ty, "SymbolNode")) {
+    int sid = comp_sym_intern(c, nt_str(nt, id, "value"));
+    buf_printf(b, "((sp_sym)%d)", sid);
+    return;
+  }
   if (!strcmp(ty, "LocalVariableReadNode")) { buf_printf(b, "lv_%s", nt_str(nt, id, "name")); return; }
   if (!strcmp(ty, "ParenthesesNode")) {
     int body = nt_ref(nt, id, "body");
@@ -608,6 +628,8 @@ static void emit_puts_one(Compiler *c, int arg, Buf *b, int indent) {
     buf_puts(b, "); if (_ps) { fputs(_ps, stdout); if (!*_ps || _ps[strlen(_ps)-1] != '\\n') putchar('\\n'); } else putchar('\\n'); }\n");
   } else if (t == TY_BOOL) {
     buf_puts(b, "puts(("); emit_expr(c, arg, b); buf_puts(b, ") ? \"true\" : \"false\");\n");
+  } else if (t == TY_SYMBOL) {
+    buf_puts(b, "puts(sp_sym_to_s("); emit_expr(c, arg, b); buf_puts(b, "));\n");
   } else {
     unsupported(c, arg, "puts argument");
   }
@@ -641,6 +663,10 @@ static void emit_p_one(Compiler *c, int arg, Buf *b, int indent) {
     buf_puts(b, "), stdout); putchar('\\n');\n");
   } else if (t == TY_BOOL) {
     buf_puts(b, "puts(("); emit_expr(c, arg, b); buf_puts(b, ") ? \"true\" : \"false\");\n");
+  } else if (t == TY_SYMBOL) {
+    buf_puts(b, "fputs(sp_str_concat(SPL(\":\"), sp_sym_to_s(");
+    emit_expr(c, arg, b);
+    buf_puts(b, ")), stdout); putchar('\\n');\n");
   } else if (ty_is_array(t) && array_kind(t)) {
     buf_printf(b, "fputs(sp_%sArray_inspect(", array_kind(t));
     emit_expr(c, arg, b);
@@ -738,13 +764,17 @@ static void emit_if(Compiler *c, int id, Buf *b, int indent, int is_unless, int 
   if (sub >= 0) {
     const char *sty = nt_type(nt, sub);
     if (sty && !strcmp(sty, "ElseNode")) {
-      buf_puts(b, " else {\n");
+      buf_puts(b, "\n");
+      emit_indent(b, indent);
+      buf_puts(b, "else {\n");
       int s = nt_ref(nt, sub, "statements");
       if (tail) emit_stmts_tail(c, s, b, indent + 1);
       else      emit_stmts(c, s, b, indent + 1);
       emit_indent(b, indent); buf_puts(b, "}\n");
     } else if (sty && !strcmp(sty, "IfNode")) {
-      buf_puts(b, " else {\n");
+      buf_puts(b, "\n");
+      emit_indent(b, indent);
+      buf_puts(b, "else {\n");
       emit_if(c, sub, b, indent + 1, 0, tail);
       emit_indent(b, indent); buf_puts(b, "}\n");
     } else {
@@ -905,6 +935,9 @@ static void declare_local(Buf *b, LocalVar *lv) {
       buf_printf(b, "    const char * lv_%s = (&(\"\\xff\")[1]);\n", lv->name);
       buf_printf(b, "    SP_GC_ROOT(lv_%s);\n", lv->name);
       break;
+    case TY_SYMBOL:
+      buf_printf(b, "    sp_sym lv_%s = ((sp_sym)-1);\n", lv->name);
+      break;
     case TY_INT_ARRAY:
     case TY_FLOAT_ARRAY:
     case TY_STR_ARRAY:
@@ -979,7 +1012,17 @@ char *codegen_program(const NodeTable *nt) {
   Buf b; memset(&b, 0, sizeof b);
   buf_puts(&b, "/* Generated by Spinel AOT compiler */\n");
   buf_puts(&b, "#include \"sp_runtime.h\"\n");
-  buf_puts(&b, "static const char *sp_sym_to_s(sp_sym id){(void)id;return \"\";}\n\n");
+  if (c->nsymbols > 0) {
+    buf_printf(&b, "static const char *const sp_sym_names[%d] = {", c->nsymbols);
+    for (int i = 0; i < c->nsymbols; i++) {
+      if (i) buf_puts(&b, ", ");
+      emit_str_literal(&b, c->symbols[i]);
+    }
+    buf_puts(&b, "};\n");
+    buf_printf(&b, "static const char *sp_sym_to_s(sp_sym id){if(id>=0&&id<%d)return sp_sym_names[id];return \"\";}\n\n", c->nsymbols);
+  } else {
+    buf_puts(&b, "static const char *sp_sym_to_s(sp_sym id){(void)id;return \"\";}\n\n");
+  }
   buf_puts(&b, "static const char *sp_class_to_s(sp_Class c){(void)c;return \"\";}\n\n\n");
 
   /* method prototypes then definitions (scope 0 is top-level) */
