@@ -2730,6 +2730,66 @@ static int emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent) {
     return 0;
   }
 
+  /* in-place string bang methods on an assignable receiver: reassign the
+     receiver to the transformed value (value-semantics mutation, like <<). */
+  if (rt == TY_STRING && argc == 0) {
+    const char *base = NULL;
+    if      (!strcmp(name, "chomp!"))      base = "chomp";
+    else if (!strcmp(name, "chop!"))       base = "chop";
+    else if (!strcmp(name, "upcase!"))     base = "upcase";
+    else if (!strcmp(name, "downcase!"))   base = "downcase";
+    else if (!strcmp(name, "capitalize!")) base = "capitalize";
+    else if (!strcmp(name, "swapcase!"))   base = "swapcase";
+    else if (!strcmp(name, "strip!"))      base = "strip";
+    else if (!strcmp(name, "lstrip!"))     base = "lstrip";
+    else if (!strcmp(name, "rstrip!"))     base = "rstrip";
+    else if (!strcmp(name, "reverse!"))    base = "reverse";
+    else if (!strcmp(name, "squeeze!"))    base = "squeeze";
+    if (base) {
+      const char *rty = nt_type(nt, recv);
+      if (rty && (!strcmp(rty, "LocalVariableReadNode") || !strcmp(rty, "InstanceVariableReadNode") || !strcmp(rty, "SelfNode"))) {
+        emit_indent(b, indent);
+        emit_expr(c, recv, b); buf_printf(b, " = sp_str_%s(", base); emit_expr(c, recv, b); buf_puts(b, ");\n");
+        return 1;
+      }
+    }
+  }
+  /* replace / prepend / clear / delete_prefix!/suffix! via reassignment */
+  if (rt == TY_STRING) {
+    const char *rty = nt_type(nt, recv);
+    int assignable = rty && (!strcmp(rty, "LocalVariableReadNode") || !strcmp(rty, "InstanceVariableReadNode") || !strcmp(rty, "SelfNode"));
+    if (assignable && !strcmp(name, "replace") && argc == 1) {
+      emit_indent(b, indent); emit_expr(c, recv, b); buf_puts(b, " = "); emit_expr(c, argv[0], b); buf_puts(b, ";\n");
+      return 1;
+    }
+    if (assignable && !strcmp(name, "prepend") && argc == 1) {
+      emit_indent(b, indent); emit_expr(c, recv, b); buf_puts(b, " = sp_str_concat("); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, recv, b); buf_puts(b, ");\n");
+      return 1;
+    }
+    if (assignable && !strcmp(name, "clear") && argc == 0) {
+      emit_indent(b, indent); emit_expr(c, recv, b); buf_puts(b, " = (&(\"\\xff\")[1]);\n");
+      return 1;
+    }
+    if (assignable && !strcmp(name, "insert") && argc == 2) {
+      /* insert(i, x): s[0,i] + x + s[i..]. A negative i counts from the end
+         and inserts after that character (i += len + 1). */
+      int ti = ++g_tmp;
+      emit_indent(b, indent);
+      buf_printf(b, "{ mrb_int _t%d = ", ti); emit_expr(c, argv[0], b);
+      buf_printf(b, "; if (_t%d < 0) _t%d += (mrb_int)sp_str_length(", ti, ti); emit_expr(c, recv, b); buf_printf(b, ") + 1; ");
+      emit_expr(c, recv, b); buf_puts(b, " = sp_str_concat(sp_str_concat(sp_str_sub_range(");
+      emit_expr(c, recv, b); buf_printf(b, ", 0, _t%d), ", ti); emit_expr(c, argv[1], b);
+      buf_puts(b, "), sp_str_sub_range("); emit_expr(c, recv, b);
+      buf_printf(b, ", _t%d, (mrb_int)sp_str_length(", ti); emit_expr(c, recv, b); buf_printf(b, "))); }\n");
+      return 1;
+    }
+    if (assignable && (!strcmp(name, "delete_prefix!") || !strcmp(name, "delete_suffix!")) && argc == 1) {
+      const char *base = !strcmp(name, "delete_prefix!") ? "delete_prefix" : "delete_suffix";
+      emit_indent(b, indent); emit_expr(c, recv, b); buf_printf(b, " = sp_str_%s(", base); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ");\n");
+      return 1;
+    }
+  }
+
   if (ty_is_hash(rt)) {
     const char *hn = ty_hash_cname(rt);
     if (hn && !strcmp(name, "[]=") && argc == 2) {
