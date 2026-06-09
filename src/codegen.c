@@ -4060,6 +4060,10 @@ static void emit_case(Compiler *c, int id, Buf *b, int indent) {
           buf_printf(b, "({ sp_Range _t%d = ", tr); emit_expr(c, conds[j], b);
           buf_printf(b, "; sp_range_include(&_t%d, _t%d); })", tr, t);
         }
+        else if (eq_family(pt) && eq_family(comp_ntype(c, conds[j])) && eq_family(pt) != eq_family(comp_ntype(c, conds[j]))) {
+          /* a when value of a different comparable family never matches */
+          buf_puts(b, "0");
+        }
         else if (pt == TY_STRING) {
           buf_printf(b, "sp_str_eq(_t%d, ", t); emit_expr(c, conds[j], b); buf_puts(b, ")");
         }
@@ -4133,6 +4137,10 @@ static void emit_case_expr(Compiler *c, int id, Buf *b) {
           int tr = ++g_tmp;
           buf_printf(b, "({ sp_Range _t%d = ", tr); emit_expr(c, conds[j], b);
           buf_printf(b, "; sp_range_include(&_t%d, _t%d); })", tr, t);
+        }
+        else if (eq_family(pt) && eq_family(comp_ntype(c, conds[j])) && eq_family(pt) != eq_family(comp_ntype(c, conds[j]))) {
+          /* a when value of a different comparable family never matches */
+          buf_puts(b, "0");
         }
         else if (pt == TY_STRING) { buf_printf(b, "sp_str_eq(_t%d, ", t); emit_expr(c, conds[j], b); buf_puts(b, ")"); }
         else { buf_printf(b, "(_t%d == ", t); emit_expr(c, conds[j], b); buf_puts(b, ")"); }
