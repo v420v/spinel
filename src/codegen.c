@@ -6036,6 +6036,45 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     }
     return;
   }
+  if (!strcmp(ty, "ConstantPathOperatorWriteNode")) {
+    int tgt = nt_ref(nt, id, "target");
+    const char *nm = tgt >= 0 ? nt_str(nt, tgt, "name") : NULL;
+    LocalVar *cv = nm ? comp_const(c, nm) : NULL;
+    if (!cv) { unsupported(c, id, "constant path operator write"); return; }
+    const char *op = nt_str(nt, id, "binary_operator");
+    int v = nt_ref(nt, id, "value");
+    emit_indent(b, indent);
+    if (cv->type == TY_STRING && op && !strcmp(op, "+")) {
+      buf_printf(b, "cst_%s = sp_str_concat(cst_%s, ", nm, nm); emit_expr(c, v, b); buf_puts(b, ");\n");
+    }
+    else {
+      buf_printf(b, "cst_%s %s= ", nm, op ? op : "+"); emit_expr(c, v, b); buf_puts(b, ";\n");
+    }
+    return;
+  }
+  if (!strcmp(ty, "ConstantPathOrWriteNode") || !strcmp(ty, "ConstantPathAndWriteNode")) {
+    int is_or = !strcmp(ty, "ConstantPathOrWriteNode");
+    int tgt = nt_ref(nt, id, "target");
+    const char *nm = tgt >= 0 ? nt_str(nt, tgt, "name") : NULL;
+    LocalVar *cv = nm ? comp_const(c, nm) : NULL;
+    if (!cv) { unsupported(c, id, "constant path or/and write"); return; }
+    int v = nt_ref(nt, id, "value");
+    if (cv->type == TY_POLY) {
+      emit_indent(b, indent);
+      buf_printf(b, "if (%ssp_poly_truthy(cst_%s)) cst_%s = ", is_or ? "!" : "", nm, nm);
+      emit_boxed(c, v, b); buf_puts(b, ";\n");
+    }
+    else if (cv->type == TY_BOOL) {
+      emit_indent(b, indent);
+      buf_printf(b, "if (%scst_%s) cst_%s = ", is_or ? "!" : "", nm, nm); emit_expr(c, v, b); buf_puts(b, ";\n");
+    }
+    else if (!is_or) {  /* &&= on an always-truthy constant: always assign */
+      emit_indent(b, indent);
+      buf_printf(b, "cst_%s = ", nm); emit_expr(c, v, b); buf_puts(b, ";\n");
+    }
+    /* ||= on an always-truthy constant: no-op */
+    return;
+  }
   if (!strcmp(ty, "GlobalVariableOperatorWriteNode")) {
     const char *nm = nt_str(nt, id, "name");
     LocalVar *lv = nm ? comp_gvar(c, nm + 1) : NULL;
