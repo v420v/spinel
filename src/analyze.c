@@ -763,6 +763,17 @@ static TyKind infer_call(Compiler *c, int id) {
     if ((!strcmp(name, "<<") || !strcmp(name, "concat") || !strcmp(name, "prepend")) && argc == 1)
       return TY_STRING;
   }
+  /* <int_array>.product(<int_array>)[.to_a].inspect -> a string */
+  if (!strcmp(name, "inspect") && argc == 0 && recv >= 0) {
+    int pr = recv;
+    if (nt_type(nt, pr) && !strcmp(nt_type(nt, pr), "CallNode") &&
+        nt_str(nt, pr, "name") && !strcmp(nt_str(nt, pr, "name"), "to_a"))
+      pr = nt_ref(nt, pr, "receiver");
+    if (pr >= 0 && nt_type(nt, pr) && !strcmp(nt_type(nt, pr), "CallNode") &&
+        nt_str(nt, pr, "name") && !strcmp(nt_str(nt, pr, "name"), "product"))
+      return TY_STRING;
+  }
+
   /* numeric.step(...) without a block materializes the sequence as an array */
   if (recv >= 0 && ty_is_numeric(rt) && !strcmp(name, "step") && nt_ref(nt, id, "block") < 0) {
     int args = nt_ref(nt, id, "arguments");

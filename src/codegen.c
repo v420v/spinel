@@ -778,6 +778,38 @@ static int emit_sum_block_expr(Compiler *c, int id, Buf *b) {
   return 1;
 }
 
+/* int_array.product(int_array)[.to_a].inspect -> the Cartesian product
+   rendered as a nested-array string. The product result has no first-class
+   type, so only this inline inspect chain is supported. Returns 1 if handled. */
+static int emit_product_inspect_expr(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  const char *name = nt_str(nt, id, "name");
+  if (!name || strcmp(name, "inspect")) return 0;
+  int recv = nt_ref(nt, id, "receiver");
+  if (recv < 0) return 0;
+  /* allow an intervening .to_a */
+  if (nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+      nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "to_a"))
+    recv = nt_ref(nt, recv, "receiver");
+  if (recv < 0 || !nt_type(nt, recv) || strcmp(nt_type(nt, recv), "CallNode")) return 0;
+  if (!nt_str(nt, recv, "name") || strcmp(nt_str(nt, recv, "name"), "product")) return 0;
+  int pr = nt_ref(nt, recv, "receiver");
+  int pargs = nt_ref(nt, recv, "arguments");
+  int pac = 0; const int *pav = pargs >= 0 ? nt_arr(nt, pargs, "arguments", &pac) : NULL;
+  if (pr < 0 || pac != 1) return 0;
+  if (comp_ntype(c, pr) != TY_INT_ARRAY) return 0;
+  /* the other operand is an int_array or an empty array literal */
+  TyKind at = comp_ntype(c, pav[0]);
+  int empty_lit = nt_type(nt, pav[0]) && !strcmp(nt_type(nt, pav[0]), "ArrayNode") &&
+                  ({ int en = 0; nt_arr(nt, pav[0], "elements", &en); en == 0; });
+  if (at != TY_INT_ARRAY && !empty_lit) return 0;
+  buf_puts(b, "sp_IntArrayPtrArray_inspect(sp_IntArray_product(");
+  emit_expr(c, pr, b); buf_puts(b, ", ");
+  if (empty_lit) buf_puts(b, "sp_IntArray_new()"); else emit_expr(c, pav[0], b);
+  buf_puts(b, "))");
+  return 1;
+}
+
 /* numeric.step(limit[, step]) without a block, materialized as an int or
    float array (so a following .to_a / .inspect works). Returns 1 if handled. */
 static int emit_step_array_expr(Compiler *c, int id, Buf *b) {
@@ -1405,6 +1437,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (emit_sort_cmp_expr(c, id, b)) return;
   if (emit_minmax_cmp_expr(c, id, b)) return;
   if (emit_step_array_expr(c, id, b)) return;
+  if (emit_product_inspect_expr(c, id, b)) return;
   if (emit_bsearch_expr(c, id, b)) return;
   if (emit_sum_block_expr(c, id, b)) return;
   if (emit_transform_hash_expr(c, id, b)) return;
