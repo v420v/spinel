@@ -732,6 +732,9 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "chr")) return TY_STRING;
     if (!strcmp(name, "[]") && argc == 1) return TY_INT;  /* bit access */
     if (!strcmp(name, "gcd") || !strcmp(name, "lcm") || !strcmp(name, "clamp")) return TY_INT;
+    if (!strcmp(name, "magnitude") && argc == 0) return TY_INT;  /* alias for abs */
+    if ((!strcmp(name, "modulo") || !strcmp(name, "remainder")) && argc == 1) return TY_INT;
+    if (!strcmp(name, "gcdlcm") && argc == 1) return TY_INT_ARRAY;  /* [gcd, lcm] */
     if (!strcmp(name, "digits")) return TY_INT_ARRAY;
     if (!strcmp(name, "to_s") && argc == 1) return TY_STRING;
   }
