@@ -859,8 +859,22 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (recv < 0 && comp_method_index(c, name) < 0) {
     int args = nt_ref(nt, id, "arguments");
     int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
-    if (!strcmp(name, "Integer") && ac == 1) { buf_puts(b, "sp_str_to_i_strict("); emit_expr(c, av[0], b); buf_puts(b, ")"); return; }
-    if (!strcmp(name, "Float") && ac == 1) { buf_puts(b, "atof("); emit_expr(c, av[0], b); buf_puts(b, ")"); return; }
+    if (!strcmp(name, "Integer") && ac == 1) {
+      TyKind at = comp_ntype(c, av[0]);
+      if (at == TY_STRING) { buf_puts(b, "sp_str_to_i_strict("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else if (at == TY_FLOAT) { buf_puts(b, "((mrb_int)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }
+      else if (at == TY_POLY) { buf_puts(b, "sp_poly_to_i("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else { buf_puts(b, "("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      return;
+    }
+    if (!strcmp(name, "Float") && ac == 1) {
+      TyKind at = comp_ntype(c, av[0]);
+      if (at == TY_STRING) { buf_puts(b, "sp_str_to_f_strict("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else if (at == TY_INT) { buf_puts(b, "((mrb_float)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }
+      else if (at == TY_POLY) { buf_puts(b, "sp_poly_to_f("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else { buf_puts(b, "("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      return;
+    }
   }
 
   /* raise */
