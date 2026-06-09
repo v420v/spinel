@@ -1029,6 +1029,22 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     }
   }
 
+  /* freeze / frozen? on an array set/read the struct's frozen flag */
+  if (recv >= 0 && argc == 0 && comp_ntype(c, recv) != TY_POLY) {
+    TyKind crt = comp_ntype(c, recv);
+    const char *ck = (crt == TY_POLY_ARRAY) ? "Poly" : array_kind(crt);
+    if (ck && !strcmp(name, "freeze")) {
+      int t = ++g_tmp;
+      buf_printf(b, "({ sp_%sArray *_t%d = ", ck, t); emit_expr(c, recv, b);
+      buf_printf(b, "; if (_t%d) _t%d->frozen = 1; _t%d; })", t, t, t);
+      return;
+    }
+    if (ck && !strcmp(name, "frozen?")) {
+      buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, ")->frozen != 0)");
+      return;
+    }
+  }
+
   /* identity methods -> the receiver itself */
   if (recv >= 0 &&
       (!strcmp(name, "freeze") || !strcmp(name, "itself") ||
@@ -2554,10 +2570,47 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "; if (_t%d) _t%d->len = 0; _t%d; })", t, t, t);
         return;
       }
-      if ((!strcmp(name, "shift") || !strcmp(name, "pop")) && argc == 0 &&
-          (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY)) {
+      if (((!strcmp(name, "shift") && (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY)) ||
+           (!strcmp(name, "pop") && (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY || rt == TY_STR_ARRAY))) &&
+          argc == 0) {
         /* remove and return first/last element (nil sentinel when empty) */
         buf_printf(b, "sp_%sArray_%s(", k, name); emit_expr(c, recv, b); buf_puts(b, ")");
+        return;
+      }
+      /* in-place mutators that return self (raise FrozenError when frozen) */
+      {
+        const char *base = NULL;
+        if      (!strcmp(name, "reverse!")) base = "reverse_bang";
+        else if (!strcmp(name, "sort!"))    base = "sort_bang";
+        else if (!strcmp(name, "shuffle!")) base = "shuffle_bang";
+        if (base && argc == 0) {
+          int t = ++g_tmp;
+          buf_printf(b, "({ sp_%sArray *_t%d = ", k, t); emit_expr(c, recv, b);
+          buf_printf(b, "; sp_%sArray_%s(_t%d); _t%d; })", k, base, t, t);
+          return;
+        }
+      }
+      if (!strcmp(name, "rotate!") && argc <= 1) {
+        int t = ++g_tmp;
+        buf_printf(b, "({ sp_%sArray *_t%d = ", k, t); emit_expr(c, recv, b);
+        buf_printf(b, "; sp_%sArray_rotate_bang(_t%d, ", k, t);
+        if (argc == 1) emit_expr(c, argv[0], b); else buf_puts(b, "1");
+        buf_printf(b, "); _t%d; })", t);
+        return;
+      }
+      if (!strcmp(name, "insert") && argc == 2 && (rt == TY_INT_ARRAY || rt == TY_STR_ARRAY)) {
+        int t = ++g_tmp;
+        buf_printf(b, "({ sp_%sArray *_t%d = ", k, t); emit_expr(c, recv, b);
+        buf_printf(b, "; sp_%sArray_insert(_t%d, ", k, t); emit_expr(c, argv[0], b);
+        buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_printf(b, "); _t%d; })", t);
+        return;
+      }
+      if (!strcmp(name, "delete_at") && argc == 1) {
+        buf_printf(b, "sp_%sArray_delete_at(", k); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        return;
+      }
+      if (!strcmp(name, "delete") && argc == 1 && (rt == TY_INT_ARRAY || rt == TY_STR_ARRAY)) {
+        buf_printf(b, "sp_%sArray_delete(", k); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
         return;
       }
       if ((!strcmp(name, "all?") || !strcmp(name, "any?") ||
