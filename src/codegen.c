@@ -4669,6 +4669,41 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     if (nm && !strcmp(nm, "RUBY_DESCRIPTION")) { buf_puts(b, "SPL(\"spinel\")"); return; }
     unsupported(c, id, "constant read");
   }
+  if (!strcmp(ty, "DefinedNode")) {
+    /* compile-time defined? -> a label string, or nil (NULL) when undefined */
+    int v = nt_ref(nt, id, "value");
+    const char *vt = v >= 0 ? nt_type(nt, v) : NULL;
+    const char *res = NULL;
+    if (vt) {
+      if (!strcmp(vt, "LocalVariableReadNode")) res = "local-variable";
+      else if (!strcmp(vt, "InstanceVariableReadNode")) res = "instance-variable";
+      else if (!strcmp(vt, "ClassVariableReadNode")) res = "class variable";
+      else if (!strcmp(vt, "SelfNode")) res = "self";
+      else if (!strcmp(vt, "TrueNode") || !strcmp(vt, "FalseNode") || !strcmp(vt, "NilNode")) res = "expression";
+      else if (!strcmp(vt, "IntegerNode") || !strcmp(vt, "FloatNode") ||
+               !strcmp(vt, "StringNode") || !strcmp(vt, "SymbolNode") || !strcmp(vt, "ArrayNode")) res = "expression";
+      else if (!strcmp(vt, "GlobalVariableReadNode")) {
+        const char *gn = nt_str(nt, v, "name");
+        for (int kk = 0; kk < nt->count && !res; kk++) {
+          const char *kt = nt_type(nt, kk);
+          if (kt && (!strcmp(kt, "GlobalVariableWriteNode") || !strcmp(kt, "GlobalVariableOperatorWriteNode")) &&
+              gn && nt_str(nt, kk, "name") && !strcmp(nt_str(nt, kk, "name"), gn))
+            res = "global-variable";
+        }
+      }
+      else if (!strcmp(vt, "ConstantReadNode")) {
+        const char *cn = nt_str(nt, v, "name");
+        if (cn && comp_const(c, cn)) res = "constant";
+      }
+      else if (!strcmp(vt, "CallNode") && nt_ref(nt, v, "receiver") < 0) {
+        const char *cn = nt_str(nt, v, "name");
+        if (cn && comp_method_index(c, cn) >= 0) res = "method";
+      }
+    }
+    if (res) buf_printf(b, "SPL(\"%s\")", res);
+    else buf_puts(b, "NULL");
+    return;
+  }
   if (!strcmp(ty, "ParenthesesNode")) {
     int body = nt_ref(nt, id, "body");
     int n = 0;
