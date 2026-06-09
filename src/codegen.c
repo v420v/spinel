@@ -1554,8 +1554,18 @@ static void emit_arg_or_default(Compiler *c, Scope *m, int idx, int provided, Bu
     else buf_puts(out, pt == TY_RANGE ? "(sp_Range){0}" : default_value(pt));
   }
   else if (pt == TY_POLY) emit_boxed(c, dv, out);
-  else
-    emit_expr(c, dv, out);
+  else {
+    /* Default empty `[]` literal: emit the correct array constructor for
+       the parameter type rather than always sp_IntArray_new(). */
+    int den = 0;
+    int is_empty_arr_dv = dty && !strcmp(dty, "ArrayNode") &&
+                          (nt_arr(c->nt, dv, "elements", &den), den == 0);
+    if (is_empty_arr_dv && ty_is_array(pt) && pt != TY_INT_ARRAY) {
+      if (pt == TY_POLY_ARRAY) buf_puts(out, "sp_PolyArray_new()");
+      else { const char *k = array_kind(pt); if (k) buf_printf(out, "sp_%sArray_new()", k); else emit_expr(c, dv, out); }
+    }
+    else emit_expr(c, dv, out);
+  }
 }
 
 /* Emit a comma-separated argument list filling defaults for omitted
