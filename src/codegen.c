@@ -2396,7 +2396,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (rt == TY_STRING) {
       /* string methods taking a regex-literal argument route to the engine */
       if ((!strcmp(name, "gsub") || !strcmp(name, "sub")) && argc == 2 && re_lit_index(c, argv[0]) >= 0) {
-        buf_printf(b, "sp_re_%s(sp_re_pat_%d, %s, ", name, re_lit_index(c, argv[0]), r);
+        const char *suf = comp_ntype(c, argv[1]) == TY_STR_STR_HASH ? "_str_str_hash" : "";
+        buf_printf(b, "sp_re_%s%s(sp_re_pat_%d, %s, ", name, suf, re_lit_index(c, argv[0]), r);
         emit_expr(c, argv[1], b); buf_puts(b, ")");
       }
       else if (!strcmp(name, "split") && argc == 1 && re_lit_index(c, argv[0]) >= 0) {
@@ -2514,6 +2515,9 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else if (!strcmp(name, "to_f") && argc == 0)    buf_printf(b, "atof(%s)", r);
       else if (!strcmp(name, "gsub") && argc == 2) {
         buf_printf(b, "sp_str_gsub(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
+      }
+      else if (!strcmp(name, "sub") && argc == 2 && comp_ntype(c, argv[1]) == TY_STR_STR_HASH) {
+        buf_printf(b, "sp_str_sub_str_str_hash(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
       }
       else if (!strcmp(name, "sub") && argc == 2) {
         buf_printf(b, "sp_str_sub(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
