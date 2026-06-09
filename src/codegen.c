@@ -384,6 +384,7 @@ static void emit_hash_key(Compiler *c, int key, TyKind kt, Buf *b) {
   emit_expr(c, key, b);
 }
 static void emit_super(Compiler *c, int id, Buf *b);
+static int  emit_super_inline(Compiler *c, int id, Buf *b, int indent, int as_expr);
 static void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const char *lead, Buf *out);
 static void emit_boxed(Compiler *c, int node, Buf *b);
 /* Emit a hash key, unboxing a poly value to the typed-hash's key type. */
@@ -3347,10 +3348,24 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       for (int k = 0; k < c->nclasses; k++) {
         int defcls = -1;
         int mi = comp_method_in_chain(c, k, name, &defcls);
-        if (mi >= 0) {
-          char call[600];
-          snprintf(call, sizeof call, "sp_%s_%s((sp_%s *)_t%d.v.p)",
-                   c->classes[defcls].name, mc(c->scopes[mi].name), c->classes[defcls].name, tv);
+        if (mi >= 0 && c->scopes[mi].nrequired == 0) {
+          /* Build the call; append default values for any optional params
+             not provided by the (zero-arg) call site. */
+          Buf cb; memset(&cb, 0, sizeof cb);
+          buf_printf(&cb, "sp_%s_%s((sp_%s *)_t%d.v.p",
+                     c->classes[defcls].name, mc(c->scopes[mi].name), c->classes[defcls].name, tv);
+          if (c->scopes[mi].nparams > 0) {
+            const char *saved_self = g_self;
+            static char selfpbuf[64];
+            snprintf(selfpbuf, sizeof selfpbuf, "(sp_%s *)_t%d.v.p", c->classes[defcls].name, tv);
+            g_self = selfpbuf;
+            for (int a = 0; a < c->scopes[mi].nparams; a++) {
+              buf_puts(&cb, ", "); emit_arg_or_default(c, &c->scopes[mi], a, -1, &cb);
+            }
+            g_self = saved_self;
+          }
+          buf_puts(&cb, ")");
+          const char *call = cb.p ? cb.p : "";
           buf_printf(b, " case %d: ", k);
           if (method_is_void(&c->scopes[mi])) buf_puts(b, call);  /* void: no usable value */
           else {
@@ -3359,6 +3374,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
             else buf_puts(b, call);
           }
           buf_puts(b, "; break;");
+          free(cb.p);
           continue;
         }
         int rdcls = -1;
@@ -3395,7 +3411,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     int ncand = 0;
     for (int k = 0; k < c->nclasses; k++) {
       int mi = comp_method_in_chain(c, k, name, NULL);
-      if (mi >= 0 && c->scopes[mi].nparams == argc) ncand++;
+      /* Include if call supplies all required params (pad defaults / truncate extras) */
+      if (mi >= 0 && argc >= c->scopes[mi].nrequired) ncand++;
     }
     if (ncand > 0 || is_index) {
       TyKind ret = comp_ntype(c, id);
@@ -3413,21 +3430,34 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       for (int k = 0; k < c->nclasses; k++) {
         int defcls = -1;
         int mi = comp_method_in_chain(c, k, name, &defcls);
-        if (mi < 0 || c->scopes[mi].nparams != argc) continue;
+        if (mi < 0 || argc < c->scopes[mi].nrequired) continue;
         TyKind mret = c->scopes[mi].ret;
+        int mnp = c->scopes[mi].nparams;
         Buf cb; memset(&cb, 0, sizeof cb);
         buf_printf(&cb, "sp_%s_%s((sp_%s *)_t%d.v.p", c->classes[defcls].name,
                    mc(c->scopes[mi].name), c->classes[defcls].name, tv);
-        for (int a = 0; a < argc; a++) {
-          /* box the call-site arg if this candidate's parameter is poly */
+        const char *saved_self = g_self;
+        static char selfpbuf2[64];
+        snprintf(selfpbuf2, sizeof selfpbuf2, "(sp_%s *)_t%d.v.p", c->classes[defcls].name, tv);
+        for (int a = 0; a < mnp; a++) {
+          /* box the call-site arg if this candidate's parameter is poly;
+             emit default for args beyond the call-site count (padding) */
           TyKind pt = TY_UNKNOWN;
-          if (a < c->scopes[mi].nparams) { LocalVar *pv = scope_local(&c->scopes[mi], c->scopes[mi].pnames[a]); if (pv) pt = pv->type; }
-          TyKind at = infer_type(c, argv[a]);
+          LocalVar *pv = scope_local(&c->scopes[mi], c->scopes[mi].pnames[a]);
+          if (pv) pt = pv->type;
           buf_puts(&cb, ", ");
-          char tn[32]; snprintf(tn, sizeof tn, "_t%d", atmp[a]);
-          if (pt == TY_POLY && at != TY_POLY) emit_boxed_text(c, at, tn, &cb);
-          else buf_puts(&cb, tn);
+          if (a < argc) {
+            TyKind at = infer_type(c, argv[a]);
+            char tn[32]; snprintf(tn, sizeof tn, "_t%d", atmp[a]);
+            if (pt == TY_POLY && at != TY_POLY) emit_boxed_text(c, at, tn, &cb);
+            else buf_puts(&cb, tn);
+          } else {
+            g_self = selfpbuf2;
+            emit_arg_or_default(c, &c->scopes[mi], a, -1, &cb);
+            g_self = saved_self;
+          }
         }
+        g_self = saved_self;
         buf_puts(&cb, ")");
         buf_printf(b, " case %d: ", k);
         if (mret == TY_VOID || mret == TY_NIL || method_is_void(&c->scopes[mi])) buf_puts(b, cb.p);  /* no usable value */
@@ -3635,19 +3665,30 @@ static void emit_call(Compiler *c, int id, Buf *b) {
           int th = ++g_tmp, tk = ++g_tmp;
           buf_printf(b, "({ %s _t%d = ", c_type_name(rt), th); emit_expr(c, recv, b);
           buf_printf(b, "; %s _t%d = ", c_type_name(ty_hash_key(rt)), tk); emit_hash_key(c, argv[0], ty_hash_key(rt), b);
-          buf_printf(b, "; sp_%sHash_has_key(_t%d, _t%d) ? sp_%sHash_get(_t%d, _t%d) : ", hn, th, tk, hn, th, tk);
           int bbody = nt_ref(nt, blk, "body");
           int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
           int bval = bn > 0 ? bb[bn - 1] : -1;
-          buf_puts(b, "({ ");
+          TyKind bvt = bval >= 0 ? comp_ntype(c, bval) : vt;
+          /* When the block's return type differs from the hash value type,
+             box both arms so the ternary produces a consistent sp_RbVal. */
+          int mismatch = vt != TY_POLY && bvt != vt;
+          if (mismatch) {
+            buf_printf(b, "; sp_%sHash_has_key(_t%d, _t%d) ? ", hn, th, tk);
+            char getexpr[128]; snprintf(getexpr, sizeof getexpr, "sp_%sHash_get(_t%d, _t%d)", hn, th, tk);
+            emit_boxed_text(c, vt, getexpr, b);
+            buf_puts(b, " : ({ ");
+          } else {
+            buf_printf(b, "; sp_%sHash_has_key(_t%d, _t%d) ? sp_%sHash_get(_t%d, _t%d) : ({ ",
+                       hn, th, tk, hn, th, tk);
+          }
           const char *fp0 = block_param_name(c, blk, 0);  /* fetch yields the key */
           if (fp0) { buf_printf(b, "lv_%s = _t%d; ", rename_local(fp0), tk); }
           for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], b, 0);  /* leading stmts */
           if (bval >= 0) {
-            if (vt == TY_POLY && comp_ntype(c, bval) != TY_POLY) emit_boxed(c, bval, b);
+            if ((vt == TY_POLY || mismatch) && bvt != TY_POLY) emit_boxed(c, bval, b);
             else emit_expr(c, bval, b);
           }
-          else buf_puts(b, vt == TY_POLY ? "sp_box_nil()" : default_value(vt));
+          else buf_puts(b, (vt == TY_POLY || mismatch) ? "sp_box_nil()" : default_value(vt));
           buf_printf(b, "; }); })");
           return;
         }
@@ -3878,7 +3919,15 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       }
       if ((!strcmp(name, "[]") || !strcmp(name, "at")) && argc == 1) {
         buf_printf(b, "sp_%sArray_get(", k);
-        emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
+        emit_expr(c, recv, b); buf_puts(b, ", ");
+        if (infer_type(c, argv[0]) == TY_POLY) {
+          int t = ++g_tmp;
+          buf_printf(b, "({ sp_RbVal _t%d = ", t);
+          emit_expr(c, argv[0], b);
+          buf_printf(b, "; _t%d.v.i; })", t);
+        } else {
+          emit_expr(c, argv[0], b);
+        }
         buf_puts(b, ")");
         return;
       }
@@ -6152,7 +6201,10 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     unsupported(c, id, "if/unless expression");
   }
   if (!strcmp(ty, "CallNode")) { emit_call(c, id, b); return; }
-  if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) { emit_super(c, id, b); return; }
+  if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) {
+    if (!emit_super_inline(c, id, b, 0, 1)) emit_super(c, id, b);
+    return;
+  }
   if (!strcmp(ty, "AndNode") || !strcmp(ty, "OrNode")) {
     int is_and = !strcmp(ty, "AndNode");
     int left = nt_ref(nt, id, "left"), right = nt_ref(nt, id, "right");
@@ -7609,7 +7661,10 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     return;
   }
   if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) {
-    emit_indent(b, indent); emit_super(c, id, b); buf_puts(b, ";\n"); return;
+    if (!emit_super_inline(c, id, b, indent, 0)) {
+      emit_indent(b, indent); emit_super(c, id, b); buf_puts(b, ";\n");
+    }
+    return;
   }
   if (!strcmp(ty, "IndexOperatorWriteNode")) { emit_index_op_write(c, id, b, indent); return; }
   if (!strcmp(ty, "IfNode"))     { emit_if(c, id, b, indent, 0, 0); return; }
@@ -8340,6 +8395,97 @@ static void emit_class_new(Compiler *c, ClassInfo *ci, Buf *b) {
     buf_puts(b, ");\n");
   }
   buf_puts(b, "  return self;\n}\n");
+}
+
+/* Inline super { block } when the parent method uses yield.
+   Returns 1 if the expansion was emitted, 0 if it should fall through to a
+   regular function call (parent doesn't yield, has early return, etc.). */
+static int emit_super_inline(Compiler *c, int id, Buf *b, int indent, int as_expr) {
+  Scope *s = comp_scope_of(c, id);
+  if (s->class_id < 0 || !s->name) return 0;
+  int p = c->classes[s->class_id].parent;
+  int defcls = -1;
+  int mi = p >= 0 ? comp_method_in_chain(c, p, s->name, &defcls) : -1;
+  if (mi < 0) return 0;
+  Scope *m = &c->scopes[mi];
+  if (!m->yields || scope_has_return(c, mi)) return 0;
+  int block = nt_ref(c->nt, id, "block");
+  if (block < 0) return 0;
+  if (g_nren + m->nlocals >= MAX_RENAME) return 0;
+  for (int i = 0; i < m->nlocals; i++) {
+    LocalVar *lv = &m->locals[i];
+    if (m->blk_param && lv->name && !strcmp(lv->name, m->blk_param)) continue;
+    if (!is_scalar_ret(lv->type)) return 0;
+  }
+
+  int tag = ++g_tmp;
+  int saved_nren = g_nren, saved_block = g_block_id;
+  const char *saved_bpn = g_block_param_name;
+  int saved_yfb = g_yield_block_fallback;
+
+  g_yield_block_fallback = saved_block;
+  g_block_id = block;
+  g_block_param_name = m->blk_param;
+
+  if (as_expr) buf_puts(b, "({\n");
+  else { emit_indent(b, indent); buf_puts(b, "{\n"); }
+  int din = indent + 1;
+
+  for (int i = 0; i < m->nlocals; i++) {
+    LocalVar *lv = &m->locals[i];
+    if (m->blk_param && lv->name && !strcmp(lv->name, m->blk_param)) continue;
+    snprintf(g_ren_from[g_nren], sizeof g_ren_from[0], "%s", lv->name);
+    snprintf(g_ren_to[g_nren], sizeof g_ren_to[0], "_y%d_%s", tag, lv->name);
+    const char *rn = g_ren_to[g_nren];
+    g_nren++;
+    emit_indent(b, din);
+    emit_ctype(c, lv->type, b);
+    buf_printf(b, " lv_%s = %s;\n", rn, lv->type == TY_RANGE ? "(sp_Range){0}" : default_value(lv->type));
+    if (needs_root(lv->type)) { emit_indent(b, din); buf_printf(b, "SP_GC_ROOT(lv_%s);\n", rn); }
+  }
+
+  const char *ty = nt_type(c->nt, id);
+  int is_forwarding = ty && !strcmp(ty, "ForwardingSuperNode");
+  int args = nt_ref(c->nt, id, "arguments");
+  int argc = 0;
+  const int *argv = args >= 0 ? nt_arr(c->nt, args, "arguments", &argc) : NULL;
+  for (int i = 0; i < m->nparams; i++) {
+    emit_indent(b, din);
+    buf_printf(b, "lv__y%d_%s = ", tag, m->pnames[i]);
+    int sv = g_nren; g_nren = saved_nren;
+    if (is_forwarding) {
+      if (i < s->nparams) buf_printf(b, "lv_%s", rename_local(s->pnames[i]));
+      else { g_nren = sv; emit_arg_or_default(c, m, i, -1, b); sv = g_nren; }
+    }
+    else {
+      emit_arg_or_default(c, m, i, i < argc ? argv[i] : -1, b);
+    }
+    g_nren = sv;
+    buf_puts(b, ";\n");
+  }
+
+  if (as_expr) {
+    TyKind rt = comp_ntype(c, id);
+    int rtag = ++g_tmp;
+    char rvbuf[32]; snprintf(rvbuf, sizeof rvbuf, "_t%d", rtag);
+    emit_indent(b, din); emit_ctype(c, rt, b);
+    buf_printf(b, " _t%d = %s;\n", rtag, default_value(rt));
+    const char *sv_rv = g_result_var; g_result_var = rvbuf;
+    int sp = g_result_poly; g_result_poly = (rt == TY_POLY);
+    emit_stmts_tail(c, m->body, b, din);
+    g_result_var = sv_rv; g_result_poly = sp;
+    emit_indent(b, din); buf_printf(b, "_t%d;\n", rtag);
+  }
+  else emit_stmts(c, m->body, b, din);
+
+  if (as_expr) { emit_indent(b, indent); buf_puts(b, "})"); }
+  else { emit_indent(b, indent); buf_puts(b, "}\n"); }
+
+  g_nren = saved_nren;
+  g_block_id = saved_block;
+  g_block_param_name = saved_bpn;
+  g_yield_block_fallback = saved_yfb;
+  return 1;
 }
 
 /* super(args) / super -> call the parent's same-named method. */

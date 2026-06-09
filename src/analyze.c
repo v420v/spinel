@@ -732,7 +732,17 @@ static TyKind infer_call(Compiler *c, int id) {
   if (recv >= 0 && ty_is_hash(rt)) {
     if (!strcmp(name, "[]"))     return ty_hash_val(rt);
     if (!strcmp(name, "[]="))    return ty_hash_val(rt);
-    if (!strcmp(name, "fetch"))  return ty_hash_val(rt);
+    if (!strcmp(name, "fetch")) {
+      TyKind vt = ty_hash_val(rt);
+      int blk = nt_ref(nt, id, "block");
+      if (blk >= 0) {
+        int bbody = nt_ref(nt, blk, "body");
+        int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
+        TyKind bvt = bn > 0 ? infer_type(c, bb[bn - 1]) : vt;
+        if (bvt != vt) return TY_POLY;
+      }
+      return vt;
+    }
     if (!strcmp(name, "delete")) return ty_hash_val(rt);
     if (!strcmp(name, "length") || !strcmp(name, "size") ||
         !strcmp(name, "count")) return TY_INT;
