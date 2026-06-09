@@ -3857,22 +3857,48 @@ static int emit_iteration_stmt(Compiler *c, int id, Buf *b, int indent) {
     return 1;
   }
 
-  /* int.step(limit[, step]) { [|i|] ... } -- integer stepping loop */
-  if (!strcmp(name, "step") && rt == TY_INT) {
+  /* num.step(limit[, step]) { [|i|] ... } -- stepping loop. A float receiver
+     or a float limit/step makes it a float walk (yielding floats), computed
+     by iteration count to avoid floating-point drift (CRuby semantics). */
+  if (!strcmp(name, "step") && (rt == TY_INT || rt == TY_FLOAT)) {
     int args = nt_ref(nt, id, "arguments");
     int sargc = 0;
     const int *sargv = args >= 0 ? nt_arr(nt, args, "arguments", &sargc) : NULL;
     if (sargc < 1) return 0;
-    int t = ++g_tmp, tl = ++g_tmp, ts = ++g_tmp;
-    emit_indent(b, indent); buf_printf(b, "mrb_int _t%d = ", tl); emit_expr(c, sargv[0], b); buf_puts(b, ";\n");
-    emit_indent(b, indent); buf_printf(b, "mrb_int _t%d = ", ts);
-    if (sargc >= 2) emit_expr(c, sargv[1], b); else buf_puts(b, "1");
+    int is_float = (rt == TY_FLOAT) || comp_ntype(c, sargv[0]) == TY_FLOAT ||
+                   (sargc >= 2 && comp_ntype(c, sargv[1]) == TY_FLOAT);
+    if (!is_float) {
+      int t = ++g_tmp, tl = ++g_tmp, ts = ++g_tmp;
+      emit_indent(b, indent); buf_printf(b, "mrb_int _t%d = ", tl); emit_expr(c, sargv[0], b); buf_puts(b, ";\n");
+      emit_indent(b, indent); buf_printf(b, "mrb_int _t%d = ", ts);
+      if (sargc >= 2) emit_expr(c, sargv[1], b); else buf_puts(b, "1");
+      buf_puts(b, ";\n");
+      emit_indent(b, indent);
+      buf_printf(b, "for (mrb_int _t%d = ", t); emit_expr(c, recv, b);
+      buf_printf(b, "; _t%d >= 0 ? _t%d <= _t%d : _t%d >= _t%d; _t%d += _t%d) {\n",
+                 ts, t, tl, t, tl, t, ts);
+      if (p0) { emit_indent(b, indent + 1); buf_printf(b, "lv_%s = _t%d;\n", p0, t); }
+      emit_stmts(c, body, b, indent + 1);
+      emit_indent(b, indent); buf_puts(b, "}\n");
+      return 1;
+    }
+    int tb = ++g_tmp, tl = ++g_tmp, ts = ++g_tmp, tn = ++g_tmp, ti = ++g_tmp;
+    emit_indent(b, indent); buf_printf(b, "mrb_float _t%d = ", tb); emit_expr(c, recv, b); buf_puts(b, ";\n");
+    emit_indent(b, indent); buf_printf(b, "mrb_float _t%d = ", tl); emit_expr(c, sargv[0], b); buf_puts(b, ";\n");
+    emit_indent(b, indent); buf_printf(b, "mrb_float _t%d = ", ts);
+    if (sargc >= 2) emit_expr(c, sargv[1], b); else buf_puts(b, "1.0");
     buf_puts(b, ";\n");
+    /* n = floor((limit-begin)/step + err); err bounds fp drift (CRuby) */
     emit_indent(b, indent);
-    buf_printf(b, "for (mrb_int _t%d = ", t); emit_expr(c, recv, b);
-    buf_printf(b, "; _t%d >= 0 ? _t%d <= _t%d : _t%d >= _t%d; _t%d += _t%d) {\n",
-               ts, t, tl, t, tl, t, ts);
-    if (p0) { emit_indent(b, indent + 1); buf_printf(b, "lv_%s = _t%d;\n", p0, t); }
+    buf_printf(b, "mrb_float _t%d_e = (fabs(_t%d)+fabs(_t%d)+fabs(_t%d-_t%d))/fabs(_t%d)*DBL_EPSILON;\n",
+               tn, tb, tl, tl, tb, ts);
+    emit_indent(b, indent);
+    buf_printf(b, "if (_t%d_e > 0.5) _t%d_e = 0.5;\n", tn, tn);
+    emit_indent(b, indent);
+    buf_printf(b, "mrb_int _t%d = (mrb_int)floor((_t%d-_t%d)/_t%d + _t%d_e);\n", tn, tl, tb, ts, tn);
+    emit_indent(b, indent);
+    buf_printf(b, "for (mrb_int _t%d = 0; _t%d <= _t%d; _t%d++) {\n", ti, ti, tn, ti);
+    if (p0) { emit_indent(b, indent + 1); buf_printf(b, "lv_%s = _t%d + _t%d * _t%d;\n", p0, tb, ti, ts); }
     emit_stmts(c, body, b, indent + 1);
     emit_indent(b, indent); buf_puts(b, "}\n");
     return 1;

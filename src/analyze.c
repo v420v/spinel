@@ -1948,8 +1948,16 @@ static int infer_block_params(Compiler *c) {
     if (!p0) continue;
 
     TyKind pt = TY_UNKNOWN;
-    if ((!strcmp(name, "times") || !strcmp(name, "upto") ||
-         !strcmp(name, "downto") || !strcmp(name, "step")) && rt == TY_INT)
+    if (!strcmp(name, "step") && (rt == TY_INT || rt == TY_FLOAT)) {
+      /* a float receiver or float limit/step yields floats */
+      int args = nt_ref(nt, id, "arguments");
+      int sc = 0; const int *sv = args >= 0 ? nt_arr(nt, args, "arguments", &sc) : NULL;
+      int isf = (rt == TY_FLOAT) || (sc >= 1 && infer_type(c, sv[0]) == TY_FLOAT) ||
+                (sc >= 2 && infer_type(c, sv[1]) == TY_FLOAT);
+      pt = isf ? TY_FLOAT : TY_INT;
+    }
+    else if ((!strcmp(name, "times") || !strcmp(name, "upto") ||
+         !strcmp(name, "downto")) && rt == TY_INT)
       pt = TY_INT;
     else if (rt == TY_STRING && (!strcmp(name, "each_char") || !strcmp(name, "each_line") || !strcmp(name, "upto")))
       pt = TY_STRING;
