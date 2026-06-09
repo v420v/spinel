@@ -3452,7 +3452,11 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
   if (!strcmp(ty, "SelfNode")) { buf_puts(b, g_self); return; }  /* self is the object reference (pointer) */
   if (!strcmp(ty, "InstanceVariableReadNode")) {
     const char *nm = nt_str(nt, id, "name");  /* "@x" */
-    buf_printf(b, "%s->iv_%s", g_self, nm + 1);
+    Scope *cs = comp_scope_of(c, id);
+    if (cs && cs->is_cmethod && cs->class_id >= 0)
+      buf_printf(b, "civ_%s_%s", c->classes[cs->class_id].name, nm + 1);  /* module/class-level ivar */
+    else
+      buf_printf(b, "%s->iv_%s", g_self, nm + 1);
     return;
   }
   if (!strcmp(ty, "ClassVariableReadNode")) {
@@ -4446,7 +4450,11 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     const char *nm = nt_str(nt, id, "name");
     int v = nt_ref(nt, id, "value");
     emit_indent(b, indent);
-    buf_printf(b, "%s->iv_%s = ", g_self, nm + 1);
+    Scope *cws = comp_scope_of(c, id);
+    if (cws && cws->is_cmethod && cws->class_id >= 0)
+      buf_printf(b, "civ_%s_%s = ", c->classes[cws->class_id].name, nm + 1);
+    else
+      buf_printf(b, "%s->iv_%s = ", g_self, nm + 1);
     const char *vty = nt_type(nt, v);
     int sc = comp_scope_of(c, id)->class_id;
     TyKind ivt = TY_INT;
@@ -5363,6 +5371,22 @@ char *codegen_program(const NodeTable *nt) {
       emit_ctype(c, t, &b);
       buf_printf(&b, " cvar_%s_%s = %s;\n", ci->name, ci->cvars[j] + 2,
                  t == TY_RANGE ? "{0}" : default_value(t));
+    }
+  }
+
+  /* module/class-level instance variables (accessed from a `def self.X`):
+     one file-scope static per (class, @ivar). */
+  for (int i = 0; i < c->nclasses; i++) {
+    ClassInfo *ci = &c->classes[i];
+    for (int j = 0; j < ci->nivars; j++) {
+      TyKind t = ci->ivar_types[j] == TY_UNKNOWN ? TY_INT : ci->ivar_types[j];
+      /* static initializers must be constant: struct-valued types (poly /
+         range / time) zero-init with {0}; scalars use their default. */
+      const char *init = (t == TY_POLY || t == TY_RANGE || t == TY_TIME) ? "{0}"
+                       : (is_scalar_ret(t) && t != TY_POLY) ? default_value(t) : "0";
+      buf_puts(&b, "static ");
+      emit_ctype(c, t, &b);
+      buf_printf(&b, " civ_%s_%s = %s;\n", ci->name, ci->ivars[j] + 1, init);
     }
   }
 
