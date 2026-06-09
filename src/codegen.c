@@ -5110,6 +5110,18 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     return;
   }
   if (!strcmp(ty, "LocalVariableReadNode")) { emit_local_ref(c, id, nt_str(nt, id, "name"), b); return; }
+  if (!strcmp(ty, "LocalVariableWriteNode")) {
+    /* assignment used as expression: ({ lv = rhs; lv; }) */
+    const char *nm = nt_str(nt, id, "name");
+    int v = nt_ref(nt, id, "value");
+    LocalVar *lv = scope_local(comp_scope_of(c, id), nm);
+    buf_puts(b, "({ ");
+    emit_local_ref(c, id, nm, b); buf_puts(b, " = ");
+    if (lv && lv->type == TY_POLY && comp_ntype(c, v) != TY_POLY) emit_boxed(c, v, b);
+    else emit_expr(c, v, b);
+    buf_puts(b, "; "); emit_local_ref(c, id, nm, b); buf_puts(b, "; })");
+    return;
+  }
   if (!strcmp(ty, "YieldNode")) {
     if (g_block_id < 0) { buf_puts(b, "SP_INT_NIL"); return; }  /* no block: yield is nil */
     emit_block_invoke(c, nt_ref(nt, id, "arguments"), b, 0, 1);
@@ -7158,7 +7170,8 @@ static void emit_proc_literal(Compiler *c, int create, Buf *b) {
   for (int i = 0; i < locals.n; i++) {
     LocalVar *lv = scope_local(bs, locals.v[i]);
     /* a celled local is a captured var (accessed via _cap), not a fn-local */
-    if (lv && !lv->is_block_param && !lv->is_cell) declare_local(c, pb, lv, 0);
+    /* skip virtual &block slots (TY_UNKNOWN) but allow rescue-bind vars (TY_EXCEPTION) */
+    if (lv && lv->type != TY_UNKNOWN && !lv->is_cell) declare_local(c, pb, lv, 0);
   }
   if (ret_ptr) {
     /* launder a heap-pointer return through the mrb_int slot: emit the body's
