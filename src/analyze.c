@@ -722,6 +722,11 @@ static TyKind infer_call(Compiler *c, int id) {
     }
   }
 
+  /* /re/ === str -> match boolean */
+  if (!strcmp(name, "===") && argc == 1 && recv >= 0 &&
+      nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "RegularExpressionNode"))
+    return TY_BOOL;
+
   if ((!strcmp(name, "-@") || !strcmp(name, "+@")) && recv >= 0 && argc == 0)
     return ty_is_numeric(rt) ? rt : TY_UNKNOWN;
   if (!strcmp(name, "!")) return TY_BOOL;

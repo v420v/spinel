@@ -1305,7 +1305,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
      /re/.match?(str[, pos])  and  str !~ /re/  and  str.match?(/re/[, pos]) */
   {
     int rre = re_lit_index(c, recv);
-    if (rre >= 0 && !strcmp(name, "match?") && argc == 1) {
+    if (rre >= 0 && (!strcmp(name, "match?") || !strcmp(name, "===")) && argc == 1) {
+      /* /re/ === str and /re/.match?(str) both yield a match boolean */
       buf_printf(b, "sp_re_match_p(sp_re_pat_%d, ", rre); emit_expr(c, argv[0], b); buf_puts(b, ")");
       return;
     }
