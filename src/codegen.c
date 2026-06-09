@@ -1978,8 +1978,26 @@ static void emit_call(Compiler *c, int id, Buf *b) {
           buf_printf(b, "; }); })");
           return;
         }
-        buf_printf(b, "sp_%sHash_get(", hn);
-        emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        /* fetch(key) with no default raises KeyError on a miss */
+        TyKind vt = ty_hash_val(rt);
+        int th = ++g_tmp, tk = ++g_tmp;
+        buf_printf(b, "({ %s _t%d = ", c_type_name(rt), th); emit_expr(c, recv, b);
+        buf_printf(b, "; %s _t%d = ", c_type_name(ty_hash_key(rt)), tk); emit_expr(c, argv[0], b);
+        buf_printf(b, "; sp_%sHash_has_key(_t%d, _t%d) ? sp_%sHash_get(_t%d, _t%d)"
+                      " : (sp_raise_cls(\"KeyError\", \"key not found\"), %s); })",
+                   hn, th, tk, hn, th, tk, vt == TY_POLY ? "sp_box_nil()" : default_value(vt));
+        return;
+      }
+      if (!strcmp(name, "fetch") && argc == 2) {
+        /* fetch(key, default) -> has_key? ? value : default */
+        TyKind vt = ty_hash_val(rt);
+        int th = ++g_tmp, tk = ++g_tmp;
+        buf_printf(b, "({ %s _t%d = ", c_type_name(rt), th); emit_expr(c, recv, b);
+        buf_printf(b, "; %s _t%d = ", c_type_name(ty_hash_key(rt)), tk); emit_expr(c, argv[0], b);
+        buf_printf(b, "; sp_%sHash_has_key(_t%d, _t%d) ? sp_%sHash_get(_t%d, _t%d) : ", hn, th, tk, hn, th, tk);
+        if (vt == TY_POLY && comp_ntype(c, argv[1]) != TY_POLY) emit_boxed(c, argv[1], b);
+        else emit_expr(c, argv[1], b);
+        buf_puts(b, "; })");
         return;
       }
       if ((!strcmp(name, "length") || !strcmp(name, "size") || !strcmp(name, "count")) && argc == 0) {
