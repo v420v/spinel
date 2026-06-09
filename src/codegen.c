@@ -3951,6 +3951,12 @@ static void emit_assign(Compiler *c, int id, Buf *b, int indent) {
   else if (lv && lv->type == TY_POLY) {
     emit_boxed(c, v, b);   /* poly slot: box the (non-poly) RHS */
   }
+  else if (lv && lv->type == TY_STR_POLY_HASH &&
+           (comp_ntype(c, v) == TY_STR_STR_HASH || comp_ntype(c, v) == TY_STR_INT_HASH)) {
+    /* widen a concrete str-keyed hash into the poly-valued slot */
+    buf_printf(b, "sp_StrPolyHash_from_%s(", comp_ntype(c, v) == TY_STR_STR_HASH ? "str_str_hash" : "str_int_hash");
+    emit_expr(c, v, b); buf_puts(b, ")");
+  }
   else {
     emit_expr(c, v, b);
   }
