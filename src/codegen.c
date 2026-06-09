@@ -723,9 +723,10 @@ static int emit_predicate_expr(Compiler *c, int id, Buf *b) {
   int bn = 0;
   const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
   if (bn < 1) return 0;
-  /* the block's last expression is used as a C condition: require a scalar */
-  TyKind vt = comp_ntype(c, bb[bn - 1]);
-  if (!(vt == TY_BOOL || vt == TY_INT || vt == TY_FLOAT)) return 0;
+  /* the block's last expression is the C condition: require a bool. A bare
+     `if (value)` would mis-handle Ruby truthiness for other types (0 / 0.0
+     are truthy in Ruby but false in C), so leave those unsupported. */
+  if (comp_ntype(c, bb[bn - 1]) != TY_BOOL) return 0;
 
   const char *p0 = block_param_name(c, block, 0); if (p0) p0 = rename_local(p0);
   int trecv = ++g_tmp, tcnt = ++g_tmp, ti = ++g_tmp;
