@@ -1191,6 +1191,13 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_printf(b, "), %s))", kind);
       return;
     }
+    /* a single non-array argument formats as a one-element array */
+    if (at == TY_INT || at == TY_FLOAT || at == TY_STRING || at == TY_SYMBOL || at == TY_POLY) {
+      buf_puts(b, "sp_str_format_polyarr("); emit_expr(c, recv, b);
+      buf_puts(b, ", ({ sp_PolyArray *_fa = sp_PolyArray_new(); sp_PolyArray_push(_fa, ");
+      emit_boxed(c, argv[0], b); buf_puts(b, "); _fa; }))");
+      return;
+    }
   }
 
   /* an empty array literal as a receiver: its node type is unknown (element
@@ -1417,6 +1424,24 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (!strcmp(name, "to_f")) { buf_puts(b, "sp_poly_to_f("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
   }
 
+  /* between?(lo, hi): lo <= self <= hi */
+  if (!strcmp(name, "between?") && argc == 2) {
+    if (rt == TY_STRING) {
+      int tv = ++g_tmp;
+      buf_printf(b, "({ const char *_t%d = ", tv); emit_expr(c, recv, b);
+      buf_printf(b, "; (strcmp(_t%d, ", tv); emit_expr(c, argv[0], b);
+      buf_printf(b, ") >= 0 && strcmp(_t%d, ", tv); emit_expr(c, argv[1], b); buf_puts(b, ") <= 0); })");
+      return;
+    }
+    if (ty_is_numeric(rt)) {
+      int tv = ++g_tmp;
+      buf_puts(b, "({ "); emit_ctype(c, rt, b); buf_printf(b, " _t%d = ", tv); emit_expr(c, recv, b);
+      buf_printf(b, "; (_t%d >= ", tv); emit_expr(c, argv[0], b);
+      buf_printf(b, " && _t%d <= ", tv); emit_expr(c, argv[1], b); buf_puts(b, "); })");
+      return;
+    }
+  }
+
   /* object_id: a stable integer id. Int uses MRI's 2n+1; pointer-backed
      values use the pointer bit pattern; a symbol uses its interned id. */
   if (!strcmp(name, "object_id") && recv >= 0 && argc == 0) {
@@ -1432,6 +1457,11 @@ static void emit_call(Compiler *c, int id, Buf *b) {
      `5.nil?` constant-folds to false; a missing-key value reads true. */
   if (recv >= 0 && rt == TY_INT && !strcmp(name, "nil?") && argc == 0) {
     buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, ") == SP_INT_NIL)");
+    return;
+  }
+  /* nil? on a string: a nullable string carries NULL (e.g. a scan miss) */
+  if (recv >= 0 && rt == TY_STRING && !strcmp(name, "nil?") && argc == 0) {
+    buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, ") == 0)");
     return;
   }
   /* nil? on a float: a nullable float carries the NaN sentinel (e.g. first/
@@ -3209,7 +3239,8 @@ static void emit_interp(Compiler *c, int id, Buf *b) {
         EMIT_IV();
       }
       else if (t == TY_STRING) {
-        buf_puts(&fmt, "%s"); EMIT_IV();
+        /* a nullable string (NULL) interpolates as the empty string */
+        buf_puts(&fmt, "%s"); buf_puts(&argbuf, "("); EMIT_IV(); buf_puts(&argbuf, " ?: \"\")");
       }
       else if (t == TY_FLOAT) {
         buf_puts(&fmt, "%s"); buf_puts(&argbuf, "sp_float_to_s(");
@@ -3504,6 +3535,10 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     else if (lt == TY_BOOL) buf_printf(b, "_t%d", t);
     else if (lt == TY_NIL)  buf_puts(b, "0");
     else if (lt == TY_INT)  buf_printf(b, "(_t%d != SP_INT_NIL)", t);  /* a nullable int reads falsy at the sentinel; a plain int is always truthy */
+    else if (lt == TY_FLOAT) buf_printf(b, "(!sp_float_is_nil(_t%d))", t);
+    else if (lt == TY_STRING || ty_is_array(lt) || ty_is_hash(lt) || ty_is_object(lt) ||
+             lt == TY_PROC || lt == TY_STRINGIO || lt == TY_STRINGSCANNER || lt == TY_EXCEPTION)
+      buf_printf(b, "(_t%d != 0)", t);  /* nullable pointer: NULL reads falsy */
     else                    buf_puts(b, "1");  /* concrete value: always truthy */
     buf_puts(b, " ? ");
     /* the "kept-left" arm and the "right" arm, each widened to res */

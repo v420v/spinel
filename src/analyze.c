@@ -683,6 +683,7 @@ static TyKind infer_call(Compiler *c, int id) {
   if (!strcmp(name, "respond_to?") && recv >= 0) return TY_BOOL;
   if (!strcmp(name, "nil?") && recv >= 0 && argc == 0) return TY_BOOL;
   if (!strcmp(name, "object_id") && recv >= 0 && argc == 0) return TY_INT;
+  if (!strcmp(name, "between?") && argc == 2 && (rt == TY_STRING || ty_is_numeric(rt))) return TY_BOOL;
   if ((!strcmp(name, "match?") || !strcmp(name, "!~")) && recv >= 0) return TY_BOOL;
   if (!strcmp(name, "=~") && recv >= 0 && argc == 1) {
     const char *rrt = nt_type(nt, recv), *art = nt_type(nt, argv[0]);
@@ -692,7 +693,7 @@ static TyKind infer_call(Compiler *c, int id) {
 
   if (recv >= 0 && argc == 1 && is_arith_op(name)) {
     if (rt == TY_STRING) {
-      if (!strcmp(name, "%") && ty_is_array(a0)) return TY_STRING;  /* sprintf */
+      if (!strcmp(name, "%")) return TY_STRING;  /* sprintf (array or single value) */
       if (!strcmp(name, "+") || !strcmp(name, "*")) return TY_STRING;
       return TY_UNKNOWN;
     }
