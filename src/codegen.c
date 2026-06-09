@@ -2908,9 +2908,18 @@ static void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
     buf_printf(b, "; %s _t%d = ", c_type_name(ty_hash_key(rt)), tb); emit_expr(c, argv[0], b);
     buf_puts(b, "; ");
     buf_printf(b, "sp_%sHash_set(_t%d, _t%d, ", hn, ta, tb);
+    const char *pf = vt == TY_POLY ?
+        (!strcmp(op, "+") ? "sp_poly_add" : !strcmp(op, "-") ? "sp_poly_sub" :
+         !strcmp(op, "*") ? "sp_poly_mul" : !strcmp(op, "/") ? "sp_poly_div" :
+         !strcmp(op, "%") ? "sp_poly_mod" : !strcmp(op, "**") ? "sp_poly_pow" : NULL) : NULL;
     if (vt == TY_STRING && !strcmp(op, "+")) {
       buf_printf(b, "sp_str_concat(sp_%sHash_get(_t%d, _t%d), ", hn, ta, tb);
       emit_expr(c, v, b); buf_puts(b, ")");
+    }
+    else if (pf) {
+      /* a poly-valued slot folds via the dynamic operator on boxed operands */
+      buf_printf(b, "%s(sp_%sHash_get(_t%d, _t%d), ", pf, hn, ta, tb);
+      emit_boxed(c, v, b); buf_puts(b, ")");
     }
     else {
       buf_printf(b, "sp_%sHash_get(_t%d, _t%d) %s ", hn, ta, tb, op);
