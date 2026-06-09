@@ -3907,6 +3907,11 @@ static void emit_puts_one(Compiler *c, int arg, Buf *b, int indent) {
   else if (t == TY_NIL) {
     buf_puts(b, "(void)("); emit_expr(c, arg, b); buf_puts(b, "); putchar('\\n');  /* puts nil */\n");
   }
+  else if (nt_type(c->nt, arg) && !strcmp(nt_type(c->nt, arg), "ConstantReadNode") &&
+           nt_str(c->nt, arg, "name") && comp_class_index(c, nt_str(c->nt, arg, "name")) >= 0) {
+    /* `puts SomeClass` -- a bare class constant renders its name */
+    buf_printf(b, "puts(\"%s\");\n", nt_str(c->nt, arg, "name"));
+  }
   else {
     unsupported(c, arg, "puts argument");
   }
