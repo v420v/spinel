@@ -152,7 +152,8 @@ int comp_cvar_intern(ClassInfo *ci, const char *name) {
 
 int comp_method_in_class(Compiler *c, int class_id, const char *name) {
   if (!name) return -1;
-  for (int s = 0; s < c->nscopes; s++)
+  /* iterate in reverse so a reopened class's later definition wins */
+  for (int s = c->nscopes - 1; s >= 0; s--)
     if (c->scopes[s].class_id == class_id && !c->scopes[s].is_cmethod &&
         c->scopes[s].name && strcmp(c->scopes[s].name, name) == 0) return s;
   return -1;
@@ -160,7 +161,7 @@ int comp_method_in_class(Compiler *c, int class_id, const char *name) {
 
 static int comp_cmethod_in_class(Compiler *c, int class_id, const char *name) {
   if (!name) return -1;
-  for (int s = 0; s < c->nscopes; s++)
+  for (int s = c->nscopes - 1; s >= 0; s--)
     if (c->scopes[s].class_id == class_id && c->scopes[s].is_cmethod &&
         c->scopes[s].name && strcmp(c->scopes[s].name, name) == 0) return s;
   return -1;

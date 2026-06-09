@@ -343,17 +343,52 @@ static const char *int_arith_fn(const char *op) {
 static const char *mc(const char *name) {
   static char buf[256];
   int j = 0;
-  for (const char *p = name; *p && j < (int)sizeof buf - 6; p++) {
+  for (const char *p = name; *p && j < (int)sizeof buf - 8; p++) {
     char ch = *p;
     if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-        (ch >= '0' && ch <= '9') || ch == '_') buf[j++] = ch;
-    else if (ch == '?') { buf[j++] = '_'; buf[j++] = 'p'; }
-    else if (ch == '!') { memcpy(buf + j, "_bang", 5); j += 5; }
-    else if (ch == '=') { memcpy(buf + j, "_set", 4); j += 4; }
-    else buf[j++] = '_';
+        (ch >= '0' && ch <= '9') || ch == '_') { buf[j++] = ch; continue; }
+    /* operator characters map to distinct tokens so that, e.g., `&` and `|`
+       (or `<<` and `>>`) don't mangle to the same C identifier */
+    const char *tok;
+    switch (ch) {
+      case '?': tok = "_p";     break;
+      case '!': tok = "_bang";  break;
+      case '=': tok = "_set";   break;
+      case '+': tok = "_plus";  break;
+      case '-': tok = "_minus"; break;
+      case '*': tok = "_star";  break;
+      case '/': tok = "_slash"; break;
+      case '%': tok = "_pct";   break;
+      case '<': tok = "_lt";    break;
+      case '>': tok = "_gt";    break;
+      case '&': tok = "_amp";   break;
+      case '|': tok = "_bar";   break;
+      case '^': tok = "_caret"; break;
+      case '~': tok = "_tilde"; break;
+      case '@': tok = "_at";    break;
+      case '[': tok = "_lb";    break;
+      case ']': tok = "_rb";    break;
+      default:  tok = "_";      break;
+    }
+    size_t tl = strlen(tok);
+    memcpy(buf + j, tok, tl); j += (int)tl;
   }
   buf[j] = '\0';
   return buf;
+}
+
+/* A class method scope is shadowed (and must not be emitted) when a later
+   scope redefines the same (class, name, is_cmethod) -- a reopened class
+   where the last definition wins, matching comp_method_in_class. */
+static int scope_is_shadowed(Compiler *c, int s) {
+  Scope *sc = &c->scopes[s];
+  if (sc->class_id < 0 || !sc->name) return 0;
+  for (int k = s + 1; k < c->nscopes; k++) {
+    Scope *o = &c->scopes[k];
+    if (o->class_id == sc->class_id && o->is_cmethod == sc->is_cmethod &&
+        o->name && !strcmp(o->name, sc->name)) return 1;
+  }
+  return 0;
 }
 
 /* Value node for keyword `name` inside a KeywordHashNode, or -1. */
@@ -5037,7 +5072,7 @@ char *codegen_program(const NodeTable *nt) {
   }
 
   /* method prototypes (scope 0 is top-level) */
-  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable) continue; emit_method_signature(c, &c->scopes[s], &b); buf_puts(&b, ";\n"); }
+  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable || scope_is_shadowed(c, s)) continue; emit_method_signature(c, &c->scopes[s], &b); buf_puts(&b, ";\n"); }
   /* constructor prototypes + definitions (after method protos: new calls initialize) */
   for (int i = 0; i < c->nclasses; i++) {
     ClassInfo *ci = &c->classes[i];
@@ -5079,7 +5114,7 @@ char *codegen_program(const NodeTable *nt) {
      function must be declared before the body that references it. */
   Buf body; memset(&body, 0, sizeof body);
   for (int i = 0; i < c->nclasses; i++) emit_class_new(c, &c->classes[i], &body);
-  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable) continue; emit_method(c, &c->scopes[s], &body); }
+  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable || scope_is_shadowed(c, s)) continue; emit_method(c, &c->scopes[s], &body); }
 
   buf_puts(&body, "int main(int argc,char**argv){\n");
   buf_puts(&body, "    SP_GC_SAVE();\n");
