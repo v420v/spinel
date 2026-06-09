@@ -709,12 +709,12 @@ static int emit_minmax_by_expr(Compiler *c, int id, Buf *b) {
   int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
   if (bn < 1) return 0;
   TyKind bvt = infer_type(c, bb[bn - 1]);
-  if (bvt != TY_INT && bvt != TY_FLOAT) return 0;  /* comparable scalar key only */
+  if (bvt != TY_INT && bvt != TY_FLOAT && bvt != TY_POLY) return 0;
   int trecv = ++g_tmp, tbest = ++g_tmp, tbv = ++g_tmp, tf = ++g_tmp, ti = ++g_tmp, tcur = ++g_tmp;
   Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);  /* recv value; its own preludes flow to g_pre */
   emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre); buf_printf(g_pre, " _t%d = ", trecv); buf_puts(g_pre, rb.p ? rb.p : ""); buf_puts(g_pre, ";\n"); free(rb.p);
   emit_indent(g_pre, g_indent); emit_ctype(c, et, g_pre); buf_printf(g_pre, " _t%d = %s;\n", tbest, et == TY_RANGE ? "(sp_Range){0}" : default_value(et));
-  emit_indent(g_pre, g_indent); emit_ctype(c, bvt, g_pre); buf_printf(g_pre, " _t%d = 0; int _t%d = 1;\n", tbv, tf);
+  emit_indent(g_pre, g_indent); emit_ctype(c, bvt, g_pre); buf_printf(g_pre, " _t%d = %s; int _t%d = 1;\n", tbv, default_value(bvt), tf);
   emit_indent(g_pre, g_indent); buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n", ti, ti, k, trecv, ti);
   if (p0) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = sp_%sArray_get(_t%d, _t%d);\n", p0, k, trecv, ti); }
   for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
@@ -725,10 +725,14 @@ static int emit_minmax_by_expr(Compiler *c, int id, Buf *b) {
   int save = g_indent; g_indent++;
   Buf vb; memset(&vb, 0, sizeof vb); emit_expr(c, bb[bn - 1], &vb); g_indent = save;
   if (mlv0) mlv0->type = mpt0;
-  emit_indent(g_pre, g_indent + 1); emit_ctype(c, bvt, g_pre); buf_printf(g_pre, " _t%d = %s;\n", tcur, vb.p ? vb.p : "0"); free(vb.p);
+  emit_indent(g_pre, g_indent + 1); emit_ctype(c, bvt, g_pre); buf_printf(g_pre, " _t%d = %s;\n", tcur, vb.p ? vb.p : default_value(bvt)); free(vb.p);
   emit_indent(g_pre, g_indent + 1);
-  buf_printf(g_pre, "if (_t%d || _t%d %s _t%d) { _t%d = lv_%s; _t%d = _t%d; _t%d = 0; }\n",
-             tf, tcur, is_max ? ">" : "<", tbv, tbest, p0 ? p0 : "", tbv, tcur, tf);
+  if (bvt == TY_POLY)
+    buf_printf(g_pre, "if (_t%d || sp_poly_%s(_t%d, _t%d)) { _t%d = lv_%s; _t%d = _t%d; _t%d = 0; }\n",
+               tf, is_max ? "gt" : "lt", tcur, tbv, tbest, p0 ? p0 : "", tbv, tcur, tf);
+  else
+    buf_printf(g_pre, "if (_t%d || _t%d %s _t%d) { _t%d = lv_%s; _t%d = _t%d; _t%d = 0; }\n",
+               tf, tcur, is_max ? ">" : "<", tbv, tbest, p0 ? p0 : "", tbv, tcur, tf);
   emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
   buf_printf(b, "_t%d", tbest);
   return 1;
@@ -1801,6 +1805,126 @@ static void emit_dispatch(Compiler *c, int cid, const char *name,
   free(atmp);
 }
 
+/* array.each_with_object(init) { |x, acc| ... } → acc (pre-statements to g_pre) */
+static int emit_each_with_object_expr(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  const char *name = nt_str(nt, id, "name");
+  if (!name || strcmp(name, "each_with_object")) return 0;
+  int recv = nt_ref(nt, id, "receiver");
+  if (recv < 0) return 0;
+  int block = nt_ref(nt, id, "block");
+  if (block < 0) return 0;
+  const char *bty = nt_type(nt, block);
+  if (!bty || strcmp(bty, "BlockNode")) return 0;
+  int args = nt_ref(nt, id, "arguments");
+  int argc = 0; const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
+  if (argc < 1 || !argv) return 0;
+  TyKind rt = comp_ntype(c, recv);
+  if (!ty_is_array(rt)) return 0;
+  const char *k = (rt == TY_POLY_ARRAY) ? "Poly" : array_kind(rt);
+  if (!k) return 0;
+  TyKind et = ty_array_elem(rt);
+  TyKind accT = infer_type(c, argv[0]);
+  if (accT == TY_UNKNOWN) {
+    const char *a0ty = nt_type(nt, argv[0]);
+    int an0 = 0;
+    if (a0ty && !strcmp(a0ty, "ArrayNode")) nt_arr(nt, argv[0], "elements", &an0);
+    if (a0ty && !strcmp(a0ty, "ArrayNode") && an0 == 0) accT = TY_INT_ARRAY;
+    else return 0;
+  }
+  int body = nt_ref(nt, block, "body");
+  int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+  const char *p0_orig = block_param_name(c, block, 0);
+  const char *p1_orig = block_param_name(c, block, 1);
+  const char *p0 = p0_orig ? rename_local(p0_orig) : NULL;
+  const char *p1 = p1_orig ? rename_local(p1_orig) : NULL;
+
+  /* Receiver */
+  int trecv = ++g_tmp;
+  Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+  emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+  buf_printf(g_pre, " _t%d = %s;\n", trecv, rb.p ? rb.p : ""); free(rb.p);
+
+  /* Accumulator */
+  int tacc = ++g_tmp;
+  Buf accb; memset(&accb, 0, sizeof accb); emit_expr(c, argv[0], &accb);
+  emit_indent(g_pre, g_indent); emit_ctype(c, accT, g_pre);
+  buf_printf(g_pre, " _t%d = %s;\n", tacc, accb.p ? accb.p : default_value(accT)); free(accb.p);
+
+  /* Save outer vars if block params shadow them */
+  Scope *cs = comp_scope_of(c, id);
+  LocalVar *outer_p0 = (p0 && cs) ? scope_local(cs, p0) : NULL;
+  int ts_p0 = 0;
+  if (outer_p0) {
+    ts_p0 = ++g_tmp;
+    Buf ot; memset(&ot, 0, sizeof ot); emit_ctype(c, outer_p0->type, &ot);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "%s _t%d = lv_%s;\n", ot.p ? ot.p : "mrb_int", ts_p0, p0); free(ot.p);
+  }
+  LocalVar *outer_p1 = (p1 && cs) ? scope_local(cs, p1) : NULL;
+  int ts_p1 = 0;
+  if (outer_p1) {
+    ts_p1 = ++g_tmp;
+    Buf ot; memset(&ot, 0, sizeof ot); emit_ctype(c, outer_p1->type, &ot);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "%s _t%d = lv_%s;\n", ot.p ? ot.p : "mrb_int", ts_p1, p1); free(ot.p);
+  }
+
+  /* Bind accumulator to p1 before loop */
+  if (p1) {
+    emit_indent(g_pre, g_indent);
+    TyKind p1_type = outer_p1 ? outer_p1->type : accT;
+    if (p1_type == TY_POLY && accT != TY_POLY) {
+      char tacc_s[32]; snprintf(tacc_s, sizeof tacc_s, "_t%d", tacc);
+      Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, accT, tacc_s, &bx);
+      buf_printf(g_pre, "lv_%s = %s;\n", p1, bx.p ? bx.p : tacc_s); free(bx.p);
+    }
+    else {
+      buf_printf(g_pre, "lv_%s = _t%d;\n", p1, tacc);
+    }
+  }
+
+  /* Loop */
+  int ti = ++g_tmp;
+  emit_indent(g_pre, g_indent);
+  buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
+             ti, ti, k, trecv, ti);
+
+  /* Assign element to p0 */
+  if (p0) {
+    emit_indent(g_pre, g_indent + 1);
+    TyKind p0_type = outer_p0 ? outer_p0->type : et;
+    if (p0_type == TY_POLY && et != TY_POLY) {
+      char elem_s[64];
+      snprintf(elem_s, sizeof elem_s, "sp_%sArray_get(_t%d, _t%d)", k, trecv, ti);
+      Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, et, elem_s, &bx);
+      buf_printf(g_pre, "lv_%s = %s;\n", p0, bx.p ? bx.p : elem_s); free(bx.p);
+    }
+    else {
+      buf_printf(g_pre, "lv_%s = sp_%sArray_get(_t%d, _t%d);\n", p0, k, trecv, ti);
+    }
+  }
+
+  /* Body */
+  int save_indent = g_indent; g_indent++;
+  for (int j = 0; j < bn; j++) emit_stmt(c, bb[j], g_pre, g_indent);
+  g_indent = save_indent;
+
+  emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+
+  /* Restore outer vars */
+  if (p0 && ts_p0 > 0) {
+    emit_indent(g_pre, g_indent); buf_printf(g_pre, "lv_%s = _t%d;\n", p0, ts_p0);
+  }
+  if (p1 && ts_p1 > 0) {
+    emit_indent(g_pre, g_indent); buf_printf(g_pre, "lv_%s = _t%d;\n", p1, ts_p1);
+  }
+
+  /* The expression evaluates to the accumulator */
+  buf_printf(b, "_t%d", tacc);
+  return 1;
+}
+
 static void emit_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   if (emit_partition_expr(c, id, b)) return;
@@ -1819,6 +1943,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (emit_inject_expr(c, id, b)) return;
   if (emit_reduce_block_expr(c, id, b)) return;
   if (emit_sortby_expr(c, id, b)) return;
+  if (emit_each_with_object_expr(c, id, b)) return;
   if (emit_inline_expr(c, id, b)) return;  /* value-returning yield method */
   const char *name = nt_str(nt, id, "name");
   int recv = nt_ref(nt, id, "receiver");

@@ -613,6 +613,16 @@ static TyKind infer_call(Compiler *c, int id) {
       }
       return ty_array_elem(rt);
     }
+    if (!strcmp(name, "each_with_object") && argc > 0 && argv) {
+      TyKind at = infer_type(c, argv[0]);
+      if (at == TY_UNKNOWN) {
+        const char *a0ty = nt_type(nt, argv[0]);
+        int an0 = 0;
+        if (a0ty && !strcmp(a0ty, "ArrayNode")) nt_arr(nt, argv[0], "elements", &an0);
+        if (a0ty && !strcmp(a0ty, "ArrayNode") && an0 == 0) return TY_INT_ARRAY;
+      }
+      return at;
+    }
     if (!strcmp(name, "tally") && argc == 0) {
       if (rt == TY_INT_ARRAY) return TY_INT_INT_HASH;
       if (rt == TY_STR_ARRAY) return TY_STR_INT_HASH;
@@ -2543,6 +2553,40 @@ static int infer_block_params(Compiler *c) {
         LocalVar *ip = scope_local_intern(es, p1); ip->is_block_param = 1;
         TyKind im = ty_unify(ip->type, TY_INT);
         if (im != ip->type) { ip->type = im; changed = 1; }
+      }
+      continue;
+    }
+
+    /* array.each_with_object(init) { |x, acc| } binds element + accumulator */
+    if (!strcmp(name, "each_with_object") && ty_is_array(rt)) {
+      Scope *es = comp_scope_of(c, block);
+      if (p0) {
+        TyKind et = ty_array_elem(rt);
+        LocalVar *ep = scope_local_intern(es, p0); ep->is_block_param = 1;
+        if (!(ty_is_array(ep->type) && !ty_is_array(et))) {
+          TyKind em = ty_unify(ep->type, et);
+          if (em != ep->type) { ep->type = em; changed = 1; }
+        }
+      }
+      const char *p1_name = block_param_name(c, block, 1);
+      if (p1_name) {
+        int ewobj_args = nt_ref(nt, id, "arguments");
+        int ewobj_argc = 0;
+        const int *ewobj_argv = ewobj_args >= 0 ? nt_arr(nt, ewobj_args, "arguments", &ewobj_argc) : NULL;
+        if (ewobj_argc > 0 && ewobj_argv) {
+          TyKind at = infer_type(c, ewobj_argv[0]);
+          if (at == TY_UNKNOWN) {
+            const char *a0ty = nt_type(nt, ewobj_argv[0]);
+            int an0 = 0;
+            if (a0ty && !strcmp(a0ty, "ArrayNode")) nt_arr(nt, ewobj_argv[0], "elements", &an0);
+            if (a0ty && !strcmp(a0ty, "ArrayNode") && an0 == 0) at = TY_INT_ARRAY;
+          }
+          if (at != TY_UNKNOWN) {
+            LocalVar *ap = scope_local_intern(es, p1_name); ap->is_block_param = 1;
+            TyKind am = ty_unify(ap->type, at);
+            if (am != ap->type) { ap->type = am; changed = 1; }
+          }
+        }
       }
       continue;
     }
