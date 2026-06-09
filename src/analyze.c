@@ -509,6 +509,7 @@ static TyKind infer_call(Compiler *c, int id) {
       if (argc == 1 && nt_type(nt, argv[0]) && !strcmp(nt_type(nt, argv[0]), "RangeNode")) return rt;
       return ty_array_elem(rt);
     }
+    if (!strcmp(name, "at") && argc == 1) return ty_array_elem(rt);  /* like [i] */
     /* index returns nil on a miss -> poly (int-or-nil) */
     if (!strcmp(name, "index") && (rt == TY_INT_ARRAY || rt == TY_STR_ARRAY)) return TY_POLY;
     if (!strcmp(name, "length") || !strcmp(name, "size") ||

@@ -1593,6 +1593,15 @@ static void emit_call(Compiler *c, int id, Buf *b) {
            a plain int constant-folds to false */
         buf_puts(b, "(("); emit_expr(c, other, b); buf_printf(b, ") %s SP_INT_NIL)", eq ? "==" : "!=");
       }
+      else if (ot == TY_FLOAT) {
+        /* a nullable float carries the NaN sentinel */
+        buf_puts(b, eq ? "sp_float_is_nil(" : "(!sp_float_is_nil(");
+        emit_expr(c, other, b); buf_puts(b, eq ? ")" : "))");
+      }
+      else if (ot == TY_STRING) {
+        /* a nullable string carries NULL */
+        buf_puts(b, "(("); emit_expr(c, other, b); buf_printf(b, ") %s 0)", eq ? "==" : "!=");
+      }
       else { buf_puts(b, "(("); emit_expr(c, other, b); buf_printf(b, "), %d)", eq ? 0 : 1); }
       return;
     }
@@ -2407,7 +2416,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
         return;
       }
-      if (!strcmp(name, "[]") && argc == 1) {
+      if ((!strcmp(name, "[]") || !strcmp(name, "at")) && argc == 1) {
         buf_printf(b, "sp_%sArray_get(", k);
         emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
         buf_puts(b, ")");
