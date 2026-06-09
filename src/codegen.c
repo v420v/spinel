@@ -1567,6 +1567,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
              !strcmp(name, "min") || !strcmp(name, "max") ||
              !strcmp(name, "pop") || !strcmp(name, "shift")) && argc == 0) { buf_puts(b, "SP_INT_NIL"); return; }
         if ((!strcmp(name, "inspect") || !strcmp(name, "to_s")) && argc == 0) { buf_puts(b, "\"[]\""); return; }
+        if ((!strcmp(name, "join") || !strcmp(name, "pack")) && argc <= 1) { buf_puts(b, "(&(\"\\xff\")[1])"); return; }
         if ((!strcmp(name, "flatten") || !strcmp(name, "compact") || !strcmp(name, "uniq") ||
              !strcmp(name, "sort") || !strcmp(name, "reverse") || !strcmp(name, "dup") ||
              !strcmp(name, "clone") || !strcmp(name, "to_a")) && argc <= 1) {
