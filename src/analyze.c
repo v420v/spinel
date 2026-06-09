@@ -252,6 +252,11 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "parameters")) return TY_POLY_ARRAY;
   }
 
+  /* __method__ / __callee__ -> the enclosing method's name (a symbol) */
+  if (recv < 0 && argc == 0 &&
+      (!strcmp(name, "__method__") || !strcmp(name, "__callee__")))
+    return TY_SYMBOL;
+
   /* identity methods: return the receiver unchanged */
   if (recv >= 0 && argc == 0 &&
       (!strcmp(name, "freeze") || !strcmp(name, "itself") ||
@@ -2346,6 +2351,15 @@ void analyze_program(Compiler *c) {
     if (ty && !strcmp(ty, "SymbolNode")) {
       const char *v = nt_str(c->nt, id, "value");
       if (v) comp_sym_intern(c, v);
+    }
+    /* __method__ / __callee__ yield the enclosing method's name as a symbol;
+       intern it now so the id table is sized before the codegen prologue */
+    else if (ty && !strcmp(ty, "CallNode") && nt_ref(c->nt, id, "receiver") < 0) {
+      const char *nm = nt_str(c->nt, id, "name");
+      if (nm && (!strcmp(nm, "__method__") || !strcmp(nm, "__callee__"))) {
+        Scope *s = comp_scope_of(c, id);
+        if (s && s->name && s->name[0]) comp_sym_intern(c, s->name);
+      }
     }
   }
   /* Proc#parameters reports param kinds (:req/:opt) and names as symbols;

@@ -1071,6 +1071,16 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     return;
   }
 
+  /* __method__ / __callee__ -> the enclosing method's name as a symbol
+     (nil at the top level) */
+  if (recv < 0 && argc == 0 &&
+      (!strcmp(name, "__method__") || !strcmp(name, "__callee__"))) {
+    Scope *s = comp_scope_of(c, id);
+    if (s && s->name && s->name[0]) buf_printf(b, "(sp_sym)%d", comp_sym_intern(c, s->name));
+    else buf_puts(b, "sp_box_nil()");
+    return;
+  }
+
   /* block_given? / self.block_given? -> true inside an inlined yielding
      method (we only inline when a block is present) */
   if (!strcmp(name, "block_given?") &&
@@ -3208,7 +3218,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       }
       else if (!strcmp(name, "chomp"))      buf_printf(b, "sp_str_chomp(%s)", r);
       else if (!strcmp(name, "chop"))       buf_printf(b, "sp_str_chop(%s)", r);
-      else if (!strcmp(name, "to_s") || !strcmp(name, "to_str") || !strcmp(name, "dup")) buf_puts(b, r);
+      else if (!strcmp(name, "to_s") || !strcmp(name, "to_str") || !strcmp(name, "dup") || !strcmp(name, "clone")) buf_puts(b, r);
       else if (!strcmp(name, "inspect"))    { int tv = ++g_tmp; buf_printf(b, "({ const char *_t%d = %s; _t%d ? sp_str_inspect(_t%d) : SPL(\"nil\"); })", tv, r, tv, tv); }
       else if (!strcmp(name, "empty?"))     buf_printf(b, "(sp_str_length(%s) == 0)", r);
       else if (!strcmp(name, "include?") && argc == 1) {
