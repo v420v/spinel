@@ -1605,6 +1605,22 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else { buf_puts(b, "(("); emit_expr(c, other, b); buf_printf(b, "), %d)", eq ? 0 : 1); }
       return;
     }
+    /* arr == [] : an array equals the empty literal iff it has no elements */
+    {
+      int er = nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ArrayNode") &&
+               ({ int _n = 0; nt_arr(nt, recv, "elements", &_n); _n == 0; });
+      int ea = nt_type(nt, argv[0]) && !strcmp(nt_type(nt, argv[0]), "ArrayNode") &&
+               ({ int _n = 0; nt_arr(nt, argv[0], "elements", &_n); _n == 0; });
+      if ((er && (array_kind(a0) || a0 == TY_POLY_ARRAY)) ||
+          (ea && (array_kind(rt) || rt == TY_POLY_ARRAY))) {
+        int arr = er ? argv[0] : recv;
+        TyKind at = er ? a0 : rt;
+        const char *kk = array_kind(at);
+        buf_printf(b, "(%ssp_%sArray_length(", eq ? "" : "!", kk ? kk : "Poly");
+        emit_expr(c, arr, b); buf_puts(b, ") == 0)");
+        return;
+      }
+    }
     if (rt == TY_POLY_ARRAY && a0 == TY_POLY_ARRAY) {
       buf_puts(b, eq ? "sp_PolyArray_eq(" : "(!sp_PolyArray_eq(");
       emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
@@ -2422,6 +2438,19 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_puts(b, ")");
         return;
       }
+      if (!strcmp(name, "clear") && argc == 0) {
+        /* empty the array in place, evaluate to it (Ruby returns self) */
+        int t = ++g_tmp;
+        buf_printf(b, "({ sp_%sArray *_t%d = ", k, t); emit_expr(c, recv, b);
+        buf_printf(b, "; if (_t%d) _t%d->len = 0; _t%d; })", t, t, t);
+        return;
+      }
+      if ((!strcmp(name, "shift") || !strcmp(name, "pop")) && argc == 0 &&
+          (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY)) {
+        /* remove and return first/last element (nil sentinel when empty) */
+        buf_printf(b, "sp_%sArray_%s(", k, name); emit_expr(c, recv, b); buf_puts(b, ")");
+        return;
+      }
       if ((!strcmp(name, "length") || !strcmp(name, "size")) && argc == 0) {
         buf_printf(b, "sp_%sArray_length(", k); emit_expr(c, recv, b); buf_puts(b, ")");
         return;
@@ -2520,6 +2549,12 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (rt == TY_POLY_ARRAY) {
       if (!strcmp(name, "[]") && argc == 1) {
         buf_puts(b, "sp_PolyArray_get("); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        return;
+      }
+      if (!strcmp(name, "clear") && argc == 0) {
+        int t = ++g_tmp;
+        buf_printf(b, "({ sp_PolyArray *_t%d = ", t); emit_expr(c, recv, b);
+        buf_printf(b, "; if (_t%d) _t%d->len = 0; _t%d; })", t, t, t);
         return;
       }
       if ((!strcmp(name, "length") || !strcmp(name, "size") || !strcmp(name, "count")) && argc == 0) {

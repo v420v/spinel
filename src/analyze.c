@@ -518,7 +518,7 @@ static TyKind infer_call(Compiler *c, int id) {
     if ((!strcmp(name, "first") || !strcmp(name, "last")) && argc == 1) return rt;  /* first(n)/last(n) -> subarray */
     if (!strcmp(name, "first") || !strcmp(name, "last") ||
         !strcmp(name, "min") || !strcmp(name, "max") ||
-        !strcmp(name, "pop")) return ty_array_elem(rt);
+        !strcmp(name, "pop") || !strcmp(name, "shift")) return ty_array_elem(rt);
     if (!strcmp(name, "minmax")) return rt;  /* [min, max], same element kind */
     if (!strcmp(name, "join"))                        return TY_STRING;
     if (!strcmp(name, "pack") && argc == 1)           return TY_STRING;
@@ -527,7 +527,7 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "push") || !strcmp(name, "<<") || !strcmp(name, "append") ||
         !strcmp(name, "reverse") || !strcmp(name, "sort") || !strcmp(name, "uniq") ||
         !strcmp(name, "to_a") || !strcmp(name, "dup") || !strcmp(name, "clone") ||
-        !strcmp(name, "compact") || !strcmp(name, "flatten") ||
+        !strcmp(name, "compact") || !strcmp(name, "flatten") || !strcmp(name, "clear") ||
         !strcmp(name, "values_at")) return rt;
     if (!strcmp(name, "[]="))                         return ty_array_elem(rt);
     if ((!strcmp(name, "assoc") || !strcmp(name, "rassoc")) && rt == TY_POLY_ARRAY)
