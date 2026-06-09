@@ -1889,6 +1889,24 @@ static int infer_block_params(Compiler *c) {
       continue;
     }
 
+    /* hash.merge(other) { |k, v1, v2| } binds key + both conflicting values */
+    if (!strcmp(name, "merge") && ty_is_hash(rt)) {
+      Scope *ms = comp_scope_of(c, block);
+      LocalVar *kp = scope_local_intern(ms, p0); kp->is_block_param = 1;
+      TyKind km = ty_unify(kp->type, ty_hash_key(rt));
+      if (km != kp->type) { kp->type = km; changed = 1; }
+      const char *mp1 = block_param_name(c, block, 1);
+      const char *mp2 = block_param_name(c, block, 2);
+      const char *mps[2]; mps[0] = mp1; mps[1] = mp2;
+      for (int mi2 = 0; mi2 < 2; mi2++) {
+        if (!mps[mi2]) continue;
+        LocalVar *vp = scope_local_intern(ms, mps[mi2]); vp->is_block_param = 1;
+        TyKind vm = ty_unify(vp->type, ty_hash_val(rt));
+        if (vm != vp->type) { vp->type = vm; changed = 1; }
+      }
+      continue;
+    }
+
     /* hash.fetch(key) { |k| } binds the looked-up key */
     if (!strcmp(name, "fetch") && ty_is_hash(rt)) {
       Scope *fs = comp_scope_of(c, block);

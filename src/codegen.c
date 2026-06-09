@@ -2217,6 +2217,47 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "sp_%sHash_inspect(", hn); emit_expr(c, recv, b); buf_puts(b, ")");
         return;
       }
+      if (!strcmp(name, "merge") && argc == 1 && nt_ref(nt, id, "block") >= 0) {
+        /* merge(other) { |k, v1, v2| } -- conflict-resolution block. The
+           result starts as a copy of the receiver, then each key of `other`
+           is inserted; on a collision the block picks the value. */
+        int blk = nt_ref(nt, id, "block");
+        const char *bp0 = block_param_name(c, blk, 0);
+        const char *bp1 = block_param_name(c, blk, 1);
+        const char *bp2 = block_param_name(c, blk, 2);
+        TyKind kt = ty_hash_key(rt), vt = ty_hash_val(rt);
+        int tr = ++g_tmp, to = ++g_tmp, ti = ++g_tmp, tk = ++g_tmp, tc = ++g_tmp, tj = ++g_tmp;
+        buf_printf(b, "({ %s _t%d = sp_%sHash_new(); SP_GC_ROOT(_t%d);", c_type_name(rt), tr, hn, tr);
+        /* copy the receiver into the fresh result */
+        buf_printf(b, " %s _t%d = ", c_type_name(rt), tc); emit_expr(c, recv, b); buf_puts(b, ";");
+        buf_printf(b, " for (mrb_int _t%d = 0; _t%d < _t%d->len; _t%d++)"
+                      " sp_%sHash_set(_t%d, _t%d->order[_t%d], sp_%sHash_get(_t%d, _t%d->order[_t%d]));",
+                   tj, tj, tc, tj, hn, tr, tc, tj, hn, tc, tc, tj);
+        buf_printf(b, " %s _t%d = ", c_type_name(rt), to); emit_expr(c, argv[0], b); buf_puts(b, ";");
+        buf_printf(b, " for (mrb_int _t%d = 0; _t%d < _t%d->len; _t%d++) {", ti, ti, to, ti);
+        buf_printf(b, " %s _t%d = _t%d->order[_t%d];", c_type_name(kt), tk, to, ti);
+        buf_printf(b, " if (sp_%sHash_has_key(_t%d, _t%d)) {", hn, tr, tk);
+        if (bp0) buf_printf(b, " lv_%s = _t%d;", rename_local(bp0), tk);
+        if (bp1) buf_printf(b, " lv_%s = sp_%sHash_get(_t%d, _t%d);", rename_local(bp1), hn, tr, tk);
+        if (bp2) buf_printf(b, " lv_%s = sp_%sHash_get(_t%d, _t%d);", rename_local(bp2), hn, to, tk);
+        buf_printf(b, " sp_%sHash_set(_t%d, _t%d, ", hn, tr, tk);
+        {
+          int bbody = nt_ref(nt, blk, "body");
+          int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
+          int bval = bn > 0 ? bb[bn - 1] : -1;
+          buf_puts(b, "({ ");
+          for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], b, 0);
+          if (bval >= 0) {
+            if (vt == TY_POLY && comp_ntype(c, bval) != TY_POLY) emit_boxed(c, bval, b);
+            else emit_expr(c, bval, b);
+          }
+          else buf_puts(b, vt == TY_POLY ? "sp_box_nil()" : default_value(vt));
+          buf_puts(b, "; })");
+        }
+        buf_printf(b, "); } else { sp_%sHash_set(_t%d, _t%d, sp_%sHash_get(_t%d, _t%d)); } }", hn, tr, tk, hn, to, tk);
+        buf_printf(b, " _t%d; })", tr);
+        return;
+      }
       if (!strcmp(name, "merge") && argc == 1 &&
           (rt == TY_STR_INT_HASH || rt == TY_STR_POLY_HASH || rt == TY_SYM_POLY_HASH)) {
         buf_printf(b, "sp_%sHash_merge(", hn); emit_expr(c, recv, b); buf_puts(b, ", ");
