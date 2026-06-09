@@ -2185,6 +2185,43 @@ static mrb_int sp_re_rindex(mrb_regexp_pattern *pat, const char *str) {
   return last;
 }
 
+/* `s.rpartition(regex)` -> [before, last_match, after]. On no match Ruby
+   returns ["", "", s] (the whole string lands in the last slot). Walks
+   forward to the final match span, mirroring sp_re_rindex. */
+static sp_StrArray *sp_re_rpartition(mrb_regexp_pattern *pat, const char *str) {
+  int64_t slen = (int64_t)strlen(str);
+  int caps[2];
+  int64_t pos = 0;
+  mrb_int ms = -1, me = -1;
+  while (pos <= slen) {
+    int n = re_exec(pat, str, slen, pos, caps, 2);
+    if (n <= 0) break;
+    ms = caps[0]; me = caps[1];
+    /* rpartition keys on the rightmost match START (MRI reverse search),
+       so step one past this start to look for a later-starting match. */
+    pos = caps[0] + 1;
+  }
+  sp_StrArray *r = sp_StrArray_new();
+  if (ms < 0) {
+    sp_StrArray_push(r, SPL(""));
+    sp_StrArray_push(r, SPL(""));
+    sp_StrArray_push(r, str);
+    return r;
+  }
+  char *before = sp_str_alloc_raw(ms + 1);
+  memcpy(before, str, ms); before[ms] = 0;
+  int mlen = (int)(me - ms);
+  char *mid = sp_str_alloc_raw(mlen + 1);
+  memcpy(mid, str + ms, mlen); mid[mlen] = 0;
+  int alen = (int)(slen - me);
+  char *after = sp_str_alloc_raw(alen + 1);
+  memcpy(after, str + me, alen); after[alen] = 0;
+  sp_StrArray_push(r, before);
+  sp_StrArray_push(r, mid);
+  sp_StrArray_push(r, after);
+  return r;
+}
+
 static mrb_bool sp_re_match_p(mrb_regexp_pattern *pat, const char *str) {
   int64_t slen = (int64_t)strlen(str);
   int caps[2];

@@ -3256,6 +3256,9 @@ static void emit_call(Compiler *c, int id, Buf *b) {
                       " _t%d; })",
                    tr, re_lit_index(c, argv[0]), r, tr, tr, tr, tr, r, tr, tr, tr);
       }
+      else if (!strcmp(name, "rpartition") && argc == 1 && re_lit_index(c, argv[0]) >= 0) {
+        buf_printf(b, "sp_re_rpartition(sp_re_pat_%d, %s)", re_lit_index(c, argv[0]), r);
+      }
       else if (!strcmp(name, "rindex") && argc == 1) { buf_printf(b, "sp_str_rindex(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       else if (!strcmp(name, "rindex") && argc == 2) { buf_printf(b, "sp_str_rindex_from(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")"); }
       else if (!strcmp(name, "crypt") && argc == 1) { buf_printf(b, "sp_str_crypt(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
