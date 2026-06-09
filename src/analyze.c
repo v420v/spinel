@@ -1888,6 +1888,15 @@ static int infer_block_params(Compiler *c) {
       continue;
     }
 
+    /* hash.fetch(key) { |k| } binds the looked-up key */
+    if (!strcmp(name, "fetch") && ty_is_hash(rt)) {
+      Scope *fs = comp_scope_of(c, block);
+      LocalVar *kp = scope_local_intern(fs, p0); kp->is_block_param = 1;
+      TyKind km = ty_unify(kp->type, ty_hash_key(rt));
+      if (km != kp->type) { kp->type = km; changed = 1; }
+      continue;
+    }
+
     /* hash.each / each_pair { |k, v| } binds two params */
     if ((!strcmp(name, "each") || !strcmp(name, "each_pair") || !strcmp(name, "map") ||
          !strcmp(name, "collect") || !strcmp(name, "flat_map") || !strcmp(name, "select") ||

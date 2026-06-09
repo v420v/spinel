@@ -2147,6 +2147,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
           int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
           int bval = bn > 0 ? bb[bn - 1] : -1;
           buf_puts(b, "({ ");
+          const char *fp0 = block_param_name(c, blk, 0);  /* fetch yields the key */
+          if (fp0) { buf_printf(b, "lv_%s = _t%d; ", rename_local(fp0), tk); }
           for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], b, 0);  /* leading stmts */
           if (bval >= 0) {
             if (vt == TY_POLY && comp_ntype(c, bval) != TY_POLY) emit_boxed(c, bval, b);
