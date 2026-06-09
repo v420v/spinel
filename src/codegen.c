@@ -548,6 +548,65 @@ static int emit_minmax_by_expr(Compiler *c, int id, Buf *b) {
   return 1;
 }
 
+/* inject(:op) / reduce(:op) / inject(&:op) / inject(init, :op) as an
+   expression: fold the array with a symbol-named arithmetic operator. The
+   block-fold form (inject { |a, e| ... }) is not handled here. Returns 1 if
+   handled. */
+static int emit_inject_expr(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  const char *name = nt_str(nt, id, "name");
+  if (!name || (strcmp(name, "inject") && strcmp(name, "reduce"))) return 0;
+  int recv = nt_ref(nt, id, "receiver");
+  if (recv < 0) return 0;
+  TyKind rt = comp_ntype(c, recv);
+  if (!ty_is_array(rt)) return 0;
+  const char *k = array_kind(rt);
+  if (!k) return 0;
+  TyKind et = ty_array_elem(rt);
+
+  /* find the operator symbol (from a &:op block or a trailing :op arg) and
+     any explicit initial value */
+  const char *op = NULL; int init = -1;
+  int block = nt_ref(nt, id, "block");
+  if (block >= 0 && nt_type(nt, block) && !strcmp(nt_type(nt, block), "BlockArgumentNode")) {
+    int ex = nt_ref(nt, block, "expression");
+    if (ex >= 0 && nt_type(nt, ex) && !strcmp(nt_type(nt, ex), "SymbolNode")) op = nt_str(nt, ex, "value");
+  }
+  int args = nt_ref(nt, id, "arguments");
+  int argc = 0; const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
+  if (!op && argc >= 1) {
+    int last = argv[argc - 1];
+    if (nt_type(nt, last) && !strcmp(nt_type(nt, last), "SymbolNode")) {
+      op = nt_str(nt, last, "value");
+      if (argc == 2) init = argv[0];
+    }
+  }
+  if (!op) return 0;
+
+  const char *ifn = (et == TY_INT) ? int_arith_fn(op) : NULL;
+  int float_op = (et == TY_FLOAT) && (!strcmp(op, "+") || !strcmp(op, "-") ||
+                                      !strcmp(op, "*") || !strcmp(op, "/"));
+  int str_op = (et == TY_STRING) && !strcmp(op, "+");
+  if (!ifn && !float_op && !str_op) return 0;
+
+  int ta = ++g_tmp, tacc = ++g_tmp, ti = ++g_tmp, tn = ++g_tmp;
+  buf_printf(b, "({ sp_%sArray *_t%d = ", k, ta); emit_expr(c, recv, b);
+  buf_printf(b, "; mrb_int _t%d = sp_%sArray_length(_t%d); ", tn, k, ta);
+  emit_ctype(c, et, b); buf_printf(b, " _t%d = ", tacc);
+  int start;
+  if (init >= 0) { emit_expr(c, init, b); start = 0; }
+  else { buf_printf(b, "_t%d > 0 ? sp_%sArray_get(_t%d, 0) : %s", tn, k, ta, default_value(et)); start = 1; }
+  buf_printf(b, "; for (mrb_int _t%d = %d; _t%d < _t%d; _t%d++) _t%d = ", ti, start, ti, tn, ti, tacc);
+  if (ifn)
+    buf_printf(b, "%s(_t%d, sp_%sArray_get(_t%d, _t%d))", ifn, tacc, k, ta, ti);
+  else if (str_op)
+    buf_printf(b, "sp_str_concat(_t%d, sp_%sArray_get(_t%d, _t%d))", tacc, k, ta, ti);
+  else
+    buf_printf(b, "_t%d %s sp_%sArray_get(_t%d, _t%d)", tacc, op, k, ta, ti);
+  buf_printf(b, "; _t%d; })", tacc);
+  return 1;
+}
+
 /* sort_by { |x| key } as an expression: a stable bubble sort of a copy of
    the receiver, ordering by the block's computed (scalar) key. Returns 1 if
    handled. */
@@ -972,6 +1031,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (emit_predicate_expr(c, id, b)) return;
   if (emit_grep_expr(c, id, b)) return;
   if (emit_minmax_by_expr(c, id, b)) return;
+  if (emit_inject_expr(c, id, b)) return;
   if (emit_sortby_expr(c, id, b)) return;
   if (emit_inline_expr(c, id, b)) return;  /* value-returning yield method */
   const char *name = nt_str(nt, id, "name");
