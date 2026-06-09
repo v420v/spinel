@@ -1193,6 +1193,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, ") ? SPL(\"TrueClass\") : SPL(\"FalseClass\"))");
       return;
     }
+    if (rt == TY_POLY) {
+      buf_puts(b, "sp_poly_class_name("); emit_expr(c, recv, b); buf_puts(b, ")");
+      return;
+    }
   }
 
   /* freeze / frozen? on an array set/read the struct's frozen flag */

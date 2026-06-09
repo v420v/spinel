@@ -2771,6 +2771,30 @@ static inline const char *sp_poly_to_s(sp_RbVal v) {
     default: return sp_str_empty;
   }
 }
+/* Class name of a boxed value, for `x.class` where x is poly. Returns a
+   .rodata or names-table string (never GC-managed). */
+static const char *sp_poly_class_name(sp_RbVal v) {
+  switch (v.tag) {
+    case SP_TAG_INT: return SPL("Integer");
+    case SP_TAG_STR: return SPL("String");
+    case SP_TAG_FLT: return SPL("Float");
+    case SP_TAG_BOOL: return v.v.b ? SPL("TrueClass") : SPL("FalseClass");
+    case SP_TAG_NIL: return SPL("NilClass");
+    case SP_TAG_SYM: return SPL("Symbol");
+    case SP_TAG_ENCODING: return SPL("Encoding");
+    case SP_TAG_CLASS: return SPL("Class");
+    case SP_TAG_OBJ:
+      switch (v.cls_id) {
+        case SP_BUILTIN_INT_ARRAY: case SP_BUILTIN_FLT_ARRAY:
+        case SP_BUILTIN_STR_ARRAY: case SP_BUILTIN_SYM_ARRAY:
+        case SP_BUILTIN_PTR_ARRAY: return SPL("Array");
+        case SP_BUILTIN_RANGE: return SPL("Range");
+        case SP_BUILTIN_TIME: return SPL("Time");
+        default: { sp_Class c = {v.cls_id}; return sp_class_to_s(c); }
+      }
+    default: return SPL("Object");
+  }
+}
 static sp_RbVal sp_poly_add(sp_RbVal a, sp_RbVal b) { if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return sp_box_int(a.v.i + b.v.i); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_FLT) return sp_box_float(a.v.f + b.v.f); if (a.tag == SP_TAG_INT && b.tag == SP_TAG_FLT) return sp_box_float((mrb_float)a.v.i + b.v.f); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_INT) return sp_box_float(a.v.f + (mrb_float)b.v.i); if (a.tag == SP_TAG_STR && b.tag == SP_TAG_STR) return sp_box_str(sp_str_concat(a.v.s, b.v.s)); return sp_box_int(0); }
 static sp_RbVal sp_poly_sub(sp_RbVal a, sp_RbVal b) { if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return sp_box_int(a.v.i - b.v.i); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_FLT) return sp_box_float(a.v.f - b.v.f); return sp_box_int(0); }
 static sp_RbVal sp_poly_mul(sp_RbVal a, sp_RbVal b) { if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return sp_box_int(a.v.i * b.v.i); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_FLT) return sp_box_float(a.v.f * b.v.f); if (a.tag == SP_TAG_INT && b.tag == SP_TAG_FLT) return sp_box_float((mrb_float)a.v.i * b.v.f); if (a.tag == SP_TAG_FLT && b.tag == SP_TAG_INT) return sp_box_float(a.v.f * (mrb_float)b.v.i); return sp_box_int(0); }

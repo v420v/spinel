@@ -266,7 +266,7 @@ static TyKind infer_call(Compiler *c, int id) {
   /* x.class -> a class-name string (for known builtin/object receivers) */
   if (recv >= 0 && argc == 0 && !strcmp(name, "class") &&
       (ty_is_numeric(rt) || rt == TY_STRING || rt == TY_SYMBOL || rt == TY_BOOL ||
-       rt == TY_RANGE || rt == TY_TIME || rt == TY_NIL ||
+       rt == TY_RANGE || rt == TY_TIME || rt == TY_NIL || rt == TY_POLY ||
        ty_is_array(rt) || ty_is_hash(rt) || ty_is_object(rt)))
     return TY_STRING;
 
