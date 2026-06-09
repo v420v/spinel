@@ -732,6 +732,45 @@ static int emit_sum_block_expr(Compiler *c, int id, Buf *b) {
   return 1;
 }
 
+/* numeric.step(limit[, step]) without a block, materialized as an int or
+   float array (so a following .to_a / .inspect works). Returns 1 if handled. */
+static int emit_step_array_expr(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  if (nt_ref(nt, id, "block") >= 0) return 0;
+  const char *name = nt_str(nt, id, "name");
+  if (!name || strcmp(name, "step")) return 0;
+  int recv = nt_ref(nt, id, "receiver");
+  if (recv < 0) return 0;
+  TyKind rt = comp_ntype(c, recv);
+  if (rt != TY_INT && rt != TY_FLOAT) return 0;
+  int args = nt_ref(nt, id, "arguments");
+  int sc = 0; const int *sv = args >= 0 ? nt_arr(nt, args, "arguments", &sc) : NULL;
+  if (sc < 1) return 0;
+  int is_float = (rt == TY_FLOAT) || comp_ntype(c, sv[0]) == TY_FLOAT ||
+                 (sc >= 2 && comp_ntype(c, sv[1]) == TY_FLOAT);
+  int tr = ++g_tmp, tl = ++g_tmp, ts = ++g_tmp, ti = ++g_tmp;
+  if (!is_float) {
+    buf_printf(b, "({ sp_IntArray *_t%d = sp_IntArray_new(); SP_GC_ROOT(_t%d); mrb_int _t%d = ", tr, tr, tl);
+    emit_expr(c, sv[0], b); buf_printf(b, "; mrb_int _t%d = ", ts);
+    if (sc >= 2) emit_expr(c, sv[1], b); else buf_puts(b, "1");
+    buf_printf(b, "; for (mrb_int _t%d = ", ti); emit_expr(c, recv, b);
+    buf_printf(b, "; _t%d >= 0 ? _t%d <= _t%d : _t%d >= _t%d; _t%d += _t%d) sp_IntArray_push(_t%d, _t%d); _t%d; })",
+               ts, ti, tl, ti, tl, ti, ts, tr, ti, tr);
+    return 1;
+  }
+  int tb = ++g_tmp, tn = ++g_tmp;
+  buf_printf(b, "({ sp_FloatArray *_t%d = sp_FloatArray_new(); SP_GC_ROOT(_t%d); mrb_float _t%d = ", tr, tr, tb);
+  emit_expr(c, recv, b); buf_printf(b, "; mrb_float _t%d = ", tl); emit_expr(c, sv[0], b);
+  buf_printf(b, "; mrb_float _t%d = ", ts);
+  if (sc >= 2) emit_expr(c, sv[1], b); else buf_puts(b, "1.0");
+  buf_printf(b, "; mrb_float _t%d_e = (fabs(_t%d)+fabs(_t%d)+fabs(_t%d-_t%d))/fabs(_t%d)*DBL_EPSILON;"
+                " if (_t%d_e > 0.5) _t%d_e = 0.5;"
+                " mrb_int _t%d = (mrb_int)floor((_t%d-_t%d)/_t%d + _t%d_e);"
+                " for (mrb_int _t%d = 0; _t%d <= _t%d; _t%d++) sp_FloatArray_push(_t%d, _t%d + _t%d * _t%d); _t%d; })",
+             tn, tb, tl, tl, tb, ts, tn, tn, tn, tl, tb, ts, tn, ti, ti, tn, ti, tr, tb, ti, ts, tr);
+  return 1;
+}
+
 /* inject(:op) / reduce(:op) / inject(&:op) / inject(init, :op) as an
    expression: fold the array with a symbol-named arithmetic operator. The
    block-fold form (inject { |a, e| ... }) is not handled here. Returns 1 if
@@ -1319,6 +1358,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (emit_minmax_by_expr(c, id, b)) return;
   if (emit_sort_cmp_expr(c, id, b)) return;
   if (emit_minmax_cmp_expr(c, id, b)) return;
+  if (emit_step_array_expr(c, id, b)) return;
   if (emit_bsearch_expr(c, id, b)) return;
   if (emit_sum_block_expr(c, id, b)) return;
   if (emit_transform_hash_expr(c, id, b)) return;

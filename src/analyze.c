@@ -755,6 +755,14 @@ static TyKind infer_call(Compiler *c, int id) {
     if ((!strcmp(name, "<<") || !strcmp(name, "concat") || !strcmp(name, "prepend")) && argc == 1)
       return TY_STRING;
   }
+  /* numeric.step(...) without a block materializes the sequence as an array */
+  if (recv >= 0 && ty_is_numeric(rt) && !strcmp(name, "step") && nt_ref(nt, id, "block") < 0) {
+    int args = nt_ref(nt, id, "arguments");
+    int sc = 0; const int *sv = args >= 0 ? nt_arr(nt, args, "arguments", &sc) : NULL;
+    int isf = (rt == TY_FLOAT) || (sc >= 1 && infer_type(c, sv[0]) == TY_FLOAT) ||
+              (sc >= 2 && infer_type(c, sv[1]) == TY_FLOAT);
+    return isf ? TY_FLOAT_ARRAY : TY_INT_ARRAY;
+  }
   /* integer receiver methods */
   if (recv >= 0 && rt == TY_INT) {
     if (!strcmp(name, "ceil") || !strcmp(name, "floor") ||
