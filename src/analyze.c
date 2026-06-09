@@ -566,6 +566,7 @@ static TyKind infer_call(Compiler *c, int id) {
     if ((!strcmp(name, "delete_at") || !strcmp(name, "delete")) && argc == 1)
       return ty_array_elem(rt);
     if (!strcmp(name, "shift") && argc == 0) return ty_array_elem(rt);
+    if (!strcmp(name, "slice!") && argc == 2) return rt;  /* removed subarray */
     if (!strcmp(name, "[]="))                         return ty_array_elem(rt);
     if ((!strcmp(name, "assoc") || !strcmp(name, "rassoc")) && rt == TY_POLY_ARRAY)
       return TY_POLY_ARRAY;  /* the matching sub-array, or nil (NULL ptr) */

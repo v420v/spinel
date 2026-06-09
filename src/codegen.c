@@ -2910,6 +2910,13 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         if (rt == TY_INT_ARRAY) { buf_printf(b, "sp_IntArray_tally_int("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
         if (rt == TY_STR_ARRAY) { buf_printf(b, "sp_StrArray_tally("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
       }
+      if (!strcmp(name, "slice!") && argc == 2) {
+        /* slice!(start, len): remove and return the subarray (raises
+           FrozenError inside the runtime helper when the array is frozen) */
+        buf_printf(b, "sp_%sArray_slice_bang(", k); emit_expr(c, recv, b);
+        buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
+        return;
+      }
       if ((!strcmp(name, "all?") || !strcmp(name, "any?") ||
            !strcmp(name, "none?") || !strcmp(name, "one?")) &&
           argc == 0 && nt_ref(nt, id, "block") < 0) {
