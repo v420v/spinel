@@ -71,6 +71,9 @@ static const char *g_rescue_cls = NULL, *g_rescue_msg = NULL;
 /* When set, tail positions assign to this var instead of `return`ing
    (used to give a begin/rescue a value). */
 static const char *g_result_var = NULL;
+/* When g_result_var is set, whether that result slot is poly (so a scalar
+   tail value must be boxed into it). */
+static int g_result_poly = 0;
 /* Return type of the method currently being emitted, so a tail/return value
    can be boxed when the method returns poly but the value is concrete. */
 static TyKind g_ret_type = TY_UNKNOWN;
@@ -4362,7 +4365,9 @@ static void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
       char rv[32]; snprintf(rv, sizeof rv, "_t%d", t);
       emit_indent(b, indent); emit_ctype(c, rt, b);
       buf_printf(b, " _t%d = %s;\n", t, rt == TY_RANGE ? "(sp_Range){0}" : default_value(rt));
+      int sp = g_result_poly; g_result_poly = (rt == TY_POLY);
       emit_begin(c, id, b, indent, rv);
+      g_result_poly = sp;
       emit_indent(b, indent); emit_tail_lead(b); buf_printf(b, "_t%d;\n", t);
       return;
     }
@@ -4382,7 +4387,8 @@ static void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
   /* a value expression: return it (or assign to the begin/rescue result) */
   emit_indent(b, indent);
   emit_tail_lead(b);
-  if (!g_result_var && g_ret_type == TY_POLY && comp_ntype(c, id) != TY_POLY) emit_boxed(c, id, b);
+  int want_poly = g_result_var ? g_result_poly : (g_ret_type == TY_POLY);
+  if (want_poly && comp_ntype(c, id) != TY_POLY) emit_boxed(c, id, b);
   else emit_expr(c, id, b);
   buf_puts(b, ";\n");
 }
