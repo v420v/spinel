@@ -3,6 +3,6 @@ local-variable
 
 constant
 
-expression
-expression
+nil
+self
 instance-variable

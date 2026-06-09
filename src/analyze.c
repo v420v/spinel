@@ -78,16 +78,31 @@ static int is_blk_param_call(Compiler *c, int node, int mi) {
   return rn && bp && bp[0] && !strcmp(rn, bp);
 }
 
+/* Re-entrancy guard for yield_value_type: prevents infinite recursion when a
+   recursive method forwards its block to itself (e.g. countdown { blk.call }). */
+#define MAX_YVT_DEPTH 32
+static int g_yvt_mi[MAX_YVT_DEPTH];
+static int g_yvt_depth = 0;
+
 /* The value type of `yield` / a `<&block-param>.call` inside method mi: the
    block-body value type at a (any) call site of mi. Polymorphic, resolved from
    the first matching caller -- matches how the rewrite inlines per call site. */
 static TyKind yield_value_type(Compiler *c, int mi) {
+  for (int i = 0; i < g_yvt_depth; i++)
+    if (g_yvt_mi[i] == mi) return TY_UNKNOWN;
+  if (g_yvt_depth >= MAX_YVT_DEPTH) return TY_UNKNOWN;
+  g_yvt_mi[g_yvt_depth++] = mi;
+
   const NodeTable *nt = c->nt;
+  TyKind result = TY_UNKNOWN;
   for (int cid = 0; cid < nt->count; cid++) {
     const char *cty = nt_type(nt, cid);
     if (!cty || strcmp(cty, "CallNode")) continue;
     int blk = nt_ref(nt, cid, "block");
     if (blk < 0) continue;
+    /* skip calls that live inside method mi itself (recursive self-calls);
+       only external call sites provide a concrete block value type */
+    if ((int)(comp_scope_of(c, cid) - c->scopes) == mi) continue;
     const char *cn = nt_str(nt, cid, "name");
     int crecv = nt_ref(nt, cid, "receiver");
     int rmi = -1;
@@ -101,11 +116,13 @@ static TyKind yield_value_type(Compiler *c, int mi) {
     if (rmi != mi) continue;
     int bb = nt_ref(nt, blk, "body");
     int bn = 0; const int *bd = bb >= 0 ? nt_arr(nt, bb, "body", &bn) : NULL;
-    if (bn == 0) return TY_NIL;
+    if (bn == 0) { result = TY_NIL; break; }
     TyKind bt = infer_type(c, bd[bn - 1]);
-    return bt == TY_VOID ? TY_NIL : bt;  /* a void last-expr's block value is nil */
+    result = bt == TY_VOID ? TY_NIL : bt;  /* a void last-expr's block value is nil */
+    break;
   }
-  return TY_UNKNOWN;
+  g_yvt_depth--;
+  return result;
 }
 
 static TyKind method_call_ret(Compiler *c, int mi, int call_id) {
@@ -357,6 +374,10 @@ static TyKind infer_call(Compiler *c, int id) {
          !strcmp(name, "mktime") || !strcmp(name, "utc") || !strcmp(name, "gm")))
       return TY_TIME;
     if (rty && !strcmp(rty, "ConstantReadNode") &&
+        nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "GC") &&
+        (!strcmp(name, "start") || !strcmp(name, "compact") || !strcmp(name, "stat")))
+      return TY_NIL;
+    if (rty && !strcmp(rty, "ConstantReadNode") &&
         nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "Process") &&
         (!strcmp(name, "pid") || !strcmp(name, "ppid")))
       return TY_INT;
@@ -574,6 +595,18 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "empty?") || !strcmp(name, "include?")) return TY_BOOL;
     if ((!strcmp(name, "all?") || !strcmp(name, "any?") ||
          !strcmp(name, "none?") || !strcmp(name, "one?")) && argc == 0) return TY_BOOL;
+    if ((!strcmp(name, "bsearch") || !strcmp(name, "find") || !strcmp(name, "detect")) && block >= 0)
+      return ty_array_elem(rt);  /* element or nil */
+    if ((!strcmp(name, "map!") || !strcmp(name, "collect!")) && block >= 0) {
+      int body = nt_ref(nt, block, "body");
+      int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+      TyKind bt = bn > 0 ? infer_type(c, bb[bn - 1]) : TY_UNKNOWN;
+      return bt != TY_UNKNOWN ? ty_array_of(bt) : rt;
+    }
+    if ((!strcmp(name, "select!") || !strcmp(name, "filter!") || !strcmp(name, "reject!") ||
+         !strcmp(name, "keep_if") || !strcmp(name, "delete_if")) && block >= 0) return rt;
+    if (!strcmp(name, "find_index") || !strcmp(name, "index")) return TY_INT;  /* int or nil */
+    if (!strcmp(name, "each_index")) return rt;
     if (!strcmp(name, "push") || !strcmp(name, "<<") || !strcmp(name, "append") ||
         !strcmp(name, "reverse") || !strcmp(name, "sort") || !strcmp(name, "uniq") ||
         !strcmp(name, "to_a") || !strcmp(name, "dup") || !strcmp(name, "clone") ||
@@ -2209,7 +2242,12 @@ static int infer_block_params(Compiler *c) {
               !strcmp(name, "reverse_each") || !strcmp(name, "each_entry") ||
               !strcmp(name, "sum") || !strcmp(name, "count") ||
               !strcmp(name, "any?") || !strcmp(name, "all?") || !strcmp(name, "none?") ||
-              !strcmp(name, "one?") || !strcmp(name, "each_with_index")) &&
+              !strcmp(name, "one?") || !strcmp(name, "each_with_index") ||
+              !strcmp(name, "bsearch") || !strcmp(name, "find_index") ||
+              !strcmp(name, "map!") || !strcmp(name, "collect!") ||
+              !strcmp(name, "select!") || !strcmp(name, "filter!") || !strcmp(name, "reject!") ||
+              !strcmp(name, "keep_if") || !strcmp(name, "delete_if") || !strcmp(name, "each_index") ||
+              !strcmp(name, "flat_map") || !strcmp(name, "each_with_object")) &&
              ty_is_array(rt))
       pt = ty_array_elem(rt);
 
@@ -2723,6 +2761,22 @@ void analyze_program(Compiler *c) {
     ClassInfo *ci = &c->classes[s->class_id];
     int iv = comp_ivar_index(ci, nt_str(c->nt, id, "name"));
     if (iv >= 0 && ci->ivar_types[iv] == TY_UNKNOWN) ci->ivar_types[iv] = TY_INT_ARRAY;
+  }
+  /* Backstop: a local variable assigned only empty array literals with no
+     push evidence stays TY_UNKNOWN. Default it to TY_POLY_ARRAY so array
+     operations (map!, p, etc.) can dispatch. */
+  for (int id = 0; id < c->nt->count; id++) {
+    const char *ty = nt_type(c->nt, id);
+    if (!ty || strcmp(ty, "LocalVariableWriteNode")) continue;
+    int v = nt_ref(c->nt, id, "value");
+    const char *vty = v >= 0 ? nt_type(c->nt, v) : NULL;
+    if (!vty || strcmp(vty, "ArrayNode")) continue;
+    int en = 0; nt_arr(c->nt, v, "elements", &en);
+    if (en != 0) continue;
+    const char *nm = nt_str(c->nt, id, "name");
+    Scope *s = comp_scope_of(c, id);
+    LocalVar *lv = nm ? scope_local(s, nm) : NULL;
+    if (lv && lv->type == TY_UNKNOWN) lv->type = TY_POLY_ARRAY;
   }
   /* A read-only ivar (referenced but never assigned a typed value) stays
      TY_UNKNOWN -> it has no C type. Such a slot always reads nil at runtime;

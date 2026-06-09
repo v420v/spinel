@@ -65,6 +65,8 @@ static const char *g_block_param_name = NULL;
 /* The C expression for `self` (a pointer). Overridden while inlining an
    instance method at a call site (where there is no real `self` param). */
 static const char *g_self = "self";
+/* When emitting class/module body statements, the class index (-1 outside). */
+static int g_class_body_id = -1;
 /* While emitting a rescue handler: the C var names holding the caught
    exception's class/message, so a bare `raise` can re-raise. */
 static const char *g_rescue_cls = NULL, *g_rescue_msg = NULL;
@@ -2017,6 +2019,14 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     return;
   }
 
+  /* GC module methods */
+  if (recv >= 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode") &&
+      nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "GC")) {
+    if (!strcmp(name, "start") && argc == 0) { buf_puts(b, "0LL"); return; }
+    if (!strcmp(name, "compact") && argc == 0) { buf_puts(b, "0LL"); return; }
+    if (!strcmp(name, "stat") && argc == 0) { buf_puts(b, "sp_box_nil()"); return; }
+  }
+
   /* Process module methods */
   if (recv >= 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode") &&
       nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "Process")) {
@@ -3626,6 +3636,139 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "sp_%sArray_slice_bang(", k); emit_expr(c, recv, b);
         buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
         return;
+      }
+      int block = nt_ref(nt, id, "block");
+      /* bsearch { |x| cond } on typed arrays - find-minimum mode */
+      if (!strcmp(name, "bsearch") && block >= 0) {
+        const char *bp = block_param_name(c, block, 0); if (bp) bp = rename_local(bp);
+        int body = nt_ref(nt, block, "body");
+        int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+        if (bn >= 1) {
+          TyKind et = ty_array_elem(rt);
+          int trecv = ++g_tmp, tlo = ++g_tmp, thi = ++g_tmp, tres = ++g_tmp, tmid = ++g_tmp;
+          emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+          buf_printf(g_pre, " _t%d = ", trecv); emit_expr(c, recv, g_pre); buf_puts(g_pre, ";\n");
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "mrb_int _t%d = 0, _t%d = sp_%sArray_length(_t%d) - 1;\n", tlo, thi, k, trecv);
+          emit_indent(g_pre, g_indent); emit_ctype(c, et, g_pre);
+          buf_printf(g_pre, " _t%d = %s;\n", tres, et == TY_INT ? "SP_INT_NIL" : "NULL");
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "while (_t%d <= _t%d) {\n", tlo, thi);
+          emit_indent(g_pre, g_indent + 1);
+          buf_printf(g_pre, "mrb_int _t%d = _t%d + (_t%d - _t%d) / 2;\n", tmid, tlo, thi, tlo);
+          if (bp) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = sp_%sArray_get(_t%d, _t%d);\n", bp, k, trecv, tmid); }
+          for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
+          int sv = g_indent; g_indent++;
+          Buf cb; memset(&cb, 0, sizeof cb); emit_expr(c, bb[bn - 1], &cb); g_indent = sv;
+          emit_indent(g_pre, g_indent + 1);
+          buf_printf(g_pre, "if (%s) { _t%d = sp_%sArray_get(_t%d, _t%d); _t%d = _t%d - 1; }\n",
+                     cb.p ? cb.p : "0", tres, k, trecv, tmid, thi, tmid);
+          free(cb.p);
+          emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "else { _t%d = _t%d + 1; }\n", tlo, tmid);
+          emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+          buf_printf(b, "_t%d", tres); return;
+        }
+      }
+      /* find_index { |x| cond } on typed arrays - returns index or SP_INT_NIL */
+      if (!strcmp(name, "find_index") && block >= 0) {
+        const char *bp = block_param_name(c, block, 0); if (bp) bp = rename_local(bp);
+        int body = nt_ref(nt, block, "body");
+        int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+        if (bn >= 1) {
+          int trecv = ++g_tmp, ti = ++g_tmp, tres = ++g_tmp;
+          emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+          buf_printf(g_pre, " _t%d = ", trecv); emit_expr(c, recv, g_pre); buf_puts(g_pre, ";\n");
+          emit_indent(g_pre, g_indent); buf_printf(g_pre, "mrb_int _t%d = SP_INT_NIL;\n", tres);
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
+                     ti, ti, k, trecv, ti);
+          if (bp) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = sp_%sArray_get(_t%d, _t%d);\n", bp, k, trecv, ti); }
+          for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
+          int sv = g_indent; g_indent++;
+          Buf cb; memset(&cb, 0, sizeof cb); emit_expr(c, bb[bn - 1], &cb); g_indent = sv;
+          emit_indent(g_pre, g_indent + 1);
+          buf_printf(g_pre, "if (%s) { _t%d = _t%d; break; }\n", cb.p ? cb.p : "0", tres, ti);
+          free(cb.p);
+          emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+          buf_printf(b, "_t%d", tres); return;
+        }
+      }
+      /* map! / collect! { |x| body } - in-place transform, returns receiver */
+      if ((!strcmp(name, "map!") || !strcmp(name, "collect!")) && block >= 0) {
+        const char *bp = block_param_name(c, block, 0); if (bp) bp = rename_local(bp);
+        int body = nt_ref(nt, block, "body");
+        int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+        if (bn >= 1) {
+          int trecv = ++g_tmp, ti = ++g_tmp;
+          Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+          emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+          buf_printf(g_pre, " _t%d = %s;\n", trecv, rb.p ? rb.p : ""); free(rb.p);
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
+                     ti, ti, k, trecv, ti);
+          if (bp) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = sp_%sArray_get(_t%d, _t%d);\n", bp, k, trecv, ti); }
+          for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
+          int sv = g_indent; g_indent++;
+          Buf vb; memset(&vb, 0, sizeof vb); emit_expr(c, bb[bn - 1], &vb); g_indent = sv;
+          emit_indent(g_pre, g_indent + 1);
+          buf_printf(g_pre, "sp_%sArray_set(_t%d, _t%d, %s);\n", k, trecv, ti, vb.p ? vb.p : "0");
+          free(vb.p);
+          emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+          buf_printf(b, "_t%d", trecv); return;
+        }
+      }
+      /* select! / filter! / keep_if / reject! / delete_if { |x| cond } - in-place filter */
+      if ((!strcmp(name, "select!") || !strcmp(name, "filter!") || !strcmp(name, "keep_if") ||
+           !strcmp(name, "reject!") || !strcmp(name, "delete_if")) && block >= 0) {
+        int is_rej = !strcmp(name, "reject!") || !strcmp(name, "delete_if");
+        const char *bp = block_param_name(c, block, 0); if (bp) bp = rename_local(bp);
+        int body = nt_ref(nt, block, "body");
+        int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+        if (bn >= 1) {
+          int trecv = ++g_tmp, ti = ++g_tmp, twp = ++g_tmp;
+          Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+          emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+          buf_printf(g_pre, " _t%d = %s;\n", trecv, rb.p ? rb.p : ""); free(rb.p);
+          emit_indent(g_pre, g_indent); buf_printf(g_pre, "mrb_int _t%d = 0;\n", twp);
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
+                     ti, ti, k, trecv, ti);
+          TyKind et = ty_array_elem(rt);
+          emit_indent(g_pre, g_indent + 1); emit_ctype(c, et, g_pre);
+          buf_printf(g_pre, " _telt%d = sp_%sArray_get(_t%d, _t%d);\n", ti, k, trecv, ti);
+          if (bp) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = _telt%d;\n", bp, ti); }
+          for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
+          int sv = g_indent; g_indent++;
+          Buf cb; memset(&cb, 0, sizeof cb); emit_expr(c, bb[bn - 1], &cb); g_indent = sv;
+          emit_indent(g_pre, g_indent + 1);
+          if (is_rej)
+            buf_printf(g_pre, "if (!(%s)) { sp_%sArray_set(_t%d, _t%d, _telt%d); _t%d++; }\n",
+                       cb.p ? cb.p : "0", k, trecv, twp, ti, twp);
+          else
+            buf_printf(g_pre, "if (%s) { sp_%sArray_set(_t%d, _t%d, _telt%d); _t%d++; }\n",
+                       cb.p ? cb.p : "0", k, trecv, twp, ti, twp);
+          free(cb.p);
+          emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+          emit_indent(g_pre, g_indent); buf_printf(g_pre, "if (_t%d) _t%d->len = _t%d;\n", trecv, trecv, twp);
+          buf_printf(b, "_t%d", trecv); return;
+        }
+      }
+      /* each_index { |i| ... } - iterate with index */
+      if (!strcmp(name, "each_index") && block >= 0) {
+        /* statement-mode: just emit the loop and return the receiver */
+        const char *ip = block_param_name(c, block, 0); if (ip) ip = rename_local(ip);
+        int body = nt_ref(nt, block, "body");
+        int trecv = ++g_tmp, ti = ++g_tmp;
+        Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+        emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+        buf_printf(g_pre, " _t%d = %s;\n", trecv, rb.p ? rb.p : ""); free(rb.p);
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
+                   ti, ti, k, trecv, ti);
+        if (ip) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = _t%d;\n", ip, ti); }
+        emit_stmts(c, body, g_pre, g_indent + 1);
+        emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+        buf_printf(b, "_t%d", trecv); return;
       }
       if ((!strcmp(name, "all?") || !strcmp(name, "any?") ||
            !strcmp(name, "none?") || !strcmp(name, "one?")) &&
@@ -5254,10 +5397,21 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     const char *res = NULL;
     if (vt) {
       if (!strcmp(vt, "LocalVariableReadNode")) res = "local-variable";
-      else if (!strcmp(vt, "InstanceVariableReadNode")) res = "instance-variable";
+      else if (!strcmp(vt, "InstanceVariableReadNode")) {
+        /* Return "instance-variable" only when the ivar is known to be assigned. */
+        const char *inm = nt_str(nt, v, "name");
+        for (int kk = 0; kk < nt->count && !res; kk++) {
+          const char *kt = nt_type(nt, kk);
+          if (kt && !strcmp(kt, "InstanceVariableWriteNode") &&
+              inm && nt_str(nt, kk, "name") && !strcmp(nt_str(nt, kk, "name"), inm))
+            res = "instance-variable";
+        }
+      }
       else if (!strcmp(vt, "ClassVariableReadNode")) res = "class variable";
       else if (!strcmp(vt, "SelfNode")) res = "self";
-      else if (!strcmp(vt, "TrueNode") || !strcmp(vt, "FalseNode") || !strcmp(vt, "NilNode")) res = "expression";
+      else if (!strcmp(vt, "NilNode")) res = "nil";
+      else if (!strcmp(vt, "TrueNode")) res = "true";
+      else if (!strcmp(vt, "FalseNode")) res = "false";
       else if (!strcmp(vt, "IntegerNode") || !strcmp(vt, "FloatNode") ||
                !strcmp(vt, "StringNode") || !strcmp(vt, "SymbolNode") || !strcmp(vt, "ArrayNode")) res = "expression";
       else if (!strcmp(vt, "GlobalVariableReadNode")) {
@@ -5271,7 +5425,20 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
       }
       else if (!strcmp(vt, "ConstantReadNode")) {
         const char *cn = nt_str(nt, v, "name");
-        if (cn && comp_const(c, cn)) res = "constant";
+        static const char *const builtins[] = {
+          "Object", "BasicObject", "Kernel", "Module", "Class", "Array", "Hash",
+          "String", "Integer", "Float", "Symbol", "Regexp", "Range", "NilClass",
+          "TrueClass", "FalseClass", "Numeric", "Comparable", "Enumerable",
+          "IO", "File", "Dir", "Math", "GC", "Process", "ENV", "ARGV",
+          "STDOUT", "STDERR", "STDIN", NULL
+        };
+        if (cn) {
+          if (comp_const(c, cn) || comp_class_index(c, cn) >= 0) res = "constant";
+          if (!res) {
+            for (int bi = 0; builtins[bi]; bi++)
+              if (!strcmp(cn, builtins[bi])) { res = "constant"; break; }
+          }
+        }
       }
       else if (!strcmp(vt, "CallNode") && nt_ref(nt, v, "receiver") < 0) {
         const char *cn = nt_str(nt, v, "name");
@@ -6574,14 +6741,25 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
   if (!strcmp(ty, "InstanceVariableWriteNode")) {
     const char *nm = nt_str(nt, id, "name");
     int v = nt_ref(nt, id, "value");
-    emit_indent(b, indent);
     Scope *cws = comp_scope_of(c, id);
-    if (cws && cws->is_cmethod && cws->class_id >= 0)
-      buf_printf(b, "civ_%s_%s = ", c->classes[cws->class_id].name, nm + 1);
-    else
-      buf_printf(b, "%s->iv_%s = ", g_self, nm + 1);
+    /* Ivar write in a class/module body (outside any def): write to the
+       module-level civ_ variable. */
+    if (cws && cws->class_id < 0 && !cws->is_cmethod && g_class_body_id >= 0) {
+      emit_indent(b, indent);
+      buf_printf(b, "civ_%s_%s = ", c->classes[g_class_body_id].name, nm + 1);
+    }
+    /* True top-level (outside any class or method): skip. */
+    else if (!cws || (cws->class_id < 0 && !cws->is_cmethod && !cws->yields)) { return; }
+    else {
+      emit_indent(b, indent);
+      if (cws && cws->is_cmethod && cws->class_id >= 0)
+        buf_printf(b, "civ_%s_%s = ", c->classes[cws->class_id].name, nm + 1);
+      else
+        buf_printf(b, "%s->iv_%s = ", g_self, nm + 1);
+    }
     const char *vty = nt_type(nt, v);
-    int sc = comp_scope_of(c, id)->class_id;
+    int sc = cws ? cws->class_id : -1;
+    if (sc < 0 && g_class_body_id >= 0) sc = g_class_body_id;
     TyKind ivt = TY_INT;
     if (sc >= 0) { int iv = comp_ivar_index(&c->classes[sc], nm); if (iv >= 0) ivt = c->classes[sc].ivar_types[iv]; }
     int ven = 0;
@@ -6791,6 +6969,10 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
        (top-to-bottom, like CRuby). Method/attr/alias declarations are
        handled elsewhere; everything else (puts, constant writes, nested
        class/module bodies) executes inline here. */
+    int cp = nt_ref(nt, id, "constant_path");
+    const char *cname = cp >= 0 ? nt_str(nt, cp, "name") : NULL;
+    int saved_cbi = g_class_body_id;
+    if (cname) g_class_body_id = comp_class_index(c, cname);
     int body = nt_ref(nt, id, "body");
     int n = 0;
     const int *stmts = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
@@ -6810,6 +6992,7 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
       }
       emit_stmt(c, stmts[k], b, indent);
     }
+    g_class_body_id = saved_cbi;
     return;
   }
   if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) {
