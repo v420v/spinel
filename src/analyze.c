@@ -655,6 +655,7 @@ static TyKind infer_call(Compiler *c, int id) {
     return ty_is_numeric(rt) ? rt : TY_UNKNOWN;
   if (!strcmp(name, "!")) return TY_BOOL;
   if (!strcmp(name, "respond_to?") && recv >= 0) return TY_BOOL;
+  if (!strcmp(name, "nil?") && recv >= 0 && argc == 0) return TY_BOOL;
   if ((!strcmp(name, "match?") || !strcmp(name, "!~")) && recv >= 0) return TY_BOOL;
   if (!strcmp(name, "=~") && recv >= 0 && argc == 1) {
     const char *rrt = nt_type(nt, recv), *art = nt_type(nt, argv[0]);

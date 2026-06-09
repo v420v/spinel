@@ -1363,6 +1363,14 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (!strcmp(name, "to_f")) { buf_puts(b, "sp_poly_to_f("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
   }
 
+  /* nil? on an integer: a nullable int carries the SP_INT_NIL sentinel
+     (e.g. an int-valued hash miss). A plain int is never the sentinel, so
+     `5.nil?` constant-folds to false; a missing-key value reads true. */
+  if (recv >= 0 && rt == TY_INT && !strcmp(name, "nil?") && argc == 0) {
+    buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, ") == SP_INT_NIL)");
+    return;
+  }
+
   /* `===` on a scalar comparable (bool/int/float/string/symbol) is case
      equality == value equality. Range/Class/Regexp `===` have their own
      handlers and fall through here. */
@@ -1391,6 +1399,11 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         emit_expr(c, other, b); buf_puts(b, eq ? ")" : "))");
       }
       else if (ot == TY_NIL) buf_puts(b, eq ? "1" : "0");
+      else if (ot == TY_INT) {
+        /* a nullable int compares equal to nil iff it holds the sentinel;
+           a plain int constant-folds to false */
+        buf_puts(b, "(("); emit_expr(c, other, b); buf_printf(b, ") %s SP_INT_NIL)", eq ? "==" : "!=");
+      }
       else { buf_puts(b, "(("); emit_expr(c, other, b); buf_printf(b, "), %d)", eq ? 0 : 1); }
       return;
     }
@@ -2297,7 +2310,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "sp_re_index_poly(sp_re_pat_%d, %s)", re_lit_index(c, argv[0]), r);
       }
       else if (!strcmp(name, "index") && argc == 1) {
-        buf_printf(b, "sp_str_index(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        /* nil-on-miss carried as the SP_INT_NIL sentinel (a nullable int) */
+        buf_printf(b, "sp_str_index_opt(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")");
       }
       else if ((!strcmp(name, "partition") || !strcmp(name, "rpartition")) && argc == 1 &&
                re_lit_index(c, argv[0]) < 0) {
@@ -2393,8 +2407,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else handled = 0;
     }
     else if (rt == TY_INT) {
-      if      (!strcmp(name, "to_s") && argc == 0) buf_printf(b, "sp_int_to_s(%s)", r);
-      else if (!strcmp(name, "inspect")) buf_printf(b, "sp_int_to_s(%s)", r);
+      if      (!strcmp(name, "to_s") && argc == 0) buf_printf(b, "((%s) == SP_INT_NIL ? SPL(\"\") : sp_int_to_s(%s))", r, r);
+      else if (!strcmp(name, "inspect")) buf_printf(b, "((%s) == SP_INT_NIL ? SPL(\"nil\") : sp_int_to_s(%s))", r, r);
       else if (!strcmp(name, "to_f"))   buf_printf(b, "((mrb_float)(%s))", r);
       else if ((!strcmp(name, "to_i") || !strcmp(name, "to_int") || !strcmp(name, "floor") ||
                 !strcmp(name, "ceil") || !strcmp(name, "round") || !strcmp(name, "truncate")) &&
@@ -3277,6 +3291,7 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     if (lt == TY_POLY)      buf_printf(b, "sp_poly_truthy(_t%d)", t);
     else if (lt == TY_BOOL) buf_printf(b, "_t%d", t);
     else if (lt == TY_NIL)  buf_puts(b, "0");
+    else if (lt == TY_INT)  buf_printf(b, "(_t%d != SP_INT_NIL)", t);  /* a nullable int reads falsy at the sentinel; a plain int is always truthy */
     else                    buf_puts(b, "1");  /* concrete value: always truthy */
     buf_puts(b, " ? ");
     /* the "kept-left" arm and the "right" arm, each widened to res */
@@ -3309,7 +3324,10 @@ static void emit_puts_one(Compiler *c, int arg, Buf *b, int indent) {
   TyKind t = comp_ntype(c, arg);
   emit_indent(b, indent);
   if (t == TY_INT) {
-    buf_puts(b, "printf(\"%lld\\n\", (long long)"); emit_expr(c, arg, b); buf_puts(b, ");\n");
+    /* a nullable int at the sentinel prints as nil (an empty line) */
+    int tv = ++g_tmp;
+    buf_printf(b, "{ mrb_int _t%d = ", tv); emit_expr(c, arg, b);
+    buf_printf(b, "; if (_t%d == SP_INT_NIL) putchar('\\n'); else printf(\"%%lld\\n\", (long long)_t%d); }\n", tv, tv);
   }
   else if (t == TY_FLOAT) {
     buf_puts(b, "{ const char *_fs = sp_float_to_s("); emit_expr(c, arg, b);
@@ -3415,7 +3433,10 @@ static void emit_p_one(Compiler *c, int arg, Buf *b, int indent) {
   }
   emit_indent(b, indent);
   if (t == TY_INT) {
-    buf_puts(b, "printf(\"%lld\\n\", (long long)"); emit_expr(c, arg, b); buf_puts(b, ");\n");
+    /* p of a nullable int at the sentinel prints "nil" */
+    int tv = ++g_tmp;
+    buf_printf(b, "{ mrb_int _t%d = ", tv); emit_expr(c, arg, b);
+    buf_printf(b, "; if (_t%d == SP_INT_NIL) fputs(\"nil\\n\", stdout); else printf(\"%%lld\\n\", (long long)_t%d); }\n", tv, tv);
   }
   else if (t == TY_FLOAT) {
     buf_puts(b, "{ const char *_fs = sp_float_to_s("); emit_expr(c, arg, b);
