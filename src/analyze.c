@@ -751,6 +751,7 @@ static TyKind infer_call(Compiler *c, int id) {
     return ty_is_numeric(rt) ? rt : TY_UNKNOWN;
   if (!strcmp(name, "!")) return TY_BOOL;
   if (!strcmp(name, "respond_to?") && recv >= 0) return TY_BOOL;
+  if ((!strcmp(name, "method_defined?") || !strcmp(name, "const_defined?")) && recv >= 0) return TY_BOOL;
   if (!strcmp(name, "nil?") && recv >= 0 && argc == 0) return TY_BOOL;
   if (!strcmp(name, "object_id") && recv >= 0 && argc == 0) return TY_INT;
   if (!strcmp(name, "between?") && argc == 2 && (rt == TY_STRING || ty_is_numeric(rt))) return TY_BOOL;

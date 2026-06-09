@@ -1611,6 +1611,50 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     }
   }
 
+  /* Class.method_defined?(:m[, inherit]): compile-time decided from the
+     class's recorded method table (instance methods + attr readers/writers).
+     inherit=false restricts the lookup to the receiver's own definitions. */
+  if (!strcmp(name, "method_defined?") && recv >= 0 && argc >= 1 &&
+      nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode")) {
+    const char *aty = nt_type(nt, argv[0]);
+    const char *qm = NULL;
+    if (aty && !strcmp(aty, "SymbolNode")) qm = nt_str(nt, argv[0], "value");
+    else if (aty && !strcmp(aty, "StringNode")) qm = nt_str(nt, argv[0], "content");
+    int ci = comp_class_index(c, nt_str(nt, recv, "name"));
+    if (qm && ci >= 0) {
+      int inherit = 1;
+      if (argc >= 2) {
+        const char *it = nt_type(nt, argv[1]);
+        if (it && !strcmp(it, "FalseNode")) inherit = 0;
+      }
+      /* a writer query (`m=`) consults the writer table under its base name */
+      size_t ln = strlen(qm);
+      int is_setter = ln > 0 && qm[ln - 1] == '=';
+      char base[256];
+      base[0] = '\0';
+      if (is_setter && ln - 1 < sizeof base) { memcpy(base, qm, ln - 1); base[ln - 1] = '\0'; }
+      int parent = c->classes[ci].parent;
+      int mc = -1;
+      int mi = comp_method_in_chain(c, ci, qm, &mc);
+      int yes;
+      if (inherit) {
+        yes = mi >= 0 || comp_reader_in_chain(c, ci, qm, NULL) ||
+              (is_setter && comp_writer_in_chain(c, ci, base, NULL));
+      }
+      else {
+        /* attr readers/writers are flattened into descendants at analyze
+           time, so "own" means present here but not in the parent chain */
+        int rd_own = comp_is_reader(&c->classes[ci], qm) &&
+                     (parent < 0 || !comp_reader_in_chain(c, parent, qm, NULL));
+        int wr_own = is_setter && comp_is_writer(&c->classes[ci], base) &&
+                     (parent < 0 || !comp_writer_in_chain(c, parent, base, NULL));
+        yes = (mi >= 0 && mc == ci) || rd_own || wr_own;
+      }
+      buf_printf(b, "%d", yes);
+      return;
+    }
+  }
+
   if ((!strcmp(name, "-@") || !strcmp(name, "+@")) && recv >= 0 && argc == 0 && !ty_is_object(rt)) {
     buf_puts(b, name[0] == '-' ? "(-" : "(+");
     emit_expr(c, recv, b); buf_puts(b, ")");
