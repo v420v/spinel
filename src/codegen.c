@@ -3808,6 +3808,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else if (!strcmp(name, "crypt") && argc == 1) { buf_printf(b, "sp_str_crypt(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       else if (!strcmp(name, "scrub") && argc == 0) buf_printf(b, "sp_str_scrub(%s, 0)", r);
       else if (!strcmp(name, "scrub") && argc == 1) { buf_printf(b, "sp_str_scrub(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else if ((!strcmp(name, "[]") || !strcmp(name, "slice")) && argc == 1 && re_lit_index(c, argv[0]) >= 0) {
+        /* s[/re/] -> the matched substring, or nil (NULL) on no match */
+        buf_printf(b, "(sp_re_match(sp_re_pat_%d, %s) >= 0 ? sp_re_match_str : NULL)", re_lit_index(c, argv[0]), r);
+      }
       else if ((!strcmp(name, "[]") || !strcmp(name, "slice")) && argc == 1 && nt_type(c->nt, argv[0]) &&
                !strcmp(nt_type(c->nt, argv[0]), "RangeNode")) {
         /* s[a..b] / s[a...b]; beginless/endless ranges use 0 / length */
