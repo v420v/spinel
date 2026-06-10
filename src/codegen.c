@@ -9099,6 +9099,38 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     }
     return;
   }
+  if (!strcmp(ty, "CallOrWriteNode") || !strcmp(ty, "CallAndWriteNode")) {
+    int is_or = !strcmp(ty, "CallOrWriteNode");
+    int recv = nt_ref(nt, id, "receiver");
+    const char *attr = nt_str(nt, id, "name");  /* attr/reader name */
+    int v = nt_ref(nt, id, "value");
+    if (recv < 0 || !attr) { unsupported(c, id, is_or ? "call-or-write" : "call-and-write"); return; }
+    TyKind rt = comp_ntype(c, recv);
+    if (!ty_is_object(rt)) { unsupported(c, id, is_or ? "call-or-write (non-object)" : "call-and-write (non-object)"); return; }
+    int class_id = ty_object_class(rt);
+    char ivn[300]; snprintf(ivn, sizeof ivn, "@%s", attr);
+    int iidx = comp_ivar_index(&c->classes[class_id], ivn);
+    TyKind ivt = iidx >= 0 ? c->classes[class_id].ivar_types[iidx] : TY_UNKNOWN;
+    int tr = ++g_tmp;
+    emit_indent(b, indent);
+    buf_puts(b, "{ ");
+    emit_ctype(c, rt, b); buf_printf(b, " _t%d = ", tr); emit_expr(c, recv, b); buf_puts(b, "; ");
+    if (ivt == TY_POLY) {
+      buf_printf(b, "if (%ssp_poly_truthy(((sp_%s *)_t%d.v.p)->iv_%s)) ((sp_%s *)_t%d.v.p)->iv_%s = ",
+                 is_or ? "!" : "", c->classes[class_id].name, tr, attr,
+                 c->classes[class_id].name, tr, attr);
+      emit_boxed(c, v, b); buf_puts(b, "; }\n");
+    }
+    else if (ivt == TY_BOOL) {
+      buf_printf(b, "if (%s_t%d->iv_%s) _t%d->iv_%s = ", is_or ? "!" : "", tr, attr, tr, attr);
+      emit_expr(c, v, b); buf_puts(b, "; }\n");
+    }
+    else if (!is_or) {  /* &&= on always-truthy type: always assign */
+      buf_printf(b, "_t%d->iv_%s = ", tr, attr); emit_expr(c, v, b); buf_puts(b, "; }\n");
+    }
+    else { buf_puts(b, "}\n"); }  /* ||= on always-truthy type: no-op, but receiver evaluated */
+    return;
+  }
   if (!strcmp(ty, "InstanceVariableWriteNode")) {
     const char *nm = nt_str(nt, id, "name");
     int v = nt_ref(nt, id, "value");
