@@ -2036,6 +2036,31 @@ static int infer_global_const_types(Compiler *c) {
       }
       continue;
     }
+    else if (!strcmp(ty, "CallNode")) {
+      /* CONST << v / CONST.push(v) / CONST.append(v): infer CONST as an
+         array whose element type comes from v's type. Only applies when
+         the receiver is a direct ConstantReadNode. */
+      const char *cnm = nt_str(nt, id, "name");
+      if (!cnm) continue;
+      int is_push = (!strcmp(cnm, "<<") || !strcmp(cnm, "push") || !strcmp(cnm, "append"));
+      if (!is_push) continue;
+      int crecv = nt_ref(nt, id, "receiver");
+      if (crecv < 0) continue;
+      const char *rty = nt_type(nt, crecv);
+      if (!rty || strcmp(rty, "ConstantReadNode")) continue;
+      const char *cnm2 = nt_str(nt, crecv, "name");
+      if (!cnm2) continue;
+      lv = comp_const(c, cnm2);
+      if (!lv || lv->type != TY_UNKNOWN) continue;
+      int cargs = nt_ref(nt, id, "arguments");
+      int cac = 0;
+      const int *cav = cargs >= 0 ? nt_arr(nt, cargs, "arguments", &cac) : NULL;
+      if (cac < 1 || !cav) continue;
+      TyKind et = infer_type(c, cav[0]);
+      if (et == TY_UNKNOWN || et == TY_NIL) continue;
+      vt = ty_array_of(et);
+      if (vt == TY_UNKNOWN) vt = TY_POLY_ARRAY;
+    }
     else {
       continue;
     }

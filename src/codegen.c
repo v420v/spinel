@@ -11212,7 +11212,22 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     emit_indent(b, indent);
     buf_printf(b, "%s_%s = ", pfx, key);
     const char *vty = nt_type(nt, v);
-    if (vty && !strcmp(vty, "NilNode")) buf_puts(b, lv->type == TY_RANGE ? "(sp_Range){0}" : default_value(lv->type));
+    int v_empty_arr = 0, v_empty_hash = 0;
+    if (vty && !strcmp(vty, "ArrayNode")) {
+      int ac = 0; nt_arr(nt, v, "elements", &ac); v_empty_arr = (ac == 0);
+    }
+    if (vty && (!strcmp(vty, "HashNode") || !strcmp(vty, "KeywordHashNode"))) {
+      int hec = 0; nt_arr(nt, v, "elements", &hec); v_empty_hash = (hec == 0);
+    }
+    if (vty && !strcmp(vty, "NilNode"))
+      buf_puts(b, lv->type == TY_RANGE ? "(sp_Range){0}" : default_value(lv->type));
+    else if (v_empty_arr && lv->type == TY_POLY_ARRAY) buf_puts(b, "sp_PolyArray_new()");
+    else if (v_empty_arr && array_kind(lv->type)) buf_printf(b, "sp_%sArray_new()", array_kind(lv->type));
+    else if (v_empty_hash && ty_is_hash(lv->type)) {
+      const char *hcn = ty_hash_cname(lv->type);
+      if (hcn) buf_printf(b, "sp_%sHash_new()", hcn);
+      else emit_expr(c, v, b);
+    }
     else emit_expr(c, v, b);
     buf_puts(b, ";\n");
     if (!isg && lv->init_guarded) {
