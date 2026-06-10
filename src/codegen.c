@@ -3415,6 +3415,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         else buf_puts(b, "(&(\"\\xff\")[1])");
         return;
       }
+      if (cn && !strcmp(cn, "Object") && argc == 0) {
+        buf_puts(b, "sp_box_obj(sp_Object_new(), SP_BUILTIN_OBJECT)");
+        return;
+      }
       if (cn && !strcmp(cn, "StringIO")) {
         if (argc == 0) buf_puts(b, "sp_StringIO_new()");
         else if (argc == 1) { buf_puts(b, "sp_StringIO_new_s("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }

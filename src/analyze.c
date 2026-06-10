@@ -368,6 +368,7 @@ static TyKind infer_call(Compiler *c, int id) {
         return TY_POLY_ARRAY;
       }
       if (cn && !strcmp(cn, "Array")) return TY_POLY_ARRAY; /* Array.new / Array.new(n) */
+      if (cn && !strcmp(cn, "Object")) return TY_POLY;  /* identity sentinel */
       if (cn && !strcmp(cn, "String")) return TY_STRING;
       if (cn && !strcmp(cn, "StringIO")) return TY_STRINGIO;
       if (cn && !strcmp(cn, "StringScanner")) return TY_STRINGSCANNER;
