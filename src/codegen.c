@@ -2400,10 +2400,22 @@ static void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const ch
     } else {
       /* Check if this param has a keyword match (lookup by param name in kwh). */
       int kv = kwh >= 0 ? kwh_lookup(nt, kwh, m->pnames[i]) : -1;
-      if (kv >= 0)
+      if (kv >= 0) {
         emit_arg_or_default(c, m, i, kv, out);
-      else
-        emit_arg_or_default(c, m, i, i < pos_argc ? argv[i] : -1, out);
+      }
+      else if (i < pos_argc) {
+        emit_arg_or_default(c, m, i, argv[i], out);
+      }
+      else {
+        /* No positional arg and no keyword match. If the param is a hash-typed
+           optional (e.g. `def f(opts = {})`) and the call site passed a
+           KeywordHashNode (e.g. `f(key: val)`), treat the whole kwh as the
+           implicit hash argument rather than using the default. */
+        LocalVar *p = scope_local(m, m->pnames[i]);
+        TyKind pt = p ? p->type : TY_INT;
+        int use_kwh = (kwh >= 0 && ty_is_hash(pt) && m->pdefault[i] >= 0);
+        emit_arg_or_default(c, m, i, use_kwh ? kwh : -1, out);
+      }
     }
   }
 }
@@ -7549,7 +7561,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         TyKind decl_type = (is_poly_hash && vt != TY_UNKNOWN && vt != TY_POLY) ? vt : (vt != TY_UNKNOWN ? vt : TY_POLY);
         emit_ctype(c, decl_type, b);
         buf_printf(b, " _t%d = ", tv);
-        emit_expr(c, argv[1], b);
+        /* When the slot is poly but the rhs has no type yet (e.g. `{}`),
+           emit a boxed value so the sp_RbVal temp initialises correctly. */
+        if (decl_type == TY_POLY) emit_boxed(c, argv[1], b);
+        else emit_expr(c, argv[1], b);
         buf_printf(b, "; if (sp_gc_is_frozen("); emit_expr(c, recv, b); buf_puts(b, ")) sp_raise_frozen_hash(); ");
         buf_printf(b, "sp_%sHash_set(", hn); emit_expr(c, recv, b); buf_puts(b, ", ");
         if (rt == TY_POLY_POLY_HASH) emit_boxed(c, argv[0], b); else emit_expr(c, argv[0], b);
@@ -9175,6 +9190,13 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
       else emit_expr(c, v, b);
     }
     else if (ivt2 == TY_POLY && comp_ntype(c, v) != TY_POLY) emit_boxed(c, v, b);
+    else if (ivt2 != TY_POLY && ivt2 != TY_UNKNOWN && comp_ntype(c, v) == TY_POLY) {
+      /* poly rhs assigned to a typed ivar: unbox to the concrete type */
+      Buf _rb; memset(&_rb, 0, sizeof _rb);
+      emit_expr(c, v, &_rb);
+      emit_unbox_text(c, ivt2, _rb.p ? _rb.p : "sp_box_nil()", b);
+      free(_rb.p);
+    }
     else emit_expr(c, v, b);
     buf_printf(b, "; %s; })", ref2e);
     return;
@@ -11422,6 +11444,13 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     else if (ivt == TY_POLY && comp_ntype(c, v) != TY_POLY) {
       /* a poly ivar slot needs a boxed RHS */
       emit_boxed(c, v, b);
+    }
+    else if (ivt != TY_POLY && ivt != TY_UNKNOWN && comp_ntype(c, v) == TY_POLY) {
+      /* poly rhs assigned to a typed ivar: unbox to the concrete type */
+      Buf _rb; memset(&_rb, 0, sizeof _rb);
+      emit_expr(c, v, &_rb);
+      emit_unbox_text(c, ivt, _rb.p ? _rb.p : "sp_box_nil()", b);
+      free(_rb.p);
     }
     else {
       emit_expr(c, v, b);
