@@ -682,6 +682,7 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "tally") && argc == 0) {
       if (rt == TY_INT_ARRAY) return TY_INT_INT_HASH;
       if (rt == TY_STR_ARRAY) return TY_STR_INT_HASH;
+      if (rt == TY_POLY_ARRAY) return TY_SYM_POLY_HASH;
     }
     if ((!strcmp(name, "first") || !strcmp(name, "last")) && argc == 1) return rt;  /* first(n)/last(n) -> subarray */
     if (!strcmp(name, "first") || !strcmp(name, "last") ||

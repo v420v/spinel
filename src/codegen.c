@@ -5480,11 +5480,20 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       return;
     }
   }
-  /* each_index on empty array literal [] (TY_UNKNOWN receiver): no-op loop */
-  if (recv >= 0 && rt == TY_UNKNOWN && !strcmp(name, "each_index") &&
+  /* take_while/drop_while/each_index on empty array literal [] (TY_UNKNOWN receiver): no-op */
+  if (recv >= 0 && rt == TY_UNKNOWN &&
+      (!strcmp(name, "take_while") || !strcmp(name, "drop_while") || !strcmp(name, "each_index")) &&
       nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ArrayNode")) {
     int en = 0; nt_arr(nt, recv, "elements", &en);
-    if (en == 0) { emit_expr(c, recv, b); return; }
+    if (en == 0) {
+      if (!strcmp(name, "take_while") || !strcmp(name, "drop_while")) {
+        buf_puts(b, "sp_PolyArray_new()");
+      }
+      else {
+        emit_expr(c, recv, b);
+      }
+      return;
+    }
   }
   if (recv >= 0 && ty_is_array(rt)) {
     if (!strcmp(name, "pack") && argc == 1 && (rt == TY_INT_ARRAY || rt == TY_POLY_ARRAY)) {
@@ -5588,6 +5597,62 @@ static void emit_call(Compiler *c, int id, Buf *b) {
           buf_printf(b, "_t%d", trecv); return;
         }
       }
+    }
+    /* take_while / drop_while (works for typed and poly arrays alike) */
+    if ((!strcmp(name, "take_while") || !strcmp(name, "drop_while")) && argc == 0
+        && nt_ref(nt, id, "block") >= 0) {
+      int is_drop = !strcmp(name, "drop_while");
+      int tw_blk = nt_ref(nt, id, "block");
+      const char *tw_bp = block_param_name(c, tw_blk, 0); if (tw_bp) tw_bp = rename_local(tw_bp);
+      int tw_body = nt_ref(nt, tw_blk, "body");
+      int tw_bn = 0; const int *tw_bb = tw_body >= 0 ? nt_arr(nt, tw_body, "body", &tw_bn) : NULL;
+      if (tw_bn > 0) {
+        const char *ek = (rt == TY_POLY_ARRAY) ? "Poly" : array_kind(rt);
+        if (ek) {
+          TyKind et = ty_array_elem(rt);
+          int trecv = ++g_tmp, tout = ++g_tmp, ti = ++g_tmp;
+          Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+          emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+          buf_printf(g_pre, " _t%d = %s;\n", trecv, rb.p ? rb.p : ""); free(rb.p);
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", ek, tout, ek);
+          if (is_drop) {
+            emit_indent(g_pre, g_indent);
+            buf_puts(g_pre, "{ mrb_bool _dropping = 1;\n");
+          }
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
+                     ti, ti, ek, trecv, ti);
+          if (tw_bp) {
+            emit_indent(g_pre, g_indent + 1); emit_ctype(c, et, g_pre);
+            buf_printf(g_pre, " lv_%s = sp_%sArray_get(_t%d, _t%d);\n", tw_bp, ek, trecv, ti);
+          }
+          for (int j = 0; j < tw_bn - 1; j++) emit_stmt(c, tw_bb[j], g_pre, g_indent + 1);
+          int sv = g_indent; g_indent = g_indent + 1;
+          Buf cb; memset(&cb, 0, sizeof cb); emit_expr(c, tw_bb[tw_bn - 1], &cb); g_indent = sv;
+          if (is_drop) {
+            emit_indent(g_pre, g_indent + 1);
+            buf_printf(g_pre, "if (_dropping && !(%s)) _dropping = 0;\n", cb.p ? cb.p : "0");
+            emit_indent(g_pre, g_indent + 1);
+            buf_printf(g_pre, "if (!_dropping) sp_%sArray_push(_t%d, sp_%sArray_get(_t%d, _t%d));\n",
+                       ek, tout, ek, trecv, ti);
+          }
+          else {
+            emit_indent(g_pre, g_indent + 1);
+            buf_printf(g_pre, "if (!(%s)) break;\n", cb.p ? cb.p : "0");
+            emit_indent(g_pre, g_indent + 1);
+            buf_printf(g_pre, "sp_%sArray_push(_t%d, sp_%sArray_get(_t%d, _t%d));\n",
+                       ek, tout, ek, trecv, ti);
+          }
+          free(cb.p);
+          emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+          if (is_drop) { emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n"); }
+          buf_printf(b, "_t%d", tout); return;
+        }
+      }
+    }
+    if (rt == TY_POLY_ARRAY && !strcmp(name, "tally") && argc == 0) {
+      buf_puts(b, "sp_PolyArray_tally("); emit_expr(c, recv, b); buf_puts(b, ")"); return;
     }
     if (k) {
       if ((!strcmp(name, "to_a") || !strcmp(name, "to_ary") || !strcmp(name, "entries") ||
@@ -5723,6 +5788,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       if (!strcmp(name, "tally") && argc == 0) {
         if (rt == TY_INT_ARRAY) { buf_printf(b, "sp_IntArray_tally_int("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
         if (rt == TY_STR_ARRAY) { buf_printf(b, "sp_StrArray_tally("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
+        if (rt == TY_POLY_ARRAY) { buf_printf(b, "sp_PolyArray_tally("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
       }
       if (!strcmp(name, "slice!") && argc == 2) {
         /* slice!(start, len): remove and return the subarray (raises
