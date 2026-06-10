@@ -8323,12 +8323,14 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     emit_indent(g_pre, g_indent);
     buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", t);
     int sym_poly = (ht == TY_SYM_POLY_HASH || ht == TY_STR_POLY_HASH);
+    int poly_poly = (ht == TY_POLY_POLY_HASH);
     for (int j = 0; j < n; j++) {
       int key = nt_ref(nt, els[j], "key");
       int val = nt_ref(nt, els[j], "value");
-      Buf kb; memset(&kb, 0, sizeof kb); emit_expr(c, key, &kb);
+      Buf kb; memset(&kb, 0, sizeof kb);
+      if (poly_poly) emit_boxed(c, key, &kb); else emit_expr(c, key, &kb);
       Buf vb; memset(&vb, 0, sizeof vb);
-      if (sym_poly) emit_boxed(c, val, &vb); else emit_expr(c, val, &vb);
+      if (sym_poly || poly_poly) emit_boxed(c, val, &vb); else emit_expr(c, val, &vb);
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "sp_%sHash_set(_t%d, ", hn, t);
       buf_puts(g_pre, kb.p ? kb.p : ""); buf_puts(g_pre, ", ");
