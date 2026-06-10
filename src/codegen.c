@@ -1697,6 +1697,77 @@ static int emit_collect_expr(Compiler *c, int id, Buf *b) {
   int recv = nt_ref(nt, id, "receiver");
   if (!name || recv < 0) return 0;
   TyKind rt = comp_ntype(c, recv);
+  /* array.each_slice(n).map { |x, y, ...| } chain: unroll into a direct slice loop */
+  if ((!strcmp(name, "map") || !strcmp(name, "collect")) &&
+      nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+      nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "each_slice") &&
+      nt_ref(nt, recv, "block") < 0) {
+    int es_recv = nt_ref(nt, recv, "receiver");
+    int es_args = nt_ref(nt, recv, "arguments");
+    int es_argc = 0; const int *es_argv = es_args >= 0 ? nt_arr(nt, es_args, "arguments", &es_argc) : NULL;
+    if (es_argc == 1 && es_recv >= 0) {
+      TyKind arr_rt = comp_ntype(c, es_recv);
+      if (ty_is_array(arr_rt)) {
+        const char *k = (arr_rt == TY_POLY_ARRAY) ? "Poly" : array_kind(arr_rt);
+        if (k) {
+          TyKind restype_es = comp_ntype(c, id);
+          int res_poly_es = (restype_es == TY_POLY_ARRAY);
+          const char *rk_es = res_poly_es ? "Poly" : array_kind(restype_es);
+          if (!rk_es) rk_es = "Int";
+          int np_es = 0; while (block_param_name(c, block, np_es)) np_es++;
+          int body_es = nt_ref(nt, block, "body");
+          int bn_es = 0; const int *bb_es = body_es >= 0 ? nt_arr(nt, body_es, "body", &bn_es) : NULL;
+          if (bn_es >= 1) {
+            int ta_es = ++g_tmp, ts_es = ++g_tmp, tres_es = ++g_tmp, ti_es = ++g_tmp;
+            Buf rb_es; memset(&rb_es, 0, sizeof rb_es); emit_expr(c, es_recv, &rb_es);
+            emit_indent(g_pre, g_indent); emit_ctype(c, arr_rt, g_pre);
+            buf_printf(g_pre, " _t%d = %s;\n", ta_es, rb_es.p ? rb_es.p : ""); free(rb_es.p);
+            emit_indent(g_pre, g_indent);
+            buf_printf(g_pre, "mrb_int _t%d = ", ts_es); emit_expr(c, es_argv[0], g_pre); buf_puts(g_pre, ";\n");
+            emit_indent(g_pre, g_indent);
+            buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", rk_es, tres_es, rk_es);
+            emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tres_es);
+            emit_indent(g_pre, g_indent);
+            buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d += _t%d) {\n",
+                       ti_es, ti_es, k, ta_es, ti_es, ts_es);
+            if (np_es > 1) {
+              for (int pj = 0; pj < np_es; pj++) {
+                const char *pn = block_param_name(c, block, pj); if (!pn) break;
+                emit_indent(g_pre, g_indent + 1);
+                buf_printf(g_pre, "lv_%s = sp_%sArray_get(_t%d, _t%d + %d);\n",
+                           rename_local(pn), k, ta_es, ti_es, pj);
+              }
+            }
+            else {
+              const char *p0_es = block_param_name(c, block, 0); if (p0_es) p0_es = rename_local(p0_es);
+              if (p0_es) {
+                emit_indent(g_pre, g_indent + 1);
+                buf_printf(g_pre, "lv_%s = sp_%sArray_slice(_t%d, _t%d, _t%d);\n",
+                           p0_es, k, ta_es, ti_es, ts_es);
+              }
+            }
+            for (int j = 0; j < bn_es - 1; j++) emit_stmt(c, bb_es[j], g_pre, g_indent + 1);
+            int saveInd_es = g_indent; g_indent = g_indent + 1;
+            Buf vb_es; memset(&vb_es, 0, sizeof vb_es); emit_expr(c, bb_es[bn_es - 1], &vb_es);
+            g_indent = saveInd_es;
+            TyKind bty_es = comp_ntype(c, bb_es[bn_es - 1]);
+            emit_indent(g_pre, g_indent + 1);
+            buf_printf(g_pre, "sp_%sArray_push(_t%d, ", rk_es, tres_es);
+            if (res_poly_es && bty_es != TY_POLY) {
+              Buf bx_es; memset(&bx_es, 0, sizeof bx_es);
+              emit_boxed_text(c, bty_es, vb_es.p ? vb_es.p : "", &bx_es);
+              buf_puts(g_pre, bx_es.p ? bx_es.p : ""); free(bx_es.p);
+            }
+            else buf_puts(g_pre, vb_es.p ? vb_es.p : "");
+            buf_puts(g_pre, ");\n"); free(vb_es.p);
+            emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+            buf_printf(b, "_t%d", tres_es);
+            return 1;
+          }
+        }
+      }
+    }
+  }
   if (ty_is_hash(rt)) return emit_hash_collect_expr(c, id, b);
   int range_recv = (rt == TY_RANGE);
   if (rt == TY_POLY) {

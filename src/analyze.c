@@ -701,6 +701,19 @@ static TyKind infer_call(Compiler *c, int id) {
     }
   }
 
+  /* each_slice(n).map/collect { |...| } chain: return array of block result type */
+  if (recv >= 0 && rt == TY_UNKNOWN && (!strcmp(name, "map") || !strcmp(name, "collect")) &&
+      nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+      nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "each_slice") &&
+      nt_ref(nt, recv, "block") < 0) {
+    int blk_es = nt_ref(nt, id, "block");
+    if (blk_es >= 0) {
+      int body_es = nt_ref(nt, blk_es, "body");
+      int bn_es = 0; const int *bb_es = body_es >= 0 ? nt_arr(nt, body_es, "body", &bn_es) : NULL;
+      return ty_array_of(bn_es > 0 ? infer_type(c, bb_es[bn_es - 1]) : TY_UNKNOWN);
+    }
+  }
+
   /* array receiver methods */
   if (recv >= 0 && ty_is_array(rt)) {
     int block = nt_ref(nt, id, "block");
@@ -3611,6 +3624,31 @@ static int infer_block_params(Compiler *c) {
         if (m != lp->type) { lp->type = m; changed = 1; }
       }
       continue;
+    }
+
+    /* array.each_slice(n).map/collect { |x, y, ...| } chain: each block param
+       gets the element type of the original array (slice elements) */
+    if ((!strcmp(name, "map") || !strcmp(name, "collect")) && rt == TY_UNKNOWN &&
+        nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+        nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "each_slice") &&
+        nt_ref(nt, recv, "block") < 0) {
+      int es_recv2 = nt_ref(nt, recv, "receiver");
+      TyKind arr_t2 = es_recv2 >= 0 ? infer_type(c, es_recv2) : TY_UNKNOWN;
+      if (ty_is_array(arr_t2)) {
+        TyKind elem_t2 = ty_array_elem(arr_t2);
+        if (elem_t2 != TY_UNKNOWN) {
+          Scope *es2 = comp_scope_of(c, block);
+          int np2 = 0; while (block_param_name(c, block, np2)) np2++;
+          for (int pj2 = 0; pj2 < np2; pj2++) {
+            const char *pn2 = block_param_name(c, block, pj2);
+            if (!pn2) break;
+            LocalVar *lp2 = scope_local_intern(es2, pn2); lp2->is_block_param = 1;
+            TyKind m2 = ty_unify(lp2->type, elem_t2);
+            if (m2 != lp2->type) { lp2->type = m2; changed = 1; }
+          }
+          continue;
+        }
+      }
     }
 
     /* array.combination(k) { |c| } binds the k-element sub-array (same kind) */
