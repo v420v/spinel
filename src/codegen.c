@@ -6008,6 +6008,14 @@ static int emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent) {
     int chain[64]; int nchain = 0;
     int cur = id;
     while (nchain < 64) {
+      /* unwrap ParenthesesNode wrappers (e.g. `(s << a) << b`) */
+      while (nt_type(nt, cur) && !strcmp(nt_type(nt, cur), "ParenthesesNode")) {
+        int pb = nt_ref(nt, cur, "body");
+        if (pb < 0) break;
+        int bn = 0; const int *bb = nt_arr(nt, pb, "body", &bn);
+        if (bn != 1) break;
+        cur = bb[0];
+      }
       const char *cty = nt_type(nt, cur);
       if (!cty || strcmp(cty, "CallNode")) break;
       const char *cnm = nt_str(nt, cur, "name");
@@ -6030,6 +6038,7 @@ static int emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent) {
         emit_expr(c, cur, b); buf_puts(b, " = sp_str_concat(");
         emit_expr(c, cur, b); buf_puts(b, ", ");
         if (at == TY_INT) { buf_puts(b, "sp_int_codepoint_to_str("); emit_expr(c, arg, b); buf_puts(b, ")"); }
+        else if (at == TY_POLY) { buf_puts(b, "sp_poly_to_s("); emit_expr(c, arg, b); buf_puts(b, ")"); }
         else emit_expr(c, arg, b);
         buf_puts(b, ");\n");
       }
