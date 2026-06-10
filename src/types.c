@@ -7,6 +7,7 @@ const char *ty_name(TyKind t) {
     case TY_VOID:    return "void";
     case TY_NIL:     return "nil";
     case TY_INT:     return "int";
+    case TY_BIGINT:  return "bigint";
     case TY_FLOAT:   return "float";
     case TY_STRING:  return "string";
     case TY_SYMBOL:  return "symbol";
@@ -71,7 +72,7 @@ const char *ty_hash_cname(TyKind h) {
   return NULL;
 }
 
-int ty_is_numeric(TyKind t) { return t == TY_INT || t == TY_FLOAT; }
+int ty_is_numeric(TyKind t) { return t == TY_INT || t == TY_BIGINT || t == TY_FLOAT; }
 int ty_is_array(TyKind t) {
   return t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY ||
          t == TY_STR_ARRAY || t == TY_POLY_ARRAY;

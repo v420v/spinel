@@ -1111,8 +1111,11 @@ static TyKind infer_call(Compiler *c, int id) {
     /* array * int -> same array type (repeat); array * string -> join string */
     if (!strcmp(name, "*") && (ty_is_array(rt) || rt == TY_POLY_ARRAY) && a0 == TY_INT) return rt;
     if (!strcmp(name, "*") && (ty_is_array(rt) || rt == TY_POLY_ARRAY) && a0 == TY_STRING) return TY_STRING;
-    if (ty_is_numeric(rt) && ty_is_numeric(a0))
-      return (rt == TY_FLOAT || a0 == TY_FLOAT) ? TY_FLOAT : TY_INT;
+    if (ty_is_numeric(rt) && ty_is_numeric(a0)) {
+      if (rt == TY_FLOAT || a0 == TY_FLOAT) return TY_FLOAT;
+      if (rt == TY_BIGINT || a0 == TY_BIGINT) return TY_BIGINT;
+      return TY_INT;
+    }
     return TY_UNKNOWN;
   }
   if (recv >= 0 && argc == 1 && !strcmp(name, "<=>")) return TY_INT;
@@ -2232,8 +2235,11 @@ static int infer_write_types(Compiler *c) {
       TyKind vt = infer_type(c, nt_ref(nt, id, "value"));
       TyKind ct = cur ? (TyKind)cur->gc_root : TY_UNKNOWN; /* old type */
       if (ct == TY_STRING) newt = TY_STRING;
-      else if (ty_is_numeric(ct) && ty_is_numeric(vt))
-        newt = (ct == TY_FLOAT || vt == TY_FLOAT) ? TY_FLOAT : TY_INT;
+      else if (ty_is_numeric(ct) && ty_is_numeric(vt)) {
+        if (ct == TY_FLOAT || vt == TY_FLOAT) newt = TY_FLOAT;
+        else if (ct == TY_BIGINT || vt == TY_BIGINT) newt = TY_BIGINT;
+        else newt = TY_INT;
+      }
       else newt = ct;
     }
     else if (!strcmp(ty, "LocalVariableOrWriteNode") ||
@@ -3662,6 +3668,100 @@ static void mark_proc_captures(Compiler *c) {
   free(inproc);
 }
 
+/* ---- bigint loop-variable detection ---- */
+/* Scan a while-loop body for `x = x * y` or `x *= y` patterns and collect
+   the variable names in a heap-allocated array. Returns the count; caller
+   must free the returned array. */
+static void bigint_scan_body(const NodeTable *nt, int id, char ***names, int *n, int *cap) {
+  if (id < 0) return;
+  const char *ty = nt_type(nt, id);
+  if (!ty) return;
+  /* x *= y  (LocalVariableOperatorWriteNode with * or **) */
+  if (!strcmp(ty, "LocalVariableOperatorWriteNode")) {
+    const char *op = nt_str(nt, id, "binary_operator");
+    if (op && (!strcmp(op, "*") || !strcmp(op, "**"))) {
+      const char *nm = nt_str(nt, id, "name");
+      if (nm) {
+        for (int k = 0; k < *n; k++) if (!strcmp((*names)[k], nm)) goto skip_mul;
+        if (*n >= *cap) { *cap = *cap * 2 + 4; *names = (char **)realloc(*names, (size_t)*cap * sizeof(char *)); }
+        (*names)[(*n)++] = (char *)nm;
+        skip_mul:;
+      }
+    }
+  }
+  /* x = x * y  (LocalVariableWriteNode where value is CallNode * with recv = x) */
+  if (!strcmp(ty, "LocalVariableWriteNode")) {
+    const char *nm = nt_str(nt, id, "name");
+    int val = nt_ref(nt, id, "value");
+    if (nm && val >= 0 && !strcmp(nt_type(nt, val) ? nt_type(nt, val) : "", "CallNode")) {
+      const char *op2 = nt_str(nt, val, "name");
+      int recv2 = nt_ref(nt, val, "receiver");
+      if (op2 && (!strcmp(op2, "*") || !strcmp(op2, "**")) && recv2 >= 0 &&
+          !strcmp(nt_type(nt, recv2) ? nt_type(nt, recv2) : "", "LocalVariableReadNode") &&
+          !strcmp(nt_str(nt, recv2, "name") ? nt_str(nt, recv2, "name") : "", nm)) {
+        for (int k = 0; k < *n; k++) if (!strcmp((*names)[k], nm)) goto skip_lv;
+        if (*n >= *cap) { *cap = *cap * 2 + 4; *names = (char **)realloc(*names, (size_t)*cap * sizeof(char *)); }
+        (*names)[(*n)++] = (char *)nm;
+        skip_lv:;
+      }
+    }
+  }
+  /* Recurse into body / stmts / subsequent */
+  bigint_scan_body(nt, nt_ref(nt, id, "body"), names, n, cap);
+  int sn = 0; const int *stmts2 = nt_arr(nt, id, "body", &sn);
+  for (int k = 0; k < sn; k++) bigint_scan_body(nt, stmts2[k], names, n, cap);
+  bigint_scan_body(nt, nt_ref(nt, id, "subsequent"), names, n, cap);
+}
+
+static void detect_bigint_loop_vars(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "WhileNode")) continue;
+    int body = nt_ref(nt, id, "statements");
+    if (body < 0) continue;
+    char **cands = NULL; int ncands = 0, cap = 0;
+    bigint_scan_body(nt, body, &cands, &ncands, &cap);
+    /* Promote matching TY_INT locals to TY_BIGINT */
+    for (int k = 0; k < ncands; k++) {
+      Scope *s = comp_scope_of(c, id);
+      LocalVar *lv = s ? scope_local(s, cands[k]) : NULL;
+      if (lv && lv->type == TY_INT) lv->type = TY_BIGINT;
+    }
+    free(cands);
+  }
+}
+
+/* After detect_bigint_loop_vars promotes some locals to TY_BIGINT, cascade
+   the promotion to variables assigned from bigint-typed expressions. */
+static void propagate_bigint_cascade(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 1;
+  while (changed) {
+    changed = 0;
+    for (int id = 0; id < nt->count; id++) {
+      const char *ty = nt_type(nt, id);
+      if (!ty) continue;
+      if (!strcmp(ty, "LocalVariableWriteNode")) {
+        const char *nm = nt_str(nt, id, "name");
+        Scope *s = comp_scope_of(c, id);
+        LocalVar *lv = nm ? scope_local(s, nm) : NULL;
+        if (!lv || lv->type != TY_INT) continue;
+        TyKind vt = infer_type(c, nt_ref(nt, id, "value"));
+        if (vt == TY_BIGINT) { lv->type = TY_BIGINT; changed = 1; }
+      }
+      else if (!strcmp(ty, "LocalVariableOperatorWriteNode")) {
+        const char *nm = nt_str(nt, id, "name");
+        Scope *s = comp_scope_of(c, id);
+        LocalVar *lv = nm ? scope_local(s, nm) : NULL;
+        if (!lv || lv->type != TY_INT) continue;
+        TyKind vt = infer_type(c, nt_ref(nt, id, "value"));
+        if (vt == TY_BIGINT) { lv->type = TY_BIGINT; changed = 1; }
+      }
+    }
+  }
+}
+
 void analyze_program(Compiler *c) {
   /* scope 0 = top level */
   Scope *top = comp_scope_new(c, NULL, -1);
@@ -3877,6 +3977,10 @@ void analyze_program(Compiler *c) {
   }
   /* recompute returns: a method returning such a param is now poly */
   for (int iter = 0; iter < 8; iter++) if (!infer_return_types(c)) break;
+
+  /* Promote loop-multiplication variables to bigint */
+  detect_bigint_loop_vars(c);
+  propagate_bigint_cascade(c);
 
   /* mark locals captured by escaping procs (they need heap cells) */
   mark_proc_captures(c);

@@ -13,6 +13,7 @@ typedef enum {
   TY_VOID,         /* a statement with no usable value */
   TY_NIL,
   TY_INT,
+  TY_BIGINT,       /* arbitrary-precision integer (sp_Bigint *) */
   TY_FLOAT,
   TY_STRING,
   TY_SYMBOL,

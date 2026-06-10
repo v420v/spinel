@@ -493,6 +493,14 @@ static const char *int_arith_fn(const char *op) {
   if (!strcmp(op, "**")) return "sp_int_pow";
   return NULL;
 }
+static const char *bigint_arith_fn(const char *op) {
+  if (!strcmp(op, "+"))  return "sp_bigint_add";
+  if (!strcmp(op, "-"))  return "sp_bigint_sub";
+  if (!strcmp(op, "*"))  return "sp_bigint_mul";
+  if (!strcmp(op, "/"))  return "sp_bigint_div";
+  if (!strcmp(op, "%"))  return "sp_bigint_mod";
+  return NULL;
+}
 
 /* Mangle a Ruby method name into a C identifier: `?`->_p, `!`->_bang,
    `=`->_set, anything else non-identifier -> `_`. Returns a static buffer
@@ -3763,6 +3771,20 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_puts(b, ")");
       return;
     }
+    if (res == TY_BIGINT) {
+      const char *bfn = bigint_arith_fn(name);
+      if (bfn) {
+        buf_printf(b, "%s(", bfn);
+        if (rt != TY_BIGINT) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, recv, b); buf_puts(b, ")"); }
+        else emit_expr(c, recv, b);
+        buf_puts(b, ", ");
+        TyKind at0 = comp_ntype(c, argv[0]);
+        if (at0 != TY_BIGINT) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+        else emit_expr(c, argv[0], b);
+        buf_puts(b, ")");
+        return;
+      }
+    }
     if (res == TY_INT) {
       buf_printf(b, "%s(", int_arith_fn(name));
       emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
@@ -3815,6 +3837,17 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (recv >= 0 && argc == 1 &&
       (!strcmp(name, "<") || !strcmp(name, ">") ||
        !strcmp(name, "<=") || !strcmp(name, ">="))) {
+    if (rt == TY_BIGINT || comp_ntype(c, argv[0]) == TY_BIGINT) {
+      buf_printf(b, "(sp_bigint_cmp(");
+      if (rt != TY_BIGINT) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, recv, b); buf_puts(b, ")"); }
+      else emit_expr(c, recv, b);
+      buf_puts(b, ", ");
+      TyKind cmp_at = comp_ntype(c, argv[0]);
+      if (cmp_at != TY_BIGINT) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else emit_expr(c, argv[0], b);
+      buf_printf(b, ") %s 0)", name);
+      return;
+    }
     if (ty_is_numeric(rt)) {
       buf_puts(b, "(");
       emit_expr(c, recv, b);
@@ -4193,6 +4226,17 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         emit_expr(c, argv[0], b); buf_printf(b, "), %d)", eq ? 0 : 1);
         return;
       }
+    }
+    /* bigint == / != */
+    if (rt == TY_BIGINT || a0 == TY_BIGINT) {
+      buf_printf(b, "(sp_bigint_cmp(");
+      if (rt != TY_BIGINT) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, recv, b); buf_puts(b, ")"); }
+      else emit_expr(c, recv, b);
+      buf_puts(b, ", ");
+      if (a0 != TY_BIGINT) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else emit_expr(c, argv[0], b);
+      buf_printf(b, ") %s 0)", eq ? "==" : "!=");
+      return;
     }
     /* a poly operand compares dynamically (covers string-vs-poly etc.) */
     if (rt == TY_POLY || a0 == TY_POLY) {
@@ -6453,6 +6497,22 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (handled) return;
   }
 
+  /* bigint methods */
+  if (recv >= 0 && rt == TY_BIGINT) {
+    Buf rs; memset(&rs, 0, sizeof rs); emit_expr(c, recv, &rs);
+    const char *r = rs.p ? rs.p : "";
+    if ((!strcmp(name, "to_s") || !strcmp(name, "inspect")) && argc == 0) {
+      buf_printf(b, "sp_bigint_to_s(%s)", r); free(rs.p); return;
+    }
+    if (!strcmp(name, "to_i") && argc == 0) {
+      buf_printf(b, "sp_bigint_to_int(%s)", r); free(rs.p); return;
+    }
+    if (!strcmp(name, "to_f") && argc == 0) {
+      buf_printf(b, "((mrb_float)sp_bigint_to_int(%s))", r); free(rs.p); return;
+    }
+    free(rs.p);
+  }
+
   /* `[]=` in expression position: mutate and return the assigned value.
      Ruby's `(h[k] = v)` and `(a[i] = v)` evaluate to v. */
   if (!strcmp(name, "[]=") && argc == 2 && recv >= 0) {
@@ -8668,6 +8728,10 @@ static void emit_puts_one(Compiler *c, int arg, Buf *b, int indent) {
     buf_printf(b, "{ mrb_int _t%d = ", tv); emit_expr(c, arg, b);
     buf_printf(b, "; if (_t%d == SP_INT_NIL) putchar('\\n'); else printf(\"%%lld\\n\", (long long)_t%d); }\n", tv, tv);
   }
+  else if (t == TY_BIGINT) {
+    buf_puts(b, "{ const char *_bs = sp_bigint_to_s("); emit_expr(c, arg, b);
+    buf_puts(b, "); if (_bs) fputs(_bs, stdout); putchar('\\n'); }\n");
+  }
   else if (t == TY_FLOAT) {
     buf_puts(b, "{ const char *_fs = sp_float_opt_to_s("); emit_expr(c, arg, b);
     buf_puts(b, "); fputs(_fs, stdout); putchar('\\n'); }\n");
@@ -8761,6 +8825,10 @@ static void emit_print_one(Compiler *c, int arg, Buf *b, int indent) {
   else if (t == TY_STRING) {
     buf_puts(b, "{ const char *_s = ("); emit_expr(c, arg, b);
     buf_puts(b, "); if (_s) fputs(_s, stdout); }\n");
+  }
+  else if (t == TY_BIGINT) {
+    buf_puts(b, "{ const char *_bs = sp_bigint_to_s((sp_Bigint *)("); emit_expr(c, arg, b);
+    buf_puts(b, ")); if (_bs) fputs(_bs, stdout); }\n");
   }
   else if (t == TY_BOOL) {
     buf_puts(b, "fputs(("); emit_expr(c, arg, b); buf_puts(b, ") ? \"true\" : \"false\", stdout);\n");
@@ -8940,6 +9008,11 @@ static void emit_assign(Compiler *c, int id, Buf *b, int indent) {
     else if (vt == TY_FLOAT_ARRAY) { buf_puts(b, "sp_PolyArray_from_float_array("); emit_expr(c, v, b); buf_puts(b, ")"); }
     else emit_expr(c, v, b);
   }
+  else if (lv && lv->type == TY_BIGINT) {
+    TyKind vt = comp_ntype(c, v);
+    if (vt == TY_BIGINT) emit_expr(c, v, b);
+    else { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, v, b); buf_puts(b, ")"); }
+  }
   else if (lv && lv->type == TY_POLY) {
     emit_boxed(c, v, b);   /* poly slot: box the (non-poly) RHS */
   }
@@ -8997,6 +9070,16 @@ static void emit_op_assign(Compiler *c, int id, Buf *b, int indent) {
   if (t == TY_INT) {
     const char *fn = int_arith_fn(op);
     if (fn) { buf_printf(b, "lv_%s = %s(lv_%s, ", en, fn, en); emit_expr(c, v, b); buf_puts(b, ");\n"); return; }
+  }
+  if (t == TY_BIGINT) {
+    const char *bfn = bigint_arith_fn(op);
+    if (bfn) {
+      TyKind vt = comp_ntype(c, v);
+      buf_printf(b, "lv_%s = %s(lv_%s, ", en, bfn, en);
+      if (vt != TY_BIGINT) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, v, b); buf_puts(b, ")"); }
+      else emit_expr(c, v, b);
+      buf_puts(b, ");\n"); return;
+    }
   }
   if (t == TY_FLOAT && (!strcmp(op, "+") || !strcmp(op, "-") || !strcmp(op, "*") || !strcmp(op, "/"))) {
     buf_printf(b, "lv_%s %s= ", en, op); emit_expr(c, v, b); buf_puts(b, ";\n");
@@ -10911,7 +10994,7 @@ static void emit_stmts_tail(Compiler *c, int id, Buf *b, int indent) {
 /* ---- declarations ---- */
 
 /* Heap-managed types need a GC root for their local slot. */
-static int needs_root(TyKind t) { return t == TY_STRING || ty_is_array(t) || ty_is_hash(t) || ty_is_object(t) || t == TY_EXCEPTION || t == TY_POLY || t == TY_PROC; }
+static int needs_root(TyKind t) { return t == TY_STRING || t == TY_BIGINT || ty_is_array(t) || ty_is_hash(t) || ty_is_object(t) || t == TY_EXCEPTION || t == TY_POLY || t == TY_PROC; }
 
 /* Emit `node` boxed into an sp_RbVal. Idempotent: an already-poly value is
    passed through unboxed (double-boxing is a classic silent-corruption bug). */
@@ -11036,6 +11119,7 @@ static void declare_local(Compiler *c, Buf *b, LocalVar *lv, int vol) {
   int ptr = 0, root = needs_root(t);
   switch (t) {
     case TY_INT:    buf_puts(&cty, "mrb_int"); init = "0"; break;
+    case TY_BIGINT: buf_puts(&cty, "sp_Bigint *"); init = "NULL"; ptr = 1; break;
     case TY_FLOAT:  buf_puts(&cty, "mrb_float"); init = "0.0"; break;
     case TY_BOOL:   buf_puts(&cty, "mrb_bool"); init = "0"; break;
     case TY_SYMBOL: buf_puts(&cty, "sp_sym"); init = "((sp_sym)-1)"; break;
