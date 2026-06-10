@@ -622,6 +622,53 @@ static TyKind infer_call(Compiler *c, int id) {
     }
   }
 
+  /* Fiber storage: Fiber[:k] and Fiber.current[:k] -> poly */
+  if (recv >= 0 && !strcmp(name, "[]") && argc == 1) {
+    const char *rty = nt_type(nt, recv);
+    if (rty && !strcmp(rty, "ConstantReadNode")) {
+      const char *rn = nt_str(nt, recv, "name");
+      if (rn && !strcmp(rn, "Fiber")) return TY_POLY;
+    }
+    if (rty && !strcmp(rty, "CallNode")) {
+      const char *rn = nt_str(nt, recv, "name");
+      int rr = nt_ref(nt, recv, "receiver");
+      if (rn && !strcmp(rn, "current") && rr >= 0) {
+        const char *rrty = nt_type(nt, rr);
+        const char *rrn = nt_str(nt, rr, "name");
+        if (rrty && !strcmp(rrty, "ConstantReadNode") && rrn && !strcmp(rrn, "Fiber"))
+          return TY_POLY;
+      }
+    }
+  }
+  /* Fiber[:k] = v -> returns v's type */
+  if (recv >= 0 && !strcmp(name, "[]=") && argc == 2) {
+    const char *rty = nt_type(nt, recv);
+    int is_fiber = 0;
+    if (rty && !strcmp(rty, "ConstantReadNode")) {
+      const char *rn = nt_str(nt, recv, "name");
+      if (rn && !strcmp(rn, "Fiber")) is_fiber = 1;
+    }
+    else if (rty && !strcmp(rty, "CallNode")) {
+      const char *rn = nt_str(nt, recv, "name");
+      int rr = nt_ref(nt, recv, "receiver");
+      if (rn && !strcmp(rn, "current") && rr >= 0) {
+        const char *rrty = nt_type(nt, rr);
+        const char *rrn = nt_str(nt, rr, "name");
+        if (rrty && !strcmp(rrty, "ConstantReadNode") && rrn && !strcmp(rrn, "Fiber"))
+          is_fiber = 1;
+      }
+    }
+    if (is_fiber) return infer_type(c, argv[1]);
+  }
+  /* ENV[key] -> string or nil (use TY_STRING; null means nil) */
+  if (recv >= 0 && argc >= 1 && (!strcmp(name, "[]") || !strcmp(name, "fetch"))) {
+    const char *rty = nt_type(nt, recv);
+    if (rty && !strcmp(rty, "ConstantReadNode")) {
+      const char *rn = nt_str(nt, recv, "name");
+      if (rn && !strcmp(rn, "ENV")) return TY_STRING;
+    }
+  }
+
   /* array receiver methods */
   if (recv >= 0 && ty_is_array(rt)) {
     int block = nt_ref(nt, id, "block");

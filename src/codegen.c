@@ -2672,6 +2672,59 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (is_trap && argc >= 1) { emit_str_literal(b, "DEFAULT"); return; }
   }
 
+  /* Fiber[:k] / Fiber.current[:k] -> sp_Fiber_storage_get */
+  if (recv >= 0 && !strcmp(name, "[]") && argc == 1) {
+    int is_fiber_recv = 0;
+    const char *rty2 = nt_type(nt, recv);
+    if (rty2 && !strcmp(rty2, "ConstantReadNode")) {
+      const char *rn = nt_str(nt, recv, "name");
+      if (rn && !strcmp(rn, "Fiber")) is_fiber_recv = 1;
+    }
+    else if (rty2 && !strcmp(rty2, "CallNode")) {
+      const char *rn = nt_str(nt, recv, "name");
+      int rr = nt_ref(nt, recv, "receiver");
+      if (rn && !strcmp(rn, "current") && rr >= 0) {
+        const char *rrty = nt_type(nt, rr);
+        const char *rrn = nt_str(nt, rr, "name");
+        if (rrty && !strcmp(rrty, "ConstantReadNode") && rrn && !strcmp(rrn, "Fiber"))
+          is_fiber_recv = 1;
+      }
+    }
+    if (is_fiber_recv) {
+      buf_puts(b, "sp_Fiber_storage_get(sp_fiber_current, ");
+      emit_expr(c, argv[0], b);
+      buf_puts(b, ")");
+      return;
+    }
+  }
+  /* ENV[key] -> getenv */
+  if (recv >= 0 && !strcmp(name, "[]") && argc == 1) {
+    const char *rty2 = nt_type(nt, recv);
+    if (rty2 && !strcmp(rty2, "ConstantReadNode")) {
+      const char *rn = nt_str(nt, recv, "name");
+      if (rn && !strcmp(rn, "ENV")) {
+        buf_puts(b, "sp_str_dup_external(getenv("); emit_expr(c, argv[0], b); buf_puts(b, "))");
+        return;
+      }
+    }
+  }
+  /* ENV.fetch(key, default) -> getenv with fallback */
+  if (recv >= 0 && !strcmp(name, "fetch") && argc >= 1) {
+    const char *rty2 = nt_type(nt, recv);
+    if (rty2 && !strcmp(rty2, "ConstantReadNode")) {
+      const char *rn = nt_str(nt, recv, "name");
+      if (rn && !strcmp(rn, "ENV")) {
+        int tk = ++g_tmp, tv = ++g_tmp;
+        buf_printf(b, "({ const char *_t%d = getenv(", tk); emit_expr(c, argv[0], b);
+        buf_printf(b, "); const char *_t%d = _t%d ? sp_str_dup_external(_t%d) : ", tv, tk, tk);
+        if (argc >= 2) emit_expr(c, argv[1], b);
+        else buf_puts(b, "NULL");
+        buf_printf(b, "; _t%d; })", tv);
+        return;
+      }
+    }
+  }
+
   /* proc {} / lambda {} / Proc.new {} literal -> a first-class Proc value */
   if (comp_ntype(c, id) == TY_PROC && nt_ref(nt, id, "block") >= 0) {
     emit_proc_literal(c, id, b);
@@ -5448,12 +5501,16 @@ static void emit_call(Compiler *c, int id, Buf *b) {
           /* remaining keys via sp_poly_get_sym / sp_poly_get_str / sp_poly_arr_get */
           for (int di = 1; di < argc; di++) {
             int tk = ++g_tmp;
-            if (kt == TY_SYMBOL) {
+            /* For poly-keyed hashes (e.g. PolyPolyHash), infer sub-key type
+               from the argument itself rather than from the parent key type. */
+            TyKind dkt = (kt == TY_POLY || kt == TY_UNKNOWN)
+                         ? comp_ntype(c, argv[di]) : kt;
+            if (dkt == TY_SYMBOL) {
               buf_printf(b, " sp_sym _t%d = ", tk);
               emit_expr(c, argv[di], b);
               buf_printf(b, "; _t%d = sp_poly_get_sym(_t%d, _t%d);", tr, tr, tk);
             }
-            else if (kt == TY_STRING) {
+            else if (dkt == TY_STRING) {
               buf_printf(b, " const char *_t%d = ", tk);
               emit_expr(c, argv[di], b);
               buf_printf(b, "; _t%d = sp_poly_get_str(_t%d, _t%d);", tr, tr, tk);
@@ -7153,6 +7210,44 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     free(rs.p);
   }
 
+  /* Fiber[:k] = v (expression form) */
+  if (!strcmp(name, "[]=") && argc == 2 && recv >= 0) {
+    int is_fiber2 = 0;
+    const char *rty3 = nt_type(nt, recv);
+    if (rty3 && !strcmp(rty3, "ConstantReadNode")) {
+      const char *rn3 = nt_str(nt, recv, "name");
+      if (rn3 && !strcmp(rn3, "Fiber")) is_fiber2 = 1;
+    }
+    else if (rty3 && !strcmp(rty3, "CallNode")) {
+      const char *rn3 = nt_str(nt, recv, "name");
+      int rr3 = nt_ref(nt, recv, "receiver");
+      if (rn3 && !strcmp(rn3, "current") && rr3 >= 0) {
+        const char *rrty3 = nt_type(nt, rr3);
+        const char *rrn3 = nt_str(nt, rr3, "name");
+        if (rrty3 && !strcmp(rrty3, "ConstantReadNode") && rrn3 && !strcmp(rrn3, "Fiber"))
+          is_fiber2 = 1;
+      }
+    }
+    if (is_fiber2) {
+      TyKind fvt = comp_ntype(c, argv[1]);
+      int tf = ++g_tmp;
+      buf_puts(b, "({ ");
+      emit_ctype(c, fvt != TY_UNKNOWN ? fvt : TY_POLY, b);
+      buf_printf(b, " _t%d = ", tf);
+      emit_expr(c, argv[1], b);
+      buf_puts(b, "; sp_Fiber_storage_set(sp_fiber_current, ");
+      emit_expr(c, argv[0], b);
+      buf_puts(b, ", ");
+      if (fvt != TY_POLY && fvt != TY_UNKNOWN) {
+        char tfs[32]; snprintf(tfs, sizeof tfs, "_t%d", tf);
+        emit_boxed_text(c, fvt, tfs, b);
+      }
+      else buf_printf(b, "_t%d", tf);
+      buf_printf(b, "); _t%d; })", tf);
+      return;
+    }
+  }
+
   /* `[]=` in expression position: mutate and return the assigned value.
      Ruby's `(h[k] = v)` and `(a[i] = v)` evaluate to v. */
   if (!strcmp(name, "[]=") && argc == 2 && recv >= 0) {
@@ -8225,7 +8320,16 @@ static int emit_iteration_stmt(Compiler *c, int id, Buf *b, int indent) {
     emit_indent(b, indent); buf_printf(b, "{ sp_IntArray *_t%d = ", ta); buf_puts(b, rb.p ? rb.p : ""); buf_puts(b, ";\n"); free(rb.p);
     emit_indent(b, indent + 1); buf_printf(b, "sp_PtrArray *_t%d = sp_IntArray_combination(_t%d, ", tc, ta); emit_expr(c, av[0], b); buf_puts(b, "); SP_GC_ROOT(_t"); buf_printf(b, "%d);\n", tc);
     emit_indent(b, indent + 1); buf_printf(b, "for (mrb_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, tc, ti);
-    if (p0) { emit_indent(b, indent + 2); buf_printf(b, "lv_%s = (sp_IntArray *)_t%d->data[_t%d];\n", p0, tc, ti); }
+    if (p0) {
+      Scope *cbsc = comp_scope_of(c, block);
+      LocalVar *clv = cbsc ? scope_local(cbsc, p0) : NULL;
+      TyKind cpt = clv ? clv->type : TY_UNKNOWN;
+      emit_indent(b, indent + 2);
+      if (cpt == TY_POLY || cpt == TY_UNKNOWN)
+        buf_printf(b, "lv_%s = sp_box_obj((sp_IntArray *)_t%d->data[_t%d], SP_BUILTIN_INT_ARRAY);\n", p0, tc, ti);
+      else
+        buf_printf(b, "lv_%s = (sp_IntArray *)_t%d->data[_t%d];\n", p0, tc, ti);
+    }
     emit_stmts(c, body, b, indent + 2);
     emit_indent(b, indent + 1); buf_puts(b, "}\n");
     emit_indent(b, indent); buf_puts(b, "}\n");
