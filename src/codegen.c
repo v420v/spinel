@@ -3964,20 +3964,28 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   /* poly receiver: [] with symbol or string key -> runtime dispatch */
   if (recv >= 0 && rt == TY_POLY && !strcmp(name, "[]") && argc == 1) {
     TyKind at = comp_ntype(c, argv[0]);
-    if (at == TY_SYMBOL) {
-      buf_puts(b, "sp_poly_get_sym("); emit_expr(c, recv, b);
-      buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
-      return;
-    }
-    if (at == TY_STRING) {
-      buf_puts(b, "sp_poly_get_str("); emit_expr(c, recv, b);
-      buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
-      return;
-    }
-    if (at == TY_INT) {
-      buf_puts(b, "sp_poly_arr_get("); emit_expr(c, recv, b);
-      buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
-      return;
+    /* Only use the fast single-call path when no user class defines [].
+       If any user class has its own [] method, fall through to the per-class
+       poly dispatch (line ~4640) which generates both user and builtin arms. */
+    int has_user_aref = 0;
+    for (int k = 0; k < c->nclasses; k++)
+      if (comp_method_in_chain(c, k, "[]", NULL) >= 0) { has_user_aref = 1; break; }
+    if (!has_user_aref) {
+      if (at == TY_SYMBOL) {
+        buf_puts(b, "sp_poly_get_sym("); emit_expr(c, recv, b);
+        buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        return;
+      }
+      if (at == TY_STRING) {
+        buf_puts(b, "sp_poly_get_str("); emit_expr(c, recv, b);
+        buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        return;
+      }
+      if (at == TY_INT) {
+        buf_puts(b, "sp_poly_arr_get("); emit_expr(c, recv, b);
+        buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        return;
+      }
     }
   }
   /* poly receiver: join */
