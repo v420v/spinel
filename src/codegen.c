@@ -5465,6 +5465,12 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       return;
     }
   }
+  /* each_index on empty array literal [] (TY_UNKNOWN receiver): no-op loop */
+  if (recv >= 0 && rt == TY_UNKNOWN && !strcmp(name, "each_index") &&
+      nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ArrayNode")) {
+    int en = 0; nt_arr(nt, recv, "elements", &en);
+    if (en == 0) { emit_expr(c, recv, b); return; }
+  }
   if (recv >= 0 && ty_is_array(rt)) {
     if (!strcmp(name, "pack") && argc == 1 && (rt == TY_INT_ARRAY || rt == TY_POLY_ARRAY)) {
       buf_printf(b, "sp_%sArray_pack(", rt == TY_POLY_ARRAY ? "Poly" : "Int");
@@ -5545,6 +5551,28 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         for (int di = 1; di < argc; di++) { buf_puts(b, ", "); emit_expr(c, argv[di], b); buf_puts(b, ")"); }
       }
       return;
+    }
+    /* each_index { |i| ... } - iterate with index (works for all array kinds) */
+    {
+      int ei_blk = nt_ref(nt, id, "block");
+      if (!strcmp(name, "each_index") && ei_blk >= 0) {
+        const char *ek = (rt == TY_POLY_ARRAY) ? "Poly" : array_kind(rt);
+        if (ek) {
+          const char *ip = block_param_name(c, ei_blk, 0); if (ip) ip = rename_local(ip);
+          int body = nt_ref(nt, ei_blk, "body");
+          int trecv = ++g_tmp, ti = ++g_tmp;
+          Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+          emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+          buf_printf(g_pre, " _t%d = %s;\n", trecv, rb.p ? rb.p : ""); free(rb.p);
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
+                     ti, ti, ek, trecv, ti);
+          if (ip) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = _t%d;\n", ip, ti); }
+          emit_stmts(c, body, g_pre, g_indent + 1);
+          emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+          buf_printf(b, "_t%d", trecv); return;
+        }
+      }
     }
     if (k) {
       if ((!strcmp(name, "to_a") || !strcmp(name, "to_ary") || !strcmp(name, "entries") ||
@@ -5822,23 +5850,6 @@ static void emit_call(Compiler *c, int id, Buf *b) {
           if (flv) flv->type = fsaved;
           buf_printf(b, "_t%d", trecv); return;
         }
-      }
-      /* each_index { |i| ... } - iterate with index */
-      if (!strcmp(name, "each_index") && block >= 0) {
-        /* statement-mode: just emit the loop and return the receiver */
-        const char *ip = block_param_name(c, block, 0); if (ip) ip = rename_local(ip);
-        int body = nt_ref(nt, block, "body");
-        int trecv = ++g_tmp, ti = ++g_tmp;
-        Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
-        emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
-        buf_printf(g_pre, " _t%d = %s;\n", trecv, rb.p ? rb.p : ""); free(rb.p);
-        emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
-                   ti, ti, k, trecv, ti);
-        if (ip) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = _t%d;\n", ip, ti); }
-        emit_stmts(c, body, g_pre, g_indent + 1);
-        emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
-        buf_printf(b, "_t%d", trecv); return;
       }
       if ((!strcmp(name, "all?") || !strcmp(name, "any?") ||
            !strcmp(name, "none?") || !strcmp(name, "one?")) &&
