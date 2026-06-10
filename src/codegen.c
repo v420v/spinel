@@ -438,11 +438,19 @@ static void emit_cond(Compiler *c, int id, Buf *b);
 static int  needs_root(TyKind t);
 static int  method_is_void(Scope *s);
 static void emit_index_op_write(Compiler *c, int id, Buf *b, int indent);
+static void emit_index_and_or_write(Compiler *c, int id, Buf *b, int indent, int is_or);
+static void emit_boxed(Compiler *c, int node, Buf *b);
 static void emit_hash_key(Compiler *c, int key, TyKind kt, Buf *b) {
-  if (comp_ntype(c, key) == TY_POLY) {
+  TyKind actual = comp_ntype(c, key);
+  if (actual == TY_POLY && kt != TY_POLY) {
     buf_puts(b, "(");
     emit_expr(c, key, b);
     buf_puts(b, kt == TY_STRING ? ").v.s" : ").v.i");  /* int/sym share v.i */
+    return;
+  }
+  if (kt == TY_POLY && actual != TY_POLY) {
+    /* PolyPolyHash key: box the typed value into sp_RbVal */
+    emit_boxed(c, key, b);
     return;
   }
   emit_expr(c, key, b);
@@ -862,7 +870,24 @@ static int emit_sum_block_expr(Compiler *c, int id, Buf *b) {
   buf_printf(b, "({ sp_%sArray *_t%d = ", k, ta); emit_expr(c, recv, b);
   buf_printf(b, "; mrb_int _t%d = sp_%sArray_length(_t%d); ", tn, k, ta);
   emit_ctype(c, acct, b); buf_printf(b, " _t%d = ", tacc);
-  if (argc == 1) emit_expr(c, argv[0], b); else buf_puts(b, acct == TY_FLOAT ? "0.0" : "0");
+  if (argc == 1) {
+    TyKind init_t = comp_ntype(c, argv[0]);
+    if (acct == TY_FLOAT && init_t == TY_INT) {
+      buf_puts(b, "(mrb_float)("); emit_expr(c, argv[0], b); buf_puts(b, ")");
+    }
+    else if (acct == TY_FLOAT && init_t == TY_POLY) {
+      buf_puts(b, "sp_poly_to_f("); emit_expr(c, argv[0], b); buf_puts(b, ")");
+    }
+    else if (acct == TY_INT && init_t == TY_POLY) {
+      buf_puts(b, "sp_poly_to_i("); emit_expr(c, argv[0], b); buf_puts(b, ")");
+    }
+    else {
+      emit_expr(c, argv[0], b);
+    }
+  }
+  else {
+    buf_puts(b, acct == TY_FLOAT ? "0.0" : "0");
+  }
   buf_printf(b, "; for (mrb_int _t%d = 0; _t%d < _t%d; _t%d++) { ", ti, ti, tn, ti);
   if (p0) buf_printf(b, "lv_%s = sp_%sArray_get(_t%d, _t%d); ", p0, k, ta, ti);
   buf_printf(b, "_t%d = ", tacc);
@@ -2908,6 +2933,21 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       }
       if (cn && !strcmp(cn, "Array") && argc == 0 && nt_ref(nt, id, "block") < 0) {
         buf_puts(b, "sp_PolyArray_new()"); return;
+      }
+      if (cn && !strcmp(cn, "Array") && argc == 1 && nt_ref(nt, id, "block") < 0) {
+        /* Array.new(n) -> PolyArray of n nils */
+        int tn = ++g_tmp, tr = ++g_tmp, ti = ++g_tmp;
+        Buf nb; memset(&nb, 0, sizeof nb); emit_expr(c, argv[0], &nb);
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "mrb_int _t%d = ", tn); buf_puts(g_pre, nb.p ? nb.p : "0"); buf_puts(g_pre, ";\n");
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "sp_PolyArray *_t%d = sp_PolyArray_new();\n", tr);
+        emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tr);
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < _t%d; _t%d++) sp_PolyArray_push(_t%d, sp_box_nil());\n",
+                   ti, ti, tn, ti, tr);
+        free(nb.p);
+        buf_printf(b, "_t%d", tr); return;
       }
       if (cn && !strcmp(cn, "Array") && nt_ref(nt, id, "block") >= 0) {
         /* Array.new(n) { |i| body } / Array.new(0) { body } */
@@ -5002,6 +5042,23 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   }
 
   /* array value methods */
+  /* empty array literal [] has TY_UNKNOWN; sum returns init or 0 */
+  if (recv >= 0 && rt == TY_UNKNOWN && !strcmp(name, "sum") &&
+      nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ArrayNode")) {
+    int en = 0; nt_arr(nt, recv, "elements", &en);
+    if (en == 0) {
+      TyKind call_t = comp_ntype(c, id);
+      if (argc == 1) {
+        if (call_t == TY_POLY) emit_boxed(c, argv[0], b);
+        else emit_expr(c, argv[0], b);
+      }
+      else {
+        if (call_t == TY_POLY) buf_puts(b, "sp_box_int(0)");
+        else buf_puts(b, "0");
+      }
+      return;
+    }
+  }
   if (recv >= 0 && ty_is_array(rt)) {
     if (!strcmp(name, "pack") && argc == 1 && (rt == TY_INT_ARRAY || rt == TY_POLY_ARRAY)) {
       buf_printf(b, "sp_%sArray_pack(", rt == TY_POLY_ARRAY ? "Poly" : "Int");
@@ -5055,6 +5112,18 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         }
         return;
       }
+    }
+    if (rt == TY_POLY_ARRAY && !strcmp(name, "sum") && argc == 0 && nt_ref(nt, id, "block") < 0) {
+      buf_puts(b, "sp_PolyArray_sum_int("); emit_expr(c, recv, b); buf_puts(b, ")");
+      return;
+    }
+    if (rt == TY_POLY_ARRAY && !strcmp(name, "sum") && argc == 1 && nt_ref(nt, id, "block") < 0) {
+      TyKind init_t = comp_ntype(c, argv[0]);
+      buf_puts(b, "(");
+      if (init_t == TY_POLY) { buf_puts(b, "sp_poly_to_i("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else { emit_expr(c, argv[0], b); }
+      buf_puts(b, " + sp_PolyArray_sum_int("); emit_expr(c, recv, b); buf_puts(b, "))");
+      return;
     }
     if (rt == TY_POLY_ARRAY && (!strcmp(name, "shift") || !strcmp(name, "pop")) && argc == 0) {
       buf_printf(b, "sp_PolyArray_%s(", name); emit_expr(c, recv, b); buf_puts(b, ")");
@@ -5411,6 +5480,24 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       }
       if (!strcmp(name, "sum") && argc == 0) {
         buf_printf(b, "sp_%sArray_sum(", k); emit_expr(c, recv, b); buf_puts(b, ", 0)");
+        return;
+      }
+      if (!strcmp(name, "sum") && argc == 1 && nt_ref(nt, id, "block") < 0) {
+        TyKind init_t = comp_ntype(c, argv[0]);
+        buf_printf(b, "sp_%sArray_sum(", k); emit_expr(c, recv, b); buf_puts(b, ", ");
+        if (rt == TY_FLOAT_ARRAY && init_t == TY_INT) {
+          buf_puts(b, "(mrb_float)("); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        }
+        else if (rt == TY_FLOAT_ARRAY && init_t == TY_POLY) {
+          buf_puts(b, "sp_poly_to_f("); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        }
+        else if (rt == TY_INT_ARRAY && init_t == TY_POLY) {
+          buf_puts(b, "sp_poly_to_i("); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        }
+        else {
+          emit_expr(c, argv[0], b);
+        }
+        buf_puts(b, ")");
         return;
       }
       if (!strcmp(name, "join") && rt == TY_STR_ARRAY && argc == 1) {
@@ -6473,6 +6560,80 @@ static void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
     return;
   }
   unsupported(c, id, "index operator assignment");
+}
+
+/* h[k] &&= v  /  h[k] ||= v  /  a[i] &&= v  /  a[i] ||= v.
+   IndexAndWriteNode / IndexOrWriteNode. Receiver and key evaluated once. */
+static void emit_index_and_or_write(Compiler *c, int id, Buf *b, int indent, int is_or) {
+  const NodeTable *nt = c->nt;
+  int recv = nt_ref(nt, id, "receiver");
+  int args = nt_ref(nt, id, "arguments");
+  int v = nt_ref(nt, id, "value");
+  int argc = 0;
+  const int *argv = NULL;
+  if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
+  if (argc != 1) { unsupported(c, id, is_or ? "index-or-write" : "index-and-write"); return; }
+  TyKind rt = comp_ntype(c, recv);
+  int ta = ++g_tmp, tb = ++g_tmp;
+
+  if (ty_is_hash(rt)) {
+    const char *hn = ty_hash_cname(rt);
+    if (!hn) { unsupported(c, id, "index and/or write (unknown hash)"); return; }
+    TyKind kt = ty_hash_key(rt);
+    TyKind vt = ty_hash_val(rt);
+    emit_indent(b, indent);
+    buf_printf(b, "{ %s _t%d = ", c_type_name(rt), ta); emit_expr(c, recv, b);
+    buf_printf(b, "; %s _t%d = ", c_type_name(kt), tb); emit_hash_key(c, argv[0], kt, b);
+    buf_puts(b, "; ");
+    if (vt == TY_POLY) {
+      buf_printf(b, "if (%ssp_poly_truthy(sp_%sHash_get(_t%d, _t%d))) sp_%sHash_set(_t%d, _t%d, ",
+                 is_or ? "!" : "", hn, ta, tb, hn, ta, tb);
+      emit_boxed(c, v, b);
+      buf_puts(b, ")");
+    }
+    else {
+      buf_printf(b, "if (%ssp_%sHash_has_key(_t%d, _t%d)) sp_%sHash_set(_t%d, _t%d, ",
+                 is_or ? "!" : "", hn, ta, tb, hn, ta, tb);
+      emit_expr(c, v, b);
+      buf_puts(b, ")");
+    }
+    buf_puts(b, "; }\n");
+    return;
+  }
+
+  if (ty_is_array(rt)) {
+    const char *k = array_kind(rt);
+    if (!k) { unsupported(c, id, "index and/or write (array kind)"); return; }
+    emit_indent(b, indent);
+    buf_printf(b, "{ %s _t%d = ", c_type_name(rt), ta); emit_expr(c, recv, b);
+    buf_printf(b, "; mrb_int _t%d = ", tb); emit_expr(c, argv[0], b);
+    buf_puts(b, "; ");
+    if (rt == TY_INT_ARRAY) {
+      buf_printf(b, "if (%ssp_IntArray_get(_t%d, _t%d) != SP_INT_NIL) sp_IntArray_set(_t%d, _t%d, ",
+                 is_or ? "!" : "", ta, tb, ta, tb);
+      emit_expr(c, v, b);
+      buf_puts(b, ")");
+    }
+    else if (rt == TY_STR_ARRAY) {
+      buf_printf(b, "if (%ssp_StrArray_get(_t%d, _t%d)) sp_StrArray_set(_t%d, _t%d, ",
+                 is_or ? "!" : "", ta, tb, ta, tb);
+      emit_expr(c, v, b);
+      buf_puts(b, ")");
+    }
+    else if (rt == TY_POLY_ARRAY) {
+      buf_printf(b, "if (%ssp_poly_truthy(sp_PolyArray_get(_t%d, _t%d))) sp_PolyArray_set(_t%d, _t%d, ",
+                 is_or ? "!" : "", ta, tb, ta, tb);
+      emit_boxed(c, v, b);
+      buf_puts(b, ")");
+    }
+    else {
+      unsupported(c, id, "index and/or write (array type)"); return;
+    }
+    buf_puts(b, "; }\n");
+    return;
+  }
+
+  unsupported(c, id, is_or ? "index-or-write" : "index-and-write");
 }
 
 static int scope_has_return(Compiler *c, int scope_idx) {
@@ -9968,6 +10129,8 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     return;
   }
   if (!strcmp(ty, "IndexOperatorWriteNode")) { emit_index_op_write(c, id, b, indent); return; }
+  if (!strcmp(ty, "IndexAndWriteNode")) { emit_index_and_or_write(c, id, b, indent, 0); return; }
+  if (!strcmp(ty, "IndexOrWriteNode"))  { emit_index_and_or_write(c, id, b, indent, 1); return; }
   if (!strcmp(ty, "IfNode"))     { emit_if(c, id, b, indent, 0, 0); return; }
   if (!strcmp(ty, "UnlessNode")) { emit_if(c, id, b, indent, 1, 0); return; }
   if (!strcmp(ty, "WhileNode"))  { emit_while(c, id, b, indent, 0); return; }
