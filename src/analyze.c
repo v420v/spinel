@@ -610,6 +610,8 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "Float") && argc == 1) return TY_FLOAT;
     if (!strcmp(name, "system") && argc >= 1) return TY_BOOL;
     if (!strcmp(name, "trap") && argc >= 1) return TY_STRING;
+    if (!strcmp(name, "rand")) return argc > 0 ? TY_INT : TY_FLOAT;
+    if (!strcmp(name, "srand")) return TY_INT;
   }
   /* Signal.trap / ::Signal.trap */
   if (recv >= 0 && !strcmp(name, "trap") && argc >= 1) {
@@ -912,6 +914,11 @@ static TyKind infer_call(Compiler *c, int id) {
       nt_type(nt, recv) && (!strcmp(nt_type(nt, recv), "HashNode") ||
                              !strcmp(nt_type(nt, recv), "KeywordHashNode"))) {
     return TY_POLY; /* {}.default -> nil (poly nil) */
+  }
+  /* fetch(key, default) on an unknown/empty hash: return the default type */
+  if (recv >= 0 && !strcmp(name, "fetch") && argc >= 2 && !ty_is_hash(rt)) {
+    TyKind dt = infer_type(c, argv[1]);
+    if (dt != TY_UNKNOWN) return dt;
   }
   if (recv >= 0 && ty_is_hash(rt)) {
     if (!strcmp(name, "[]"))     return ty_hash_val(rt);
@@ -2682,6 +2689,26 @@ static int infer_write_types(Compiler *c) {
       else if (name && !strcmp(name, "[]=") && an == 2) {
         kt = infer_type(c, argv[0]); vt = infer_type(c, argv[1]);
       }
+      else if (name && (!strcmp(name, "fetch") || !strcmp(name, "[]")) && an >= 1) {
+        /* hash.fetch(key,..) / hash[key]: promote TY_UNKNOWN local to a typed hash.
+           Only fires when the slot is currently TY_UNKNOWN (empty hash). */
+        TyKind rslot = TY_UNKNOWN;
+        const char *rrty = nt_type(nt, recv);
+        if (rrty && !strcmp(rrty, "LocalVariableReadNode")) {
+          const char *rnm2 = nt_str(nt, recv, "name");
+          LocalVar *lv2 = rnm2 ? scope_local(comp_scope_of(c, recv), rnm2) : NULL;
+          if (lv2) rslot = lv2->type;
+        }
+        else if (rrty && !strcmp(rrty, "InstanceVariableReadNode")) {
+          /* handled via slot below if it's TY_UNKNOWN */
+        }
+        if (rslot != TY_UNKNOWN) continue;  /* already typed, skip */
+        kt = infer_type(c, argv[0]);
+        if (kt == TY_SYMBOL) { vt = TY_INT; /* dummy: sym hash val is always poly */ }
+        else if (kt == TY_STRING) { vt = TY_POLY; /* will map to STR_POLY */ }
+        else if (kt == TY_INT)    { vt = TY_POLY; /* will map to POLY_POLY */ }
+        else continue;
+      }
       else continue;
     }
     else if (!strcmp(ty, "IndexOperatorWriteNode")) {
@@ -2739,8 +2766,12 @@ static int infer_write_types(Compiler *c) {
       if (*slot != TY_UNKNOWN && ty_is_array(*slot)) continue;
       if (*slot != TY_UNKNOWN && !ty_is_hash(*slot)) continue;
       TyKind hv = ty_hash_of(TY_INT, vt);
-      if (hv == TY_UNKNOWN) continue;
-      if (*slot != TY_UNKNOWN && *slot != hv) continue;
+      if (hv == TY_UNKNOWN) hv = TY_POLY_POLY_HASH;  /* int key + unknown val type */
+      if (*slot != TY_UNKNOWN && *slot != hv) {
+        /* widen to poly-poly if mismatch */
+        if (ty_is_hash(*slot)) { *slot = TY_POLY_POLY_HASH; }
+        continue;
+      }
       *slot = hv;
     }
     else if (kt == TY_STRING) {

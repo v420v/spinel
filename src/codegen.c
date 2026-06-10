@@ -2915,6 +2915,16 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else { buf_puts(b, "("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
       return;
     }
+    if (!strcmp(name, "rand")) {
+      if (ac == 0) { buf_puts(b, "(mrb_float)((double)rand() / (RAND_MAX + 1.0))"); return; }
+      buf_puts(b, "((mrb_int)("); emit_expr(c, av[0], b); buf_printf(b, " > 0 ? rand() %% (int)"); emit_expr(c, av[0], b); buf_puts(b, " : rand()))");
+      return;
+    }
+    if (!strcmp(name, "srand")) {
+      if (ac == 0) { buf_puts(b, "(srand((unsigned)time(NULL)), (mrb_int)0)"); return; }
+      buf_puts(b, "({ unsigned _sv = (unsigned)("); emit_expr(c, av[0], b); buf_puts(b, "); srand(_sv); (mrb_int)_sv; })");
+      return;
+    }
   }
 
   /* raise */
@@ -7188,6 +7198,28 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     }
   }
 
+  /* $stderr.puts / $stderr.print: emit to stderr */
+  if (recv >= 0 && argc >= 0 && nt_type(nt, recv) &&
+      !strcmp(nt_type(nt, recv), "GlobalVariableReadNode")) {
+    const char *gvnm = nt_str(nt, recv, "name");
+    if (gvnm && (!strcmp(gvnm, "$stderr") || !strcmp(gvnm, "$stdout"))) {
+      int is_err = gvnm[1] == 's' && gvnm[2] == 't' && gvnm[3] == 'd' && gvnm[4] == 'e';
+      const char *fd = is_err ? "stderr" : "stdout";
+      if (!strcmp(name, "puts") || !strcmp(name, "print")) {
+        int want_nl = !strcmp(name, "puts");
+        for (int k = 0; k < argc; k++) {
+          TyKind at = comp_ntype(c, argv[k]);
+          if (at == TY_STRING) { buf_printf(b, "fputs("); emit_expr(c, argv[k], b); buf_printf(b, ", %s)", fd); }
+          else if (at == TY_INT) { buf_printf(b, "fprintf(%s, \"%%lld\", (long long)(", fd); emit_expr(c, argv[k], b); buf_puts(b, "))"); }
+          else { buf_printf(b, "fputs(sp_poly_to_s("); emit_expr(c, argv[k], b); buf_printf(b, "), %s)", fd); }
+          if (want_nl && k == argc - 1) buf_printf(b, "; fputc('\\n', %s)", fd);
+        }
+        if (argc == 0 && want_nl) buf_printf(b, "fputc('\\n', %s)", fd);
+        return;
+      }
+      if (!strcmp(name, "flush")) { buf_printf(b, "fflush(%s)", fd); return; }
+    }
+  }
   /* Last-resort fallbacks for inspect/to_s on unresolved receivers.
      The test array_unresolved_inspect_no_segv expects "[]" when an
      unsupported method chains into inspect. Emit a safe nil-degrade
@@ -9774,6 +9806,17 @@ static int emit_output_call(Compiler *c, int id, Buf *b, int indent) {
   }
   /* trap(...) stmt: no-op (Spinel has no signal-handler runtime) */
   if (!strcmp(name, "trap") && argc >= 1) return 1;
+  if (!strcmp(name, "srand")) {
+    emit_indent(b, indent);
+    if (argc == 0) buf_puts(b, "srand((unsigned)time(NULL));\n");
+    else { buf_puts(b, "srand((unsigned)("); emit_expr(c, argv[0], b); buf_puts(b, "));\n"); }
+    return 1;
+  }
+  if (!strcmp(name, "rand") && argc >= 1) {
+    /* stmt-level rand: evaluate for side effects; result unused */
+    emit_indent(b, indent); buf_puts(b, "(void)("); emit_expr(c, argv[0], b); buf_puts(b, ");\n");
+    return 1;
+  }
   if (!strcmp(name, "warn")) {
     /* Kernel#warn: each argument to stderr with a trailing newline */
     for (int k = 0; k < argc; k++) {
