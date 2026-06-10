@@ -1176,6 +1176,25 @@ static TyKind infer_uncached(Compiler *c, int id) {
     LocalVar *lv = nm ? comp_const(c, nm) : NULL;
     if (lv) return lv->type;
     if (nm && !strcmp(nm, "ARGV")) return TY_STR_ARRAY;
+    /* well-known module constants */
+    int par_id = nt_ref(nt, id, "parent");
+    const char *par_ty = par_id >= 0 ? nt_type(nt, par_id) : NULL;
+    const char *par_nm = (par_ty && !strcmp(par_ty, "ConstantReadNode")) ? nt_str(nt, par_id, "name") : NULL;
+    if (par_nm && !strcmp(par_nm, "Float")) {
+      if (nm && (!strcmp(nm, "MAX") || !strcmp(nm, "MIN") || !strcmp(nm, "EPSILON") ||
+                 !strcmp(nm, "INFINITY") || !strcmp(nm, "NAN") || !strcmp(nm, "DIG") ||
+                 !strcmp(nm, "MANT_DIG") || !strcmp(nm, "RADIX"))) return TY_FLOAT;
+    }
+    if (par_nm && !strcmp(par_nm, "Math")) {
+      if (nm && (!strcmp(nm, "PI") || !strcmp(nm, "E"))) return TY_FLOAT;
+    }
+    if (par_nm && !strcmp(par_nm, "File")) {
+      if (nm && (!strcmp(nm, "SEPARATOR") || !strcmp(nm, "PATH_SEPARATOR") ||
+                 !strcmp(nm, "ALT_SEPARATOR"))) return TY_STRING;
+    }
+    if (par_nm && !strcmp(par_nm, "Integer")) {
+      if (nm && (!strcmp(nm, "MAX") || !strcmp(nm, "MIN"))) return TY_UNKNOWN; /* raises NameError */
+    }
     return TY_UNKNOWN;
   }
   if (!strcmp(ty, "SelfNode")) {

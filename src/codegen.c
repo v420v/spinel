@@ -7122,6 +7122,35 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     const char *nm = nt_str(nt, id, "name");
     if (nm && comp_const(c, nm)) { buf_printf(b, "cst_%s", nm); return; }
     if (nm && !strcmp(nm, "ARGV")) { buf_puts(b, "sp_get_ARGV()"); return; }
+    /* well-known module constants */
+    int par_idc = nt_ref(nt, id, "parent");
+    const char *par_tyc = par_idc >= 0 ? nt_type(nt, par_idc) : NULL;
+    const char *par_nmc = (par_tyc && !strcmp(par_tyc, "ConstantReadNode")) ? nt_str(nt, par_idc, "name") : NULL;
+    if (par_nmc && !strcmp(par_nmc, "Float") && nm) {
+      if (!strcmp(nm, "MAX"))      { buf_puts(b, "DBL_MAX"); return; }
+      if (!strcmp(nm, "MIN"))      { buf_puts(b, "DBL_MIN"); return; }
+      if (!strcmp(nm, "EPSILON"))  { buf_puts(b, "DBL_EPSILON"); return; }
+      if (!strcmp(nm, "INFINITY")) { buf_puts(b, "(1.0/0.0)"); return; }
+      if (!strcmp(nm, "NAN"))      { buf_puts(b, "(0.0/0.0)"); return; }
+      if (!strcmp(nm, "DIG"))      { buf_printf(b, "(double)DBL_DIG"); return; }
+      if (!strcmp(nm, "MANT_DIG")) { buf_printf(b, "(double)DBL_MANT_DIG"); return; }
+      if (!strcmp(nm, "RADIX"))    { buf_printf(b, "(double)FLT_RADIX"); return; }
+    }
+    if (par_nmc && !strcmp(par_nmc, "Math") && nm) {
+      if (!strcmp(nm, "PI")) { buf_puts(b, "M_PI"); return; }
+      if (!strcmp(nm, "E"))  { buf_puts(b, "M_E"); return; }
+    }
+    if (par_nmc && !strcmp(par_nmc, "File") && nm) {
+      if (!strcmp(nm, "SEPARATOR"))      { buf_puts(b, "\"/\""); return; }
+      if (!strcmp(nm, "PATH_SEPARATOR")) { buf_puts(b, "\":\""); return; }
+      if (!strcmp(nm, "ALT_SEPARATOR"))  { buf_puts(b, "(&(\"\\xff\")[1])"); return; }
+    }
+    if (par_nmc && !strcmp(par_nmc, "Integer") && nm &&
+        (!strcmp(nm, "MAX") || !strcmp(nm, "MIN"))) {
+      /* Integer::MAX/MIN do not exist in Ruby — raise NameError at runtime */
+      buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant Integer::%s\"), 0)", nm);
+      return;
+    }
     unsupported(c, id, "constant path read");
   }
   if (!strcmp(ty, "DefinedNode")) {
