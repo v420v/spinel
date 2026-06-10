@@ -4,6 +4,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int re_has_captures(const char *src) {
+  if (!src) return 0;
+  for (const char *p = src; *p; p++) {
+    if (*p == '\\') { if (p[1]) p++; continue; }
+    if (*p == '(' && p[1] != '?') return 1;
+  }
+  return 0;
+}
+
 /* ---- operator classification ---- */
 
 static int str_in(const char *s, const char *const *set) {
@@ -982,13 +991,22 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "scrub") || !strcmp(name, "crypt")) return TY_STRING;
     if (!strcmp(name, "rindex")) return TY_INT;
     if (!strcmp(name, "partition") || !strcmp(name, "rpartition")) return TY_STR_ARRAY;
-    if (!strcmp(name, "casecmp?")) return TY_BOOL;
+    if (!strcmp(name, "casecmp?") || !strcmp(name, "ascii_only?") || !strcmp(name, "valid_encoding?")) return TY_BOOL;
     if (!strcmp(name, "to_f"))  return TY_FLOAT;
     if (!strcmp(name, "each_char") || !strcmp(name, "each_line") || !strcmp(name, "each_byte")) return TY_STRING;
     { int blk = nt_ref(nt, id, "block");
       if (blk >= 0 && (!strcmp(name, "chars") || !strcmp(name, "lines"))) return TY_STRING;
       if (blk >= 0 && (!strcmp(name, "bytes") || !strcmp(name, "codepoints"))) return TY_STRING; }
-    if (!strcmp(name, "split") || !strcmp(name, "lines") || !strcmp(name, "scan")) return TY_STR_ARRAY;
+    if (!strcmp(name, "split") || !strcmp(name, "lines")) return TY_STR_ARRAY;
+    if (!strcmp(name, "scan") && argc == 1) {
+      /* scan with capture groups returns poly_array (array of arrays or strings) */
+      const char *aty = nt_type(nt, argv[0]);
+      if (aty && !strcmp(aty, "RegularExpressionNode")) {
+        const char *src = nt_str(nt, argv[0], "unescaped");
+        if (src && re_has_captures(src)) return TY_POLY_ARRAY;
+      }
+      return TY_STR_ARRAY;
+    }
     if (!strcmp(name, "upto") && argc == 1) return TY_STR_ARRAY;  /* blockless: materialized sequence */
     if (!strcmp(name, "bytes") || !strcmp(name, "codepoints")) return TY_INT_ARRAY;
     if (!strcmp(name, "unpack") && argc == 1) return TY_POLY_ARRAY;

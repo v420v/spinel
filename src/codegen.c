@@ -6483,7 +6483,14 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     }
     if (is_line) {
       int tl = ++g_tmp;
-      buf_printf(b, "sp_StrArray *_t%d = sp_str_lines(_t%d); for (mrb_int _t%d = 0; _t%d < sp_StrArray_length(_t%d); _t%d++) { ", tl, ts, ti, ti, tl, ti);
+      /* chomp: true keyword arg uses the _chomp variant */
+      int eline_chomp = 0;
+      if (argc == 1 && argv && nt_type(nt, argv[0]) && !strcmp(nt_type(nt, argv[0]), "KeywordHashNode")) {
+        int cv = struct_kwarg_value(c, argv[0], "chomp");
+        eline_chomp = (cv >= 0 && nt_type(nt, cv) && !strcmp(nt_type(nt, cv), "TrueNode"));
+      }
+      buf_printf(b, "sp_StrArray *_t%d = %s(_t%d); for (mrb_int _t%d = 0; _t%d < sp_StrArray_length(_t%d); _t%d++) { ",
+                 tl, eline_chomp ? "sp_str_lines_chomp" : "sp_str_lines", ts, ti, ti, tl, ti);
       if (p0) {
         if (p0_box_poly_ech) buf_printf(b, "lv_%s = sp_box_str(sp_StrArray_get(_t%d, _t%d)); ", p0, tl, ti);
         else buf_printf(b, "lv_%s = sp_StrArray_get(_t%d, _t%d); ", p0, tl, ti);
@@ -6545,6 +6552,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
                !re_has_captures(re_lit_src(c, argv[0]))) {
         buf_printf(b, "sp_re_scan(sp_re_pat_%d, %s)", re_lit_index(c, argv[0]), r);
       }
+      else if (!strcmp(name, "scan") && argc == 1 && re_lit_index(c, argv[0]) >= 0 &&
+               re_has_captures(re_lit_src(c, argv[0]))) {
+        buf_printf(b, "sp_re_scan_poly(sp_re_pat_%d, %s)", re_lit_index(c, argv[0]), r);
+      }
       else if (!strcmp(name, "to_sym") || !strcmp(name, "intern")) buf_printf(b, "sp_sym_intern(%s)", r);
       else if (!strcmp(name, "length") || !strcmp(name, "size")) buf_printf(b, "sp_str_length(%s)", r);
       else if (!strcmp(name, "bytesize")) buf_printf(b, "(mrb_int)sp_str_byte_len(%s)", r);
@@ -6572,6 +6583,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else if (!strcmp(name, "end_with?") && argc == 1) {
         buf_printf(b, "sp_str_end_with(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")");
       }
+      else if (!strcmp(name, "ascii_only?") && argc == 0) buf_printf(b, "sp_str_ascii_only(%s)", r);
+      else if (!strcmp(name, "valid_encoding?") && argc == 0) buf_printf(b, "sp_str_valid_encoding(%s)", r);
       else if (!strcmp(name, "index") && argc == 1 && re_lit_index(c, argv[0]) >= 0) {
         buf_printf(b, "sp_re_index_poly(sp_re_pat_%d, %s)", re_lit_index(c, argv[0]), r);
       }
@@ -6662,10 +6675,20 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else if (!strcmp(name, "byteslice") && argc == 1) { buf_printf(b, "sp_str_byteslice(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ", 1)"); }
       else if (!strcmp(name, "squeeze") && argc == 0) buf_printf(b, "sp_str_squeeze(%s)", r);
       else if (!strcmp(name, "squeeze") && argc == 1) { buf_printf(b, "sp_str_squeeze_chars(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else if (!strcmp(name, "squeeze") && argc >= 2) {
+        buf_printf(b, "sp_str_squeeze_n(%s, (const char *[]){", r);
+        for (int a = 0; a < argc; a++) { if (a) buf_puts(b, ", "); emit_expr(c, argv[a], b); }
+        buf_printf(b, "}, %d)", argc);
+      }
       else if ((!strcmp(name, "tr") || !strcmp(name, "tr_s")) && argc == 2) {
         buf_printf(b, "sp_str_%s(%s, ", name, r); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
       }
       else if (!strcmp(name, "delete") && argc == 1) { buf_printf(b, "sp_str_delete(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else if (!strcmp(name, "delete") && argc >= 2) {
+        buf_printf(b, "sp_str_delete_n(%s, (const char *[]){", r);
+        for (int a = 0; a < argc; a++) { if (a) buf_puts(b, ", "); emit_expr(c, argv[a], b); }
+        buf_printf(b, "}, %d)", argc);
+      }
       else if (!strcmp(name, "count") && argc == 1) { buf_printf(b, "sp_str_count(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       else if (!strcmp(name, "count") && argc >= 2) {
         buf_printf(b, "sp_str_count_n(%s, (const char *[]){", r);
@@ -6673,7 +6696,15 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "}, %d)", argc);
       }
       else if (!strcmp(name, "lines") && argc == 0) buf_printf(b, "sp_str_lines(%s)", r);
+      else if (!strcmp(name, "lines") && argc == 1 && nt_type(nt, argv[0]) &&
+               !strcmp(nt_type(nt, argv[0]), "KeywordHashNode")) {
+        int chomp_v = struct_kwarg_value(c, argv[0], "chomp");
+        int is_chomp = (chomp_v >= 0 && nt_type(nt, chomp_v) &&
+                        !strcmp(nt_type(nt, chomp_v), "TrueNode"));
+        buf_printf(b, "%s(%s)", is_chomp ? "sp_str_lines_chomp" : "sp_str_lines", r);
+      }
       else if (!strcmp(name, "bytes") && argc == 0)   buf_printf(b, "sp_str_bytes(%s)", r);
+      else if (!strcmp(name, "codepoints") && argc == 0) buf_printf(b, "sp_str_codepoints(%s)", r);
       else if (!strcmp(name, "unpack") && argc == 1)  { buf_printf(b, "sp_str_unpack(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       else if (!strcmp(name, "chars") && argc == 0)   buf_printf(b, "sp_str_chars(%s)", r);
       else if ((!strcmp(name, "succ") || !strcmp(name, "next")) && argc == 0) buf_printf(b, "sp_str_succ(%s)", r);
@@ -8822,8 +8853,23 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
           Buf el; memset(&el, 0, sizeof el); emit_expr(c, inner, &el);
           const char *ep = el.p ? el.p : "NULL";
           emit_indent(g_pre, g_indent);
-          if (it == TY_RANGE)
-            buf_printf(g_pre, "{ sp_Range _sr = %s; mrb_int _e = _sr.last+(_sr.excl?0:1); for (mrb_int _si = _sr.first; _si < _e; _si++) sp_PolyArray_push(_t%d, sp_box_int(_si)); }\n", ep, t);
+          if (it == TY_RANGE) {
+            /* check if it's a string range (bounds are TY_STRING) */
+            int rn = nt_type(nt, inner) && !strcmp(nt_type(nt, inner), "RangeNode") ? inner : -1;
+            int rlo = rn >= 0 ? nt_ref(nt, rn, "left") : -1;
+            int rhi = rn >= 0 ? nt_ref(nt, rn, "right") : -1;
+            int rexcl = rn >= 0 ? (int)(nt_int(nt, rn, "flags", 0) & 4) : 0;
+            if (rlo >= 0 && comp_ntype(c, rlo) == TY_STRING) {
+              Buf lo_b; memset(&lo_b, 0, sizeof lo_b); emit_expr(c, rlo, &lo_b);
+              Buf hi_b; memset(&hi_b, 0, sizeof hi_b); emit_expr(c, rhi, &hi_b);
+              buf_printf(g_pre, "{ sp_StrArray *_sa = sp_StrArray_from_string_range(%s, %s, %d); if (_sa) for (mrb_int _si = 0; _si < _sa->len; _si++) sp_PolyArray_push(_t%d, sp_box_str(_sa->data[_si])); }\n",
+                         lo_b.p ? lo_b.p : "NULL", hi_b.p ? hi_b.p : "NULL", rexcl, t);
+              free(lo_b.p); free(hi_b.p);
+            }
+            else {
+              buf_printf(g_pre, "{ sp_Range _sr = %s; mrb_int _e = _sr.last+(_sr.excl?0:1); for (mrb_int _si = _sr.first; _si < _e; _si++) sp_PolyArray_push(_t%d, sp_box_int(_si)); }\n", ep, t);
+            }
+          }
           else if (it == TY_INT_ARRAY)
             buf_printf(g_pre, "{ sp_IntArray *_sa = %s; if (_sa) for (mrb_int _si = 0; _si < _sa->len; _si++) sp_PolyArray_push(_t%d, sp_box_int(_sa->data[_sa->start+_si])); }\n", ep, t);
           else if (it == TY_STR_ARRAY)
@@ -8862,8 +8908,22 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
         Buf el; memset(&el, 0, sizeof el); emit_expr(c, inner, &el);
         const char *ep = el.p ? el.p : "NULL";
         emit_indent(g_pre, g_indent);
-        if (it == TY_RANGE)
-          buf_printf(g_pre, "{ sp_Range _sr = %s; mrb_int _e = _sr.last+(_sr.excl?0:1); for (mrb_int _si = _sr.first; _si < _e; _si++) sp_%sArray_push(_t%d, _si); }\n", ep, k, t);
+        if (it == TY_RANGE) {
+          int rn2 = nt_type(nt, inner) && !strcmp(nt_type(nt, inner), "RangeNode") ? inner : -1;
+          int rlo2 = rn2 >= 0 ? nt_ref(nt, rn2, "left") : -1;
+          int rexcl2 = rn2 >= 0 ? (int)(nt_int(nt, rn2, "flags", 0) & 4) : 0;
+          if (rlo2 >= 0 && comp_ntype(c, rlo2) == TY_STRING) {
+            int rhi2 = nt_ref(nt, rn2, "right");
+            Buf lo2; memset(&lo2, 0, sizeof lo2); emit_expr(c, rlo2, &lo2);
+            Buf hi2; memset(&hi2, 0, sizeof hi2); emit_expr(c, rhi2, &hi2);
+            buf_printf(g_pre, "{ sp_StrArray *_sa = sp_StrArray_from_string_range(%s, %s, %d); if (_sa) for (mrb_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push(_t%d, _sa->data[_si]); }\n",
+                       lo2.p ? lo2.p : "NULL", hi2.p ? hi2.p : "NULL", rexcl2, k, t);
+            free(lo2.p); free(hi2.p);
+          }
+          else {
+            buf_printf(g_pre, "{ sp_Range _sr = %s; mrb_int _e = _sr.last+(_sr.excl?0:1); for (mrb_int _si = _sr.first; _si < _e; _si++) sp_%sArray_push(_t%d, _si); }\n", ep, k, t);
+          }
+        }
         else if (it == TY_INT_ARRAY && !strcmp(k, "Int"))
           buf_printf(g_pre, "{ sp_IntArray *_sa = %s; if (_sa) for (mrb_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push(_t%d, _sa->data[_sa->start+_si]); }\n", ep, k, t);
         else if (it == TY_STR_ARRAY && !strcmp(k, "Str"))
