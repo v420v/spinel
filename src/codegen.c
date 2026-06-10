@@ -1603,6 +1603,72 @@ static int emit_collect_expr(Compiler *c, int id, Buf *b) {
   TyKind rt = comp_ntype(c, recv);
   if (ty_is_hash(rt)) return emit_hash_collect_expr(c, id, b);
   int range_recv = (rt == TY_RANGE);
+  if (rt == TY_POLY) {
+    /* poly-typed receiver (e.g. `arr = nil` default): iterate via
+       sp_poly_arr_len / sp_poly_arr_get and build a typed result array */
+    int is_map2 = !strcmp(name, "map") || !strcmp(name, "collect");
+    if (!is_map2) return 0;
+    TyKind restype2 = comp_ntype(c, id);
+    int res_poly2 = (restype2 == TY_POLY_ARRAY);
+    const char *rk2 = res_poly2 ? "Poly" : array_kind(restype2);
+    if (!rk2) return 0;
+    const char *p0p = block_param_name(c, block, 0); if (p0p) p0p = rename_local(p0p);
+    int body2 = nt_ref(nt, block, "body");
+    int bn2 = 0;
+    const int *bb2 = body2 >= 0 ? nt_arr(nt, body2, "body", &bn2) : NULL;
+    if (bn2 < 1) return 0;
+    int trecv2 = ++g_tmp, tn2 = ++g_tmp, tres2 = ++g_tmp, ti2 = ++g_tmp;
+    Buf rb2; memset(&rb2, 0, sizeof rb2); emit_expr(c, recv, &rb2);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "sp_RbVal _t%d = ", trecv2);
+    buf_puts(g_pre, rb2.p ? rb2.p : "sp_box_nil()");
+    buf_puts(g_pre, ";\n");
+    free(rb2.p);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "mrb_int _t%d = sp_poly_arr_len(_t%d);\n", tn2, trecv2);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", rk2, tres2, rk2);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tres2);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < _t%d; _t%d++) {\n",
+               ti2, ti2, tn2, ti2);
+    /* pin block param to TY_POLY via shadow declaration */
+    Scope *csc2 = p0p ? comp_scope_of(c, block) : NULL;
+    LocalVar *clv2 = (csc2 && p0p) ? scope_local(csc2, p0p) : NULL;
+    TyKind csaved2 = clv2 ? clv2->type : TY_UNKNOWN;
+    if (clv2) clv2->type = TY_POLY;
+    for (int j2 = 0; j2 < bn2; j2++) infer_type(c, bb2[j2]);
+    emit_indent(g_pre, g_indent + 1);
+    buf_puts(g_pre, "{\n");
+    emit_indent(g_pre, g_indent + 2);
+    buf_printf(g_pre, "sp_RbVal lv_%s = sp_poly_arr_get(_t%d, _t%d);\n",
+               p0p ? p0p : "_dummy", trecv2, ti2);
+    for (int j2 = 0; j2 < bn2 - 1; j2++) emit_stmt(c, bb2[j2], g_pre, g_indent + 2);
+    int saveIndent2 = g_indent; g_indent = g_indent + 2;
+    Buf vb2; memset(&vb2, 0, sizeof vb2); emit_expr(c, bb2[bn2 - 1], &vb2);
+    g_indent = saveIndent2;
+    TyKind bty2 = comp_ntype(c, bb2[bn2 - 1]);
+    emit_indent(g_pre, g_indent + 2);
+    buf_printf(g_pre, "sp_%sArray_push(_t%d, ", rk2, tres2);
+    if (res_poly2 && bty2 != TY_POLY) {
+      Buf bx2; memset(&bx2, 0, sizeof bx2);
+      emit_boxed_text(c, bty2, vb2.p ? vb2.p : "", &bx2);
+      buf_puts(g_pre, bx2.p ? bx2.p : ""); free(bx2.p);
+    }
+    else {
+      buf_puts(g_pre, vb2.p ? vb2.p : "");
+    }
+    buf_puts(g_pre, ");\n");
+    free(vb2.p);
+    emit_indent(g_pre, g_indent + 1);
+    buf_puts(g_pre, "}\n");
+    emit_indent(g_pre, g_indent);
+    buf_puts(g_pre, "}\n");
+    if (clv2) clv2->type = csaved2;
+    buf_printf(b, "_t%d", tres2);
+    return 1;
+  }
   if (!ty_is_array(rt) && !range_recv) return 0;
   const char *k = range_recv ? "Int" : (rt == TY_POLY_ARRAY ? "Poly" : array_kind(rt));
   if (!k) return 0;
