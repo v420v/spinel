@@ -2103,6 +2103,7 @@ static const char *sp_re_match_post = NULL;
    underlying issue is unconditional. */
 typedef struct{const char**data;mrb_int len;}sp_Argv;
 static sp_Argv sp_argv;
+static const char *sp_program_name = "";
 static sp_StrArray *sp_argv_array_cache = NULL;
 static sp_StrArray *sp_get_ARGV(void) {
   if (!sp_argv_array_cache) {

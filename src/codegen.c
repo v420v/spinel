@@ -3610,14 +3610,20 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if ((!strcmp(name, "read") || !strcmp(name, "binread")) && argc == 1) {
       buf_puts(b, "sp_file_read("); emit_expr(c, argv[0], b); buf_puts(b, ")"); return;
     }
-    if (!strcmp(name, "write") && argc == 2) {
+    if ((!strcmp(name, "write") || !strcmp(name, "binwrite")) && argc == 2) {
       /* runtime write is void; Ruby returns the byte count */
       buf_puts(b, "({ const char *_wp = "); emit_expr(c, argv[0], b);
       buf_puts(b, "; const char *_wd = "); emit_expr(c, argv[1], b);
       buf_puts(b, "; sp_file_write(_wp, _wd); (mrb_int)sp_str_byte_len(_wd); })"); return;
     }
-    if ((!strcmp(name, "exist?") || !strcmp(name, "exists?")) && argc == 1) {
+    if ((!strcmp(name, "exist?") || !strcmp(name, "exists?") || !strcmp(name, "readable?")) && argc == 1) {
       buf_puts(b, "sp_file_exist("); emit_expr(c, argv[0], b); buf_puts(b, ")"); return;
+    }
+    if ((!strcmp(name, "directory?") || !strcmp(name, "zero?") || !strcmp(name, "empty?")) && argc == 1) {
+      buf_puts(b, "sp_file_directory("); emit_expr(c, argv[0], b); buf_puts(b, ")"); return;
+    }
+    if (!strcmp(name, "file?") && argc == 1) {
+      buf_puts(b, "(!sp_file_directory("); emit_expr(c, argv[0], b); buf_puts(b, ") && sp_file_exist("); emit_expr(c, argv[0], b); buf_puts(b, "))"); return;
     }
     if (!strcmp(name, "delete") && argc == 1) {
       buf_puts(b, "({ sp_file_delete("); emit_expr(c, argv[0], b); buf_puts(b, "); (mrb_int)1; })"); return;
@@ -6309,8 +6315,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
           return;
         }
       }
-      if ((!strcmp(name, "include?") || !strcmp(name, "index") || !strcmp(name, "find_index")) && argc == 1 && rt != TY_FLOAT_ARRAY) {
-        const char *fn = !strcmp(name, "include?") ? "include" : "index";
+      if ((!strcmp(name, "include?") || !strcmp(name, "member?") || !strcmp(name, "index") || !strcmp(name, "find_index")) && argc == 1 && rt != TY_FLOAT_ARRAY) {
+        const char *fn = (!strcmp(name, "include?") || !strcmp(name, "member?")) ? "include" : "index";
         buf_printf(b, "sp_%sArray_%s(", k, fn);
         emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
         return;
@@ -6486,8 +6492,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         emit_boxed(c, argv[0], b); buf_puts(b, ")");
         return;
       }
-      if (!strcmp(name, "join") && argc == 1) {
-        buf_puts(b, "sp_PolyArray_join("); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+      if (!strcmp(name, "join") && argc <= 1) {
+        buf_puts(b, "sp_PolyArray_join("); emit_expr(c, recv, b); buf_puts(b, ", ");
+        if (argc == 1) emit_expr(c, argv[0], b); else buf_puts(b, "\"\"");
+        buf_puts(b, ")");
         return;
       }
       if ((!strcmp(name, "inspect") || !strcmp(name, "to_s")) && argc == 0) {
@@ -8881,6 +8889,7 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
        $, read nil (spinel doesn't honor the split/print-sep defaults) */
     if (nm && !strcmp(nm, "$/")) { emit_str_literal(b, "\n"); return; }
     if (nm && !strcmp(nm, "$?")) { buf_puts(b, "sp_last_status"); return; }
+    if (nm && (!strcmp(nm, "$PROGRAM_NAME") || !strcmp(nm, "$0"))) { buf_puts(b, "sp_program_name"); return; }
     if (nm && (!strcmp(nm, "$!") || !strcmp(nm, "$;") || !strcmp(nm, "$,"))) { buf_puts(b, "0"); return; }
     if (nm && nm[0] == '$') {
       const char *rn = comp_resolve_gvar(c, nm + 1);
@@ -9650,6 +9659,11 @@ static void emit_p_one(Compiler *c, int arg, Buf *b, int indent) {
   else if (t == TY_POLY) {
     buf_puts(b, "fputs(sp_poly_inspect("); emit_expr(c, arg, b);
     buf_puts(b, "), stdout); putchar('\\n');\n");
+  }
+  else if (t == TY_TIME) {
+    int tv = ++g_tmp;
+    buf_printf(b, "{ sp_Time _t%d = ", tv); emit_expr(c, arg, b);
+    buf_printf(b, "; fputs(sp_time_inspect_v(_t%d), stdout); putchar('\\n'); }\n", tv);
   }
   else if (t == TY_NIL) {
     buf_puts(b, "(void)("); emit_expr(c, arg, b); buf_puts(b, "); fputs(\"nil\\n\", stdout);\n");
@@ -12735,6 +12749,7 @@ char *codegen_program(const NodeTable *nt) {
   buf_puts(&body, "    SP_GC_SAVE();\n");
   buf_puts(&body, "    sp_re_init();\n");
   buf_puts(&body, "    { sp_argv.len = argc - 1; sp_argv.data = (const char**)malloc(sizeof(const char*) * (size_t)(argc > 1 ? argc - 1 : 1)); for (int _ai = 0; _ai < argc - 1; _ai++) sp_argv.data[_ai] = sp_str_dup_external(argv[_ai + 1]); }\n");
+  buf_puts(&body, "    sp_program_name = argc > 0 ? argv[0] : \"\";\n");
   /* Register END blocks (atexit runs LIFO, so they execute in reverse registration order) */
   for (int e = 1; e <= end_count; e++)
     buf_printf(&body, "    atexit(sp_end_fn_%d);\n", e);

@@ -470,8 +470,11 @@ static TyKind infer_call(Compiler *c, int id) {
         return TY_STRING;
       if (!strcmp(name, "exist?") || !strcmp(name, "exists?"))
         return TY_BOOL;
-      if (!strcmp(name, "write") || !strcmp(name, "delete"))
+      if (!strcmp(name, "write") || !strcmp(name, "binwrite") || !strcmp(name, "delete"))
         return TY_INT;
+      if (!strcmp(name, "readable?") || !strcmp(name, "directory?") || !strcmp(name, "file?") ||
+          !strcmp(name, "zero?") || !strcmp(name, "empty?"))
+        return TY_BOOL;
       if (!strcmp(name, "mtime"))
         return TY_TIME;
     }
@@ -1308,6 +1311,7 @@ static TyKind infer_uncached(Compiler *c, int id) {
     /* predefined punctuation globals: $/ defaults to "\n"; $! / $; / $, read nil */
     if (nm && !strcmp(nm, "$/")) return TY_STRING;
     if (nm && !strcmp(nm, "$?")) return TY_INT;  /* last child exit status */
+    if (nm && (!strcmp(nm, "$PROGRAM_NAME") || !strcmp(nm, "$0"))) return TY_STRING;
     if (nm && (!strcmp(nm, "$!") || !strcmp(nm, "$;") || !strcmp(nm, "$,"))) return TY_NIL;
     const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
     LocalVar *lv = rn ? comp_gvar(c, rn) : NULL;
@@ -3314,7 +3318,9 @@ static int infer_block_params(Compiler *c) {
               !strcmp(name, "select") || !strcmp(name, "reject") || !strcmp(name, "filter") ||
               !strcmp(name, "find") || !strcmp(name, "detect") || !strcmp(name, "each_with_index") ||
               !strcmp(name, "sort_by") || !strcmp(name, "find_all") || !strcmp(name, "count") ||
-              !strcmp(name, "bsearch")) && rt == TY_RANGE)
+              !strcmp(name, "any?") || !strcmp(name, "all?") || !strcmp(name, "none?") ||
+              !strcmp(name, "one?") || !strcmp(name, "sum") || !strcmp(name, "min_by") ||
+              !strcmp(name, "max_by") || !strcmp(name, "bsearch")) && rt == TY_RANGE)
       pt = TY_INT;
     else if ((!strcmp(name, "each") || !strcmp(name, "map") || !strcmp(name, "collect") ||
               !strcmp(name, "select") || !strcmp(name, "reject") || !strcmp(name, "filter") ||
