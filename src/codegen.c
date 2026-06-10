@@ -7839,7 +7839,7 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     return;
   }
   if (!strcmp(ty, "SourceLineNode")) {
-    buf_printf(b, "%lld", (long long)nt_int(nt, id, "value", 0));
+    buf_printf(b, "%lld", (long long)nt_int(nt, id, "start_line", 0));
     return;
   }
   if (!strcmp(ty, "RegularExpressionNode")) {
