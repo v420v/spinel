@@ -2898,6 +2898,15 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else { buf_puts(b, "("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
       return;
     }
+    if (!strcmp(name, "Integer") && ac == 2) {
+      TyKind at = comp_ntype(c, av[0]);
+      if (at == TY_STRING) {
+        buf_puts(b, "sp_str_to_i_strict_base("); emit_expr(c, av[0], b);
+        buf_puts(b, ", "); emit_expr(c, av[1], b); buf_puts(b, ")");
+      }
+      else { buf_puts(b, "("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      return;
+    }
     if (!strcmp(name, "Float") && ac == 1) {
       TyKind at = comp_ntype(c, av[0]);
       if (at == TY_STRING) { buf_puts(b, "sp_str_to_f_strict("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
@@ -5253,8 +5262,21 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "(_t%d.last - _t%d.excl)", t, t);
       else if (!strcmp(name, "last") || !strcmp(name, "end"))  /* the end value itself */
         buf_printf(b, "(_t%d.last)", t);
-      else if (!strcmp(name, "size") || !strcmp(name, "count"))
-        buf_printf(b, "(_t%d.last - _t%d.excl - _t%d.first + 1)", t, t, t);
+      else if (!strcmp(name, "size") || !strcmp(name, "count")) {
+        /* a string-literal range ("a".."z") has no integer size: nil */
+        int is_str_range = 0;
+        {
+          int rn = unwrap_parens(c, recv);
+          if (rn >= 0 && nt_type(nt, rn) && !strcmp(nt_type(nt, rn), "RangeNode")) {
+            int lo = nt_ref(nt, rn, "left"), hi = nt_ref(nt, rn, "right");
+            if (lo >= 0 && hi >= 0 && comp_ntype(c, lo) == TY_STRING) is_str_range = 1;
+          }
+        }
+        if (is_str_range)
+          buf_printf(b, "((void)_t%d, SP_INT_NIL)", t);
+        else
+          buf_printf(b, "(_t%d.last - _t%d.excl - _t%d.first + 1)", t, t, t);
+      }
       else if (!strcmp(name, "sum"))
         buf_printf(b, "sp_IntArray_sum(sp_IntArray_from_range(_t%d.first, _t%d.last - _t%d.excl), 0)", t, t, t);
       else if (!strcmp(name, "exclude_end?"))
@@ -7025,6 +7047,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else if (!strcmp(name, "infinite?")) buf_printf(b, "(isinf(%s) ? ((%s) > 0 ? 1LL : -1LL) : SP_INT_NIL)", r, r);
       else if (!strcmp(name, "positive?")) buf_printf(b, "((%s) > 0)", r);
       else if (!strcmp(name, "negative?")) buf_printf(b, "((%s) < 0)", r);
+      else if (!strcmp(name, "next_float")) buf_printf(b, "nextafter(%s, INFINITY)", r);
+      else if (!strcmp(name, "prev_float")) buf_printf(b, "nextafter(%s, -INFINITY)", r);
+      else if (!strcmp(name, "magnitude")) buf_printf(b, "((%s) < 0 ? -(%s) : (%s))", r, r, r);
+      else if (!strcmp(name, "modulo") && argc == 1) { buf_printf(b, "fmod(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       else handled = 0;
     }
     free(rs.p);

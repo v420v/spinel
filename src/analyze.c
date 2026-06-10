@@ -595,7 +595,7 @@ static TyKind infer_call(Compiler *c, int id) {
     if (mi < 0) mi = comp_included_method_index(c, name);
     if (mi >= 0) return method_call_ret(c, mi, id);
     /* Kernel conversions */
-    if (!strcmp(name, "Integer") && argc == 1) return TY_INT;
+    if (!strcmp(name, "Integer") && (argc == 1 || argc == 2)) return TY_INT;
     if (!strcmp(name, "Float") && argc == 1) return TY_FLOAT;
     if (!strcmp(name, "system") && argc >= 1) return TY_BOOL;
     if (!strcmp(name, "trap") && argc >= 1) return TY_STRING;
@@ -1080,7 +1080,11 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "divmod") && argc == 1) return TY_POLY_ARRAY;  /* [Integer, Float] */
     if (!strcmp(name, "infinite?")) return TY_INT;   /* nil / 1 / -1 (nullable int) */
     if (!strcmp(name, "nan?") || !strcmp(name, "finite?") ||
-        !strcmp(name, "positive?") || !strcmp(name, "negative?")) return TY_BOOL;
+        !strcmp(name, "positive?") || !strcmp(name, "negative?") ||
+        !strcmp(name, "zero?")) return TY_BOOL;
+    if (!strcmp(name, "next_float") || !strcmp(name, "prev_float") ||
+        !strcmp(name, "abs") || !strcmp(name, "magnitude") ||
+        !strcmp(name, "modulo") || !strcmp(name, "to_f")) return TY_FLOAT;
     if (!strcmp(name, "floor") || !strcmp(name, "ceil") ||
         !strcmp(name, "round") || !strcmp(name, "truncate")) {
       /* value-based return type: ndigits > 0 (literal) -> Float, else Integer */
