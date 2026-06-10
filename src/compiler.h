@@ -71,6 +71,15 @@ typedef struct {
   int is_struct;       /* defined via Struct.new(:a, :b): readers[] are the
                           positional members; the constructor takes them in
                           order and there is no user `initialize`. */
+  /* Prepend shadow chain: when `prepend M` is called on this class,
+     M's methods overwrite the active slot; the previous slot is
+     renamed to a shadow `__prep_N_<m>`.  The chain maps each name
+     (user name or shadow name) to the next shadow in the chain,
+     so `emit_super` can follow it rather than the parent class. */
+  char **prep_from;      /* source name in the chain link */
+  char **prep_to;        /* target shadow name */
+  int nprep_chain, cprep_chain;
+  int prep_shadow_count; /* next shadow index to assign */
 } ClassInfo;
 
 typedef struct {
@@ -147,6 +156,10 @@ void       comp_add_writer(ClassInfo *ci, const char *name);
 int        comp_is_reader(ClassInfo *ci, const char *name);
 int        comp_is_writer(ClassInfo *ci, const char *name);
 void       comp_add_alias(ClassInfo *ci, const char *new_name, const char *old_name);
+/* Prepend-chain helpers. */
+void        comp_prep_chain_add(ClassInfo *ci, const char *from, const char *to);
+const char *comp_prep_chain_target(Compiler *c, int class_id, const char *name);
+const char *comp_prep_user_name(const char *name);
 /* Resolve `name` through the class's (chain-aware) alias table to the
    underlying method/attr name. Returns `name` unchanged if not aliased. */
 const char *comp_resolve_alias(Compiler *c, int class_id, const char *name);

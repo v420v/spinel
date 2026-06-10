@@ -10972,20 +10972,40 @@ static int emit_super_inline(Compiler *c, int id, Buf *b, int indent, int as_exp
 /* super(args) / super -> call the parent's same-named method. */
 static void emit_super(Compiler *c, int id, Buf *b) {
   Scope *s = comp_scope_of(c, id);
-  if (s->class_id < 0 || !s->name) { unsupported(c, id, "super (not in a method)"); }
+  if (s->class_id < 0 || !s->name) { unsupported(c, id, "super (not in a method)"); return; }
+  const char *ty = nt_type(c->nt, id);
+  /* Prepend chain: super goes to the next shadow in the same class. */
+  const char *shadow = comp_prep_chain_target(c, s->class_id, s->name);
+  if (shadow) {
+    buf_printf(b, "sp_%s_%s((sp_%s *)%s",
+               c->classes[s->class_id].name, mc(shadow),
+               c->classes[s->class_id].name, g_self);
+    if (ty && !strcmp(ty, "ForwardingSuperNode")) {
+      for (int i = 0; i < s->nparams; i++) buf_printf(b, ", lv_%s", s->pnames[i]);
+    }
+    else {
+      int smi = -1;
+      for (int k = c->nscopes - 1; k >= 1; k--) {
+        Scope *sc = &c->scopes[k];
+        if (sc->class_id == s->class_id && sc->name && !strcmp(sc->name, shadow))
+          { smi = k; break; }
+      }
+      emit_args_filled(c, smi, nt_ref(c->nt, id, "arguments"), ", ", b);
+    }
+    buf_puts(b, ")");
+    return;
+  }
+  /* Strip __prep_N_ prefix to get the user method name for parent chain lookup. */
+  const char *uname = comp_prep_user_name(s->name);
   int p = c->classes[s->class_id].parent;
   int defcls = -1;
-  int mi = p >= 0 ? comp_method_in_chain(c, p, s->name, &defcls) : -1;
-  if (mi < 0) unsupported(c, id, "super (no parent method)");
-  buf_printf(b, "sp_%s_%s((sp_%s *)%s", c->classes[defcls].name, mc(s->name), c->classes[defcls].name, g_self);
-  /* explicit args, or forward the current method's params for bare super */
-  const char *ty = nt_type(c->nt, id);
+  int mi = p >= 0 ? comp_method_in_chain(c, p, uname, &defcls) : -1;
+  if (mi < 0) { unsupported(c, id, "super (no parent method)"); return; }
+  buf_printf(b, "sp_%s_%s((sp_%s *)%s", c->classes[defcls].name, mc(uname), c->classes[defcls].name, g_self);
   if (ty && !strcmp(ty, "ForwardingSuperNode")) {
     for (int i = 0; i < s->nparams; i++) buf_printf(b, ", lv_%s", s->pnames[i]);
   }
   else {
-    /* SuperNode: fill in defaults for any omitted trailing params, exactly
-       like a normal call through emit_args_filled. */
     emit_args_filled(c, mi, nt_ref(c->nt, id, "arguments"), ", ", b);
   }
   buf_puts(b, ")");

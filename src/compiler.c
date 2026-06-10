@@ -36,6 +36,12 @@ void comp_free(Compiler *c) {
     free(c->classes[i].readers);
     for (int j = 0; j < c->classes[i].nwriters; j++) free(c->classes[i].writers[j]);
     free(c->classes[i].writers);
+    for (int j = 0; j < c->classes[i].nprep_chain; j++) {
+      free(c->classes[i].prep_from[j]);
+      free(c->classes[i].prep_to[j]);
+    }
+    free(c->classes[i].prep_from);
+    free(c->classes[i].prep_to);
   }
   free(c->classes);
   for (int i = 0; i < c->ngvars; i++) free(c->gvars[i].name);
@@ -318,4 +324,30 @@ LocalVar *scope_local_intern(Scope *s, const char *name) {
   lv->proc_ret = TY_UNKNOWN;
   lv->is_cell = 0;
   return lv;
+}
+
+void comp_prep_chain_add(ClassInfo *ci, const char *from, const char *to) {
+  if (ci->nprep_chain >= ci->cprep_chain) {
+    ci->cprep_chain = ci->cprep_chain ? ci->cprep_chain * 2 : 4;
+    ci->prep_from = realloc(ci->prep_from, sizeof(char *) * (size_t)ci->cprep_chain);
+    ci->prep_to   = realloc(ci->prep_to,   sizeof(char *) * (size_t)ci->cprep_chain);
+  }
+  ci->prep_from[ci->nprep_chain] = strdup(from);
+  ci->prep_to[ci->nprep_chain]   = strdup(to);
+  ci->nprep_chain++;
+}
+
+const char *comp_prep_chain_target(Compiler *c, int class_id, const char *name) {
+  if (class_id < 0 || class_id >= c->nclasses || !name) return NULL;
+  ClassInfo *ci = &c->classes[class_id];
+  for (int k = 0; k < ci->nprep_chain; k++)
+    if (!strcmp(ci->prep_from[k], name)) return ci->prep_to[k];
+  return NULL;
+}
+
+const char *comp_prep_user_name(const char *name) {
+  if (!name || strncmp(name, "__prep_", 7) != 0) return name;
+  const char *p = name + 7;
+  while (*p >= '0' && *p <= '9') p++;
+  return (*p == '_') ? p + 1 : name;
 }

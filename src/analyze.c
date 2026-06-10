@@ -1377,9 +1377,15 @@ static TyKind infer_uncached(Compiler *c, int id) {
   if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) {
     Scope *s = comp_scope_of(c, id);
     if (s->class_id < 0 || !s->name) return TY_UNKNOWN;
+    const char *shadow = comp_prep_chain_target(c, s->class_id, s->name);
+    if (shadow) {
+      int mi = comp_method_in_class(c, s->class_id, shadow);
+      return mi >= 0 ? c->scopes[mi].ret : TY_UNKNOWN;
+    }
+    const char *uname = comp_prep_user_name(s->name);
     int p = c->classes[s->class_id].parent;
     if (p < 0) return TY_UNKNOWN;
-    int mi = comp_method_in_chain(c, p, s->name, NULL);
+    int mi = comp_method_in_chain(c, p, uname, NULL);
     return mi >= 0 ? c->scopes[mi].ret : TY_UNKNOWN;
   }
   if (!strcmp(ty, "AndNode") || !strcmp(ty, "OrNode")) {
@@ -1892,6 +1898,66 @@ static void resolve_parents(Compiler *c) {
     if (sty && !strcmp(sty, "ConstantReadNode")) {
       int p = comp_class_index(c, nt_str(nt, sc, "name"));
       if (p >= 0 && p != i) c->classes[i].parent = p;
+    }
+  }
+}
+
+/* For each class, find `prepend M` declarations and transplant M's instance
+   methods into the class with shadow-chain renaming so `super` can route
+   from M's body to the original (now renamed) class body. */
+static void register_prepends(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  for (int ci = 0; ci < c->nclasses; ci++) {
+    int body = nt_ref(nt, c->classes[ci].def_node, "body");
+    int n = 0;
+    const int *stmts = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
+    for (int k = 0; k < n; k++) {
+      int s = stmts[k];
+      const char *sty = nt_type(nt, s);
+      if (!sty || strcmp(sty, "CallNode")) continue;
+      const char *nm = nt_str(nt, s, "name");
+      if (!nm || strcmp(nm, "prepend")) continue;
+      if (nt_ref(nt, s, "receiver") >= 0) continue;
+      int anode = nt_ref(nt, s, "arguments");
+      int an = 0;
+      const int *args = anode >= 0 ? nt_arr(nt, anode, "arguments", &an) : NULL;
+      for (int j = 0; j < an; j++) {
+        const char *aty = nt_type(nt, args[j]);
+        const char *mname = NULL;
+        if (aty && !strcmp(aty, "ConstantReadNode")) mname = nt_str(nt, args[j], "name");
+        else if (aty && !strcmp(aty, "ConstantPathNode")) mname = nt_str(nt, args[j], "name");
+        int mod_id = mname ? comp_class_index(c, mname) : -1;
+        if (mod_id < 0) continue;
+        /* Transplant each instance method of the module into class ci. */
+        for (int ms = 0; ms < c->nscopes; ms++) {
+          Scope *sc = &c->scopes[ms];
+          if (sc->class_id != mod_id || sc->is_cmethod || !sc->name) continue;
+          const char *method_name = sc->name;
+          int active_mi = comp_method_in_class(c, ci, method_name);
+          if (active_mi >= 0) {
+            Scope *active = &c->scopes[active_mi];
+            char shadow[256];
+            snprintf(shadow, sizeof shadow, "__prep_%d_%s",
+                     c->classes[ci].prep_shadow_count++, method_name);
+            /* Rename any existing chain entry for method_name to use shadow. */
+            ClassInfo *cif = &c->classes[ci];
+            for (int kk = 0; kk < cif->nprep_chain; kk++) {
+              if (!strcmp(cif->prep_from[kk], method_name)) {
+                free(cif->prep_from[kk]);
+                cif->prep_from[kk] = strdup(shadow);
+                break;
+              }
+            }
+            /* Rename the currently active scope to the shadow name. */
+            free(active->name);
+            active->name = strdup(shadow);
+            /* Record the new dispatch chain entry: method_name -> shadow. */
+            comp_prep_chain_add(&c->classes[ci], method_name, shadow);
+          }
+          /* Transplant the module scope into class ci. */
+          sc->class_id = ci;
+        }
+      }
     }
   }
 }
@@ -2521,6 +2587,40 @@ static int bind_call_params(Compiler *c, int call_id, int mi) {
       TyKind at = infer_type(c, val);
       TyKind merged = ty_unify(p->type, at);
       if (merged != p->type) { p->type = merged; changed = 1; }
+    }
+  }
+  return changed;
+}
+
+/* Propagate param types from each prep-chain source scope (the transplanted
+   module method) to the shadow scope it calls via super. The shadow scope has
+   no AST call site, so bind_call_params never runs for it. */
+static int propagate_prep_params(Compiler *c) {
+  int changed = 0;
+  for (int ci = 0; ci < c->nclasses; ci++) {
+    ClassInfo *cls = &c->classes[ci];
+    for (int k = 0; k < cls->nprep_chain; k++) {
+      const char *from_name = cls->prep_from[k];
+      const char *to_name   = cls->prep_to[k];
+      int from_mi = comp_method_in_class(c, ci, from_name);
+      int to_mi = -1;
+      for (int s = 0; s < c->nscopes; s++) {
+        if (c->scopes[s].class_id == ci && !c->scopes[s].is_cmethod &&
+            c->scopes[s].name && !strcmp(c->scopes[s].name, to_name)) {
+          to_mi = s; break;
+        }
+      }
+      if (from_mi < 0 || to_mi < 0) continue;
+      Scope *fs = &c->scopes[from_mi];
+      Scope *ts = &c->scopes[to_mi];
+      int n = fs->nparams < ts->nparams ? fs->nparams : ts->nparams;
+      for (int i = 0; i < n; i++) {
+        LocalVar *fp = scope_local(fs, fs->pnames[i]);
+        LocalVar *tp = scope_local(ts, ts->pnames[i]);
+        if (!fp || !tp || fp->type == TY_UNKNOWN) continue;
+        TyKind merged = ty_unify(tp->type, fp->type);
+        if (merged != tp->type) { tp->type = merged; changed = 1; }
+      }
     }
   }
   return changed;
@@ -3248,6 +3348,7 @@ static void compute_reachable(Compiler *c) {
   for (int ci = 0; ci < c->nclasses; ci++) {
     ClassInfo *cls = &c->classes[ci];
     for (int i = 0; i < cls->naliases; i++) { ADD_NAME(cls->alias_new[i]); ADD_NAME(cls->alias_old[i]); }
+    for (int i = 0; i < cls->nprep_chain; i++) ADD_NAME(cls->prep_to[i]);
   }
 
   /* Names that may be invoked implicitly (no explicit CallNode): keep live. */
@@ -3400,6 +3501,7 @@ void analyze_program(Compiler *c) {
 
   resolve_parents(c);
   inherit_members(c);
+  register_prepends(c);
 
   /* collect top-level `include <Mod>` calls so bare method calls can
      resolve to module_function methods in those modules. */
@@ -3511,6 +3613,7 @@ void analyze_program(Compiler *c) {
     int ch = 0;
     ch |= infer_write_types(c);
     ch |= infer_param_types(c);
+    ch |= propagate_prep_params(c);
     ch |= infer_string_params(c);
     ch |= infer_default_param_types(c);
     ch |= infer_block_params(c);
