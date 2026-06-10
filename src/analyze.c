@@ -226,6 +226,12 @@ static TyKind infer_call(Compiler *c, int id) {
   TyKind rt = recv >= 0 ? infer_type(c, recv) : TY_UNKNOWN;
   TyKind a0 = argc >= 1 ? infer_type(c, argv[0]) : TY_UNKNOWN;
 
+  /* Safe navigation &. : nil receiver always short-circuits to nil */
+  {
+    const char *call_op = nt_str(nt, id, "call_operator");
+    if (recv >= 0 && call_op && !strcmp(call_op, "&.") && rt == TY_NIL) return TY_NIL;
+  }
+
   /* an empty array literal used directly as a receiver (`[].flatten`) has no
      usage to fold an element type from; treat it as an empty poly array so
      array methods dispatch instead of falling through to unresolved. */
@@ -555,6 +561,16 @@ static TyKind infer_call(Compiler *c, int id) {
     /* Kernel conversions */
     if (!strcmp(name, "Integer") && argc == 1) return TY_INT;
     if (!strcmp(name, "Float") && argc == 1) return TY_FLOAT;
+    if (!strcmp(name, "system") && argc >= 1) return TY_BOOL;
+    if (!strcmp(name, "trap") && argc >= 1) return TY_STRING;
+  }
+  /* Signal.trap / ::Signal.trap */
+  if (recv >= 0 && !strcmp(name, "trap") && argc >= 1) {
+    const char *rty = nt_type(nt, recv);
+    if (rty && (!strcmp(rty, "ConstantReadNode") || !strcmp(rty, "ConstantPathNode"))) {
+      const char *rname = nt_str(nt, recv, "name");
+      if (rname && !strcmp(rname, "Signal")) return TY_STRING;
+    }
   }
 
   /* array receiver methods */
@@ -588,6 +604,10 @@ static TyKind infer_call(Compiler *c, int id) {
       return ty_array_elem(rt);
     }
     if (!strcmp(name, "at") && argc == 1) return ty_array_elem(rt);  /* like [i] */
+    if (!strcmp(name, "dig") && argc >= 1) {
+      if (argc == 1) return ty_array_elem(rt);
+      return TY_POLY;
+    }
     /* index returns nil on a miss -> poly (int-or-nil) */
     if ((!strcmp(name, "index") || !strcmp(name, "find_index") || !strcmp(name, "rindex")) &&
         (rt == TY_INT_ARRAY || rt == TY_STR_ARRAY)) return TY_POLY;
@@ -745,12 +765,18 @@ static TyKind infer_call(Compiler *c, int id) {
         !strcmp(name, "include?"))
       return TY_BOOL;
     if (rt == TY_POLY) {
+      /* &. on a poly receiver may short-circuit to nil at runtime → always poly */
+      {
+        const char *call_op = nt_str(nt, id, "call_operator");
+        if (recv >= 0 && call_op && !strcmp(call_op, "&.")) return TY_POLY;
+      }
       if (!strcmp(name, "to_s") || !strcmp(name, "inspect")) return TY_STRING;
       if ((!strcmp(name, "gsub") || !strcmp(name, "sub")) && argc == 2) return TY_STRING;
       if (!strcmp(name, "join")) return TY_STRING;
       if (!strcmp(name, "to_i") || !strcmp(name, "length") || !strcmp(name, "size")) return TY_INT;
       if (!strcmp(name, "to_f")) return TY_FLOAT;
       if (!strcmp(name, "[]") && argc == 1) return TY_POLY;  /* boxed array element access */
+      if (!strcmp(name, "dig") && argc >= 1) return TY_POLY;
       /* poly method dispatch: unify the return type over every class that
          defines `name` (the runtime cls_id picks the impl). */
       TyKind r = TY_UNKNOWN; int found = 0;
@@ -840,6 +866,10 @@ static TyKind infer_call(Compiler *c, int id) {
       return vt;
     }
     if (!strcmp(name, "delete")) return ty_hash_val(rt);
+    if (!strcmp(name, "dig") && argc >= 1) {
+      if (argc == 1) return ty_hash_val(rt);
+      return TY_POLY;
+    }
     if (!strcmp(name, "default") && argc == 0) return TY_POLY;
     if (!strcmp(name, "length") || !strcmp(name, "size") ||
         !strcmp(name, "count")) return TY_INT;
@@ -869,8 +899,19 @@ static TyKind infer_call(Compiler *c, int id) {
         return r != TY_UNKNOWN ? r : rt;
       }
     }
-    if (!strcmp(name, "merge") || !strcmp(name, "dup") || !strcmp(name, "clone") ||
-        !strcmp(name, "replace")) return rt;
+    if (!strcmp(name, "merge") && argc == 1) {
+      TyKind at = argc >= 1 ? infer_type(c, argv[0]) : TY_UNKNOWN;
+      if (at == rt) return rt;  /* same type: trivial */
+      /* cross-variant str-keyed merge: promote to str_poly_hash */
+      if (ty_hash_key(rt) == TY_STRING && ty_is_hash(at) && ty_hash_key(at) == TY_STRING)
+        return TY_STR_POLY_HASH;
+      /* cross-variant sym-keyed merge: both sym → sym_poly (only sym_poly exists) */
+      if (ty_hash_key(rt) == TY_SYMBOL && ty_is_hash(at) && ty_hash_key(at) == TY_SYMBOL)
+        return TY_SYM_POLY_HASH;
+      return rt;
+    }
+    if (!strcmp(name, "dup") || !strcmp(name, "clone") || !strcmp(name, "replace") ||
+        !strcmp(name, "merge")) return rt;
     if (!strcmp(name, "has_key?") || !strcmp(name, "key?") ||
         !strcmp(name, "include?") || !strcmp(name, "member?") ||
         !strcmp(name, "has_value?") || !strcmp(name, "value?") ||
@@ -1091,6 +1132,12 @@ static TyKind infer_call(Compiler *c, int id) {
     }
   }
 
+  /* safe navigation &. with unresolved type: return poly (receiver may be nil at runtime) */
+  {
+    const char *call_op = nt_str(nt, id, "call_operator");
+    if (recv >= 0 && call_op && !strcmp(call_op, "&.")) return TY_POLY;
+  }
+
   return TY_UNKNOWN;
 }
 
@@ -1161,8 +1208,10 @@ static TyKind infer_uncached(Compiler *c, int id) {
     const char *nm = nt_str(nt, id, "name");
     /* predefined punctuation globals: $/ defaults to "\n"; $! / $; / $, read nil */
     if (nm && !strcmp(nm, "$/")) return TY_STRING;
+    if (nm && !strcmp(nm, "$?")) return TY_INT;  /* last child exit status */
     if (nm && (!strcmp(nm, "$!") || !strcmp(nm, "$;") || !strcmp(nm, "$,"))) return TY_NIL;
-    LocalVar *lv = nm ? comp_gvar(c, nm + 1) : NULL;
+    const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
+    LocalVar *lv = rn ? comp_gvar(c, rn) : NULL;
     return lv ? lv->type : TY_UNKNOWN;
   }
   if (!strcmp(ty, "ConstantReadNode")) {
@@ -1651,13 +1700,34 @@ static int is_c_ident(const char *s) {
 /* Register global variables ($g) and top-level constants (FOO). */
 static void register_globals_consts(Compiler *c) {
   const NodeTable *nt = c->nt;
+  /* Pass 1: collect alias $copy $orig mappings first so pass 2 can skip them. */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "AliasGlobalVariableNode")) continue;
+    int nw_id  = nt_ref(nt, id, "new_name");
+    int old_id = nt_ref(nt, id, "old_name");
+    const char *nw  = nw_id  >= 0 ? nt_str(nt, nw_id,  "name") : NULL;
+    const char *old = old_id >= 0 ? nt_str(nt, old_id, "name") : NULL;
+    if (nw && nw[0] == '$' && is_c_ident(nw + 1) &&
+        old && old[0] == '$' && is_c_ident(old + 1)) {
+      comp_gvar_intern(c, old + 1);             /* intern the original */
+      comp_add_gvar_alias(c, nw + 1, old + 1); /* $new -> $old */
+    }
+  }
+  /* Pass 2: intern all other globals (skipping alias names). */
   for (int id = 0; id < nt->count; id++) {
     const char *ty = nt_type(nt, id);
     if (!ty) continue;
     if (!strcmp(ty, "GlobalVariableWriteNode") || !strcmp(ty, "GlobalVariableReadNode") ||
         !strcmp(ty, "GlobalVariableOperatorWriteNode") || !strcmp(ty, "GlobalVariableTargetNode")) {
       const char *nm = nt_str(nt, id, "name");
-      if (nm && nm[0] == '$' && is_c_ident(nm + 1)) comp_gvar_intern(c, nm + 1);
+      /* skip alias names - they resolve to the original and need no separate slot */
+      if (nm && nm[0] == '$' && is_c_ident(nm + 1) &&
+          !strcmp(nm + 1, comp_resolve_gvar(c, nm + 1)))
+        comp_gvar_intern(c, nm + 1);
+    }
+    else if (!strcmp(ty, "AliasGlobalVariableNode")) {
+      /* already handled in pass 1 */
     }
     else if (!strcmp(ty, "ConstantTargetNode")) {
       /* target in a multi-write: A, B = expr */
@@ -1704,13 +1774,15 @@ static int infer_global_const_types(Compiler *c) {
     TyKind vt = TY_UNKNOWN;
     if (!strcmp(ty, "GlobalVariableWriteNode")) {
       const char *nm = nt_str(nt, id, "name");
-      if (nm) lv = comp_gvar(c, nm + 1);
+      const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
+      if (rn) lv = comp_gvar(c, rn);
       vt = infer_type(c, nt_ref(nt, id, "value"));
       if (vt == TY_NIL) continue;
     }
     else if (!strcmp(ty, "GlobalVariableOperatorWriteNode")) {
       const char *nm = nt_str(nt, id, "name");
-      if (nm) lv = comp_gvar(c, nm + 1);
+      const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
+      if (rn) lv = comp_gvar(c, rn);
       TyKind cur = lv ? lv->type : TY_UNKNOWN;
       TyKind v = infer_type(c, nt_ref(nt, id, "value"));
       if (cur == TY_STRING) vt = TY_STRING;
@@ -2306,6 +2378,9 @@ static int infer_write_types(Compiler *c) {
       if (*slot != TY_UNKNOWN && want != *slot) want = TY_POLY_ARRAY;
       *slot = want;
     }
+    else if (*slot == TY_POLY_POLY_HASH) {
+      /* already widest hash type; no further promotion needed */
+    }
     else if (kt == TY_INT) {
       /* int key []=: if slot already array, leave it; otherwise infer int-keyed hash */
       if (vt == TY_UNKNOWN) continue;
@@ -2332,6 +2407,12 @@ static int infer_write_types(Compiler *c) {
       if (vt == TY_UNKNOWN) continue;
       if (*slot != TY_UNKNOWN && *slot != TY_SYM_POLY_HASH) continue;
       *slot = TY_SYM_POLY_HASH;
+    }
+    else if (kt != TY_UNKNOWN) {
+      /* non-standard key type (array, object, etc.): heterogeneous hash */
+      if (vt == TY_UNKNOWN) continue;
+      if (*slot != TY_UNKNOWN && !ty_is_hash(*slot)) continue;
+      *slot = TY_POLY_POLY_HASH;
     }
     if (*slot != before) changed = 1;
   }

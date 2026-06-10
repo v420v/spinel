@@ -64,6 +64,20 @@ static LocalVar *lv_intern(LocalVar **arr, int *n, int *cap, const char *name) {
 }
 LocalVar *comp_gvar(Compiler *c, const char *name) { return lv_find(c->gvars, c->ngvars, name); }
 LocalVar *comp_gvar_intern(Compiler *c, const char *name) { return lv_intern(&c->gvars, &c->ngvars, &c->cgvars, name); }
+const char *comp_resolve_gvar(Compiler *c, const char *name) {
+  for (int i = 0; i < c->ngvar_aliases; i++)
+    if (strcmp(c->gvar_alias_from[i], name) == 0) return c->gvar_alias_to[i];
+  return name;
+}
+void comp_add_gvar_alias(Compiler *c, const char *from, const char *to) {
+  for (int i = 0; i < c->ngvar_aliases; i++)
+    if (strcmp(c->gvar_alias_from[i], from) == 0) return; /* already recorded */
+  c->gvar_alias_from = realloc(c->gvar_alias_from, sizeof(char*) * (size_t)(c->ngvar_aliases + 1));
+  c->gvar_alias_to   = realloc(c->gvar_alias_to,   sizeof(char*) * (size_t)(c->ngvar_aliases + 1));
+  c->gvar_alias_from[c->ngvar_aliases] = strdup(from);
+  c->gvar_alias_to[c->ngvar_aliases]   = strdup(to);
+  c->ngvar_aliases++;
+}
 LocalVar *comp_const(Compiler *c, const char *name) { return lv_find(c->consts, c->nconsts, name); }
 LocalVar *comp_const_intern(Compiler *c, const char *name) { return lv_intern(&c->consts, &c->nconsts, &c->cconsts, name); }
 

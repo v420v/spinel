@@ -278,8 +278,9 @@ static const char *c_type_name(TyKind t) {
     case TY_STR_STR_HASH: return "sp_StrStrHash *";
     case TY_INT_INT_HASH: return "sp_IntIntHash *";
     case TY_INT_STR_HASH: return "sp_IntStrHash *";
-    case TY_SYM_POLY_HASH: return "sp_SymPolyHash *";
-    case TY_STR_POLY_HASH: return "sp_StrPolyHash *";
+    case TY_SYM_POLY_HASH:  return "sp_SymPolyHash *";
+    case TY_STR_POLY_HASH:  return "sp_StrPolyHash *";
+    case TY_POLY_POLY_HASH: return "sp_PolyPolyHash *";
     case TY_POLY:         return "sp_RbVal";
     case TY_POLY_ARRAY:   return "sp_PolyArray *";
     case TY_PROC:         return "sp_Proc *";
@@ -2129,10 +2130,75 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
   if (!name) unsupported(c, id, "call (no name)");
 
+  /* system(cmd, ...) expr: run and return bool */
+  if (recv < 0 && !strcmp(name, "system") && argc >= 1) {
+    int ts = ++g_tmp;
+    buf_printf(b, "({ const char *_sys_%d[] = { ", ts);
+    for (int k = 0; k < argc; k++) { if (k > 0) buf_puts(b, ", "); emit_expr(c, argv[k], b); }
+    buf_printf(b, ", NULL }; (mrb_bool)sp_system_args(%d, _sys_%d); })", argc, ts);
+    return;
+  }
+  /* trap(...) / Signal.trap(...) expr: return "DEFAULT" */
+  {
+    int is_trap = (recv < 0 && !strcmp(name, "trap"));
+    if (!is_trap && recv >= 0 && !strcmp(name, "trap") && argc >= 1) {
+      const char *rty2 = nt_type(nt, recv);
+      if (rty2 && (!strcmp(rty2, "ConstantReadNode") || !strcmp(rty2, "ConstantPathNode"))) {
+        const char *rn = nt_str(nt, recv, "name");
+        if (rn && !strcmp(rn, "Signal")) is_trap = 1;
+      }
+    }
+    if (is_trap && argc >= 1) { emit_str_literal(b, "DEFAULT"); return; }
+  }
+
   /* proc {} / lambda {} / Proc.new {} literal -> a first-class Proc value */
   if (comp_ntype(c, id) == TY_PROC && nt_ref(nt, id, "block") >= 0) {
     emit_proc_literal(c, id, b);
     return;
+  }
+
+  /* Safe navigation &. : nil receiver -> return nil/0; non-nil -> emit conditional */
+  {
+    const char *safe_op = nt_str(nt, id, "call_operator");
+    if (recv >= 0 && safe_op && !strcmp(safe_op, "&.")) {
+      TyKind rrt = comp_ntype(c, recv);
+      if (rrt == TY_NIL) {
+        /* nil&.foo always returns nil */
+        TyKind ret = comp_ntype(c, id);
+        const char *dv = default_value(ret);
+        buf_puts(b, dv ? dv : "0");
+        return;
+      }
+      if (rrt == TY_POLY) {
+        /* poly &. method: nil check + dispatch on non-nil string/int/other */
+        int tsn = ++g_tmp;
+        buf_printf(b, "({ sp_RbVal _sn_%d = ", tsn); emit_expr(c, recv, b); buf_puts(b, "; ");
+        buf_printf(b, "_sn_%d.tag == SP_TAG_NIL ? sp_box_nil() : ", tsn);
+        /* dispatch the method on the non-nil value */
+        if (!strcmp(name, "upcase")) {
+          buf_printf(b, "sp_box_str(sp_str_upcase(_sn_%d.v.s))", tsn);
+        }
+        else if (!strcmp(name, "downcase")) {
+          buf_printf(b, "sp_box_str(sp_str_downcase(_sn_%d.v.s))", tsn);
+        }
+        else if (!strcmp(name, "length") || !strcmp(name, "size")) {
+          buf_printf(b, "sp_box_int(sp_poly_length(_sn_%d))", tsn);
+        }
+        else if (!strcmp(name, "inspect")) {
+          buf_printf(b, "sp_box_str(sp_poly_inspect(_sn_%d))", tsn);
+        }
+        else if (!strcmp(name, "to_s")) {
+          buf_printf(b, "sp_box_str(sp_poly_to_s(_sn_%d))", tsn);
+        }
+        else {
+          /* fallback: return the poly value unchanged */
+          buf_printf(b, "_sn_%d", tsn);
+        }
+        buf_puts(b, "; })");
+        return;
+      }
+      /* non-nil typed receiver: for concrete types, dispatch as normal (always non-nil) */
+    }
   }
 
   /* n.times/upto/downto/step { ... } in expression position: run the loop
@@ -2496,7 +2562,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
        !strcmp(name, "dup") || !strcmp(name, "clone"))) {
     int args = nt_ref(nt, id, "arguments");
     int argc0 = 0; if (args >= 0) nt_arr(nt, args, "arguments", &argc0);
-    if (argc0 == 0) { emit_expr(c, recv, b); return; }
+    /* hash dup/clone requires a deep copy -- skip the identity shortcut */
+    if (argc0 == 0 && !ty_is_hash(recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN)) { emit_expr(c, recv, b); return; }
   }
 
   /* then / yield_self: pass receiver to block, return block result */
@@ -3592,6 +3659,38 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_printf(b, "), %s)%s", kind, eq ? "" : ")");
       return;
     }
+    /* hash == hash */
+    if (ty_is_hash(rt) || ty_is_hash(a0) || rt == TY_UNKNOWN || a0 == TY_UNKNOWN) {
+      /* two empty hash literals are trivially equal */
+      int re = nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "HashNode") &&
+               ({ int _n = 0; nt_arr(nt, recv, "elements", &_n); _n == 0; });
+      int ae = nt_type(nt, argv[0]) && !strcmp(nt_type(nt, argv[0]), "HashNode") &&
+               ({ int _n = 0; nt_arr(nt, argv[0], "elements", &_n); _n == 0; });
+      if (re && ae) { buf_puts(b, eq ? "1" : "0"); return; }
+      if (ty_is_hash(rt) && ty_is_hash(a0)) {
+        if (rt == a0) {
+          /* same typed hash: use the dedicated equality function */
+          const char *hn = ty_hash_cname(rt);
+          if (hn) {
+            buf_puts(b, eq ? "" : "(!");
+            buf_printf(b, "sp_%sHash_eq(", hn);
+            emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
+            buf_puts(b, eq ? ")" : "))");
+            return;
+          }
+        }
+        /* different hash types can never be equal */
+        buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, "), (");
+        emit_expr(c, argv[0], b); buf_printf(b, "), %d)", eq ? 0 : 1);
+        return;
+      }
+      if (ty_is_hash(rt) || ty_is_hash(a0)) {
+        /* hash vs non-hash */
+        buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, "), (");
+        emit_expr(c, argv[0], b); buf_printf(b, "), %d)", eq ? 0 : 1);
+        return;
+      }
+    }
     /* a poly operand compares dynamically (covers string-vs-poly etc.) */
     if (rt == TY_POLY || a0 == TY_POLY) {
       buf_puts(b, eq ? "sp_poly_eq(" : "(!sp_poly_eq(");
@@ -4225,11 +4324,42 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (recv >= 0 && ty_is_hash(rt)) {
     const char *hn = ty_hash_cname(rt);
     if (hn) {
+      if ((!strcmp(name, "dup") || !strcmp(name, "clone")) && argc == 0) {
+        buf_printf(b, "sp_%sHash_dup(", hn); emit_expr(c, recv, b); buf_puts(b, ")");
+        return;
+      }
       if (!strcmp(name, "[]") && argc == 1) {
-        /* int-valued hashes have a nullable get_opt; string-valued use get */
-        const char *getter = ty_hash_val(rt) == TY_INT ? "get_opt" : "get";
-        buf_printf(b, "sp_%sHash_%s(", hn, getter);
-        emit_expr(c, recv, b); buf_puts(b, ", "); emit_hash_key(c, argv[0], ty_hash_key(rt), b); buf_puts(b, ")");
+        if (rt == TY_POLY_POLY_HASH) {
+          buf_printf(b, "sp_%sHash_get(", hn);
+          emit_expr(c, recv, b); buf_puts(b, ", "); emit_boxed(c, argv[0], b); buf_puts(b, ")");
+        }
+        else {
+          /* int-valued hashes have a nullable get_opt; string-valued use get */
+          const char *getter = ty_hash_val(rt) == TY_INT ? "get_opt" : "get";
+          buf_printf(b, "sp_%sHash_%s(", hn, getter);
+          emit_expr(c, recv, b); buf_puts(b, ", "); emit_hash_key(c, argv[0], ty_hash_key(rt), b); buf_puts(b, ")");
+        }
+        return;
+      }
+      if (!strcmp(name, "dig") && argc >= 1) {
+        TyKind vt = ty_hash_val(rt);
+        const char *getter = vt == TY_INT ? "get_opt" : "get";
+        if (argc == 1) {
+          buf_printf(b, "sp_%sHash_%s(", hn, getter);
+          emit_expr(c, recv, b); buf_puts(b, ", "); emit_hash_key(c, argv[0], ty_hash_key(rt), b); buf_puts(b, ")");
+        }
+        else {
+          /* multi-step: chain sp_poly_arr_get / sp_poly_get_sym / sp_poly_get_str */
+          TyKind kt = ty_hash_key(rt);
+          for (int di = argc - 1; di >= 1; di--) {
+            if (kt == TY_SYMBOL) buf_puts(b, "sp_poly_get_sym(");
+            else if (kt == TY_STRING) buf_puts(b, "sp_poly_get_str(");
+            else buf_puts(b, "sp_poly_arr_get(");
+          }
+          buf_printf(b, "sp_%sHash_%s(", hn, getter == "get_opt" ? "get_opt" : "get");
+          emit_expr(c, recv, b); buf_puts(b, ", "); emit_hash_key(c, argv[0], kt, b); buf_puts(b, ")");
+          for (int di = 1; di < argc; di++) { buf_puts(b, ", "); emit_expr(c, argv[di], b); buf_puts(b, ")"); }
+        }
         return;
       }
       if ((!strcmp(name, "values_at") || !strcmp(name, "fetch_values")) && argc >= 1) {
@@ -4414,14 +4544,36 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         return;
       }
       if (!strcmp(name, "merge") && argc == 1 &&
-          (rt == TY_STR_INT_HASH || rt == TY_STR_POLY_HASH || rt == TY_SYM_POLY_HASH)) {
+          (rt == TY_STR_INT_HASH || rt == TY_STR_POLY_HASH || rt == TY_SYM_POLY_HASH ||
+           rt == TY_STR_STR_HASH)) {
+        TyKind at = comp_ntype(c, argv[0]);
+        /* cross-variant str merge: promote both sides to str_poly_hash */
+        if ((rt == TY_STR_INT_HASH || rt == TY_STR_STR_HASH) &&
+            ty_is_hash(at) && ty_hash_key(at) == TY_STRING && at != rt) {
+          buf_puts(b, "sp_StrPolyHash_merge(");
+          const char *rfn = rt == TY_STR_INT_HASH ? "sp_StrPolyHash_from_str_int_hash("
+                                                   : "sp_StrPolyHash_from_str_str_hash(";
+          buf_puts(b, rfn); emit_expr(c, recv, b); buf_puts(b, "), ");
+          const char *afn = at == TY_STR_INT_HASH ? "sp_StrPolyHash_from_str_int_hash("
+                          : at == TY_STR_STR_HASH  ? "sp_StrPolyHash_from_str_str_hash("
+                                                   : NULL;
+          if (afn) { buf_puts(b, afn); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+          else { emit_expr(c, argv[0], b); }
+          buf_puts(b, ")");
+          return;
+        }
         buf_printf(b, "sp_%sHash_merge(", hn); emit_expr(c, recv, b); buf_puts(b, ", ");
         /* a str_poly receiver may be merged with a concrete str-keyed hash;
            coerce the argument to the receiver's variant first */
-        TyKind at = comp_ntype(c, argv[0]);
         if (rt == TY_STR_POLY_HASH && (at == TY_STR_STR_HASH || at == TY_STR_INT_HASH)) {
           buf_printf(b, "sp_StrPolyHash_from_%s(", at == TY_STR_STR_HASH ? "str_str_hash" : "str_int_hash");
           emit_expr(c, argv[0], b); buf_puts(b, ")");
+        }
+        else if (at == TY_POLY) {
+          /* poly arg: unbox to the receiver's hash type */
+          int t = ++g_tmp;
+          buf_printf(b, "({ sp_RbVal _t%d = ", t); emit_expr(c, argv[0], b);
+          buf_printf(b, "; (sp_%sHash*)_t%d.v.p; })", hn, t);
         }
         else emit_expr(c, argv[0], b);
         buf_puts(b, ")");
@@ -4536,6 +4688,17 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_printf(b, "sp_PolyArray_%s(", name); emit_expr(c, recv, b); buf_puts(b, ")");
       return;
     }
+    if (rt == TY_POLY_ARRAY && !strcmp(name, "dig") && argc >= 1) {
+      if (argc == 1) {
+        buf_puts(b, "sp_PolyArray_get("); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+      }
+      else {
+        for (int di = argc - 1; di >= 1; di--) buf_printf(b, "sp_poly_arr_get(");
+        buf_puts(b, "sp_PolyArray_get("); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        for (int di = 1; di < argc; di++) { buf_puts(b, ", "); emit_expr(c, argv[di], b); buf_puts(b, ")"); }
+      }
+      return;
+    }
     if (k) {
       if ((!strcmp(name, "to_a") || !strcmp(name, "to_ary") || !strcmp(name, "entries") ||
            !strcmp(name, "flatten") || !strcmp(name, "compact")) && argc == 0) {
@@ -4572,6 +4735,32 @@ static void emit_call(Compiler *c, int id, Buf *b) {
           emit_expr(c, argv[0], b);
         }
         buf_puts(b, ")");
+        return;
+      }
+      if (!strcmp(name, "dig") && argc >= 1) {
+        if (argc == 1) {
+          /* single-step: same as arr[i] */
+          buf_printf(b, "sp_%sArray_get(", k); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        }
+        else {
+          /* multi-step: box the array as sp_RbVal, then chain sp_poly_arr_get */
+          buf_printf(b, "sp_poly_arr_get(");
+          /* first step: box the typed array as obj, then get element i */
+          int is_int = (rt == TY_INT_ARRAY);
+          (void)is_int;
+          /* build chain from innermost outward */
+          for (int di = argc - 1; di >= 1; di--) {
+            buf_printf(b, "sp_poly_arr_get(");
+          }
+          /* first access: typed get then box */
+          buf_printf(b, "sp_box_obj(");
+          emit_expr(c, recv, b);
+          buf_printf(b, ", SP_BUILTIN_%s_ARRAY)", rt == TY_INT_ARRAY ? "INT" : rt == TY_FLOAT_ARRAY ? "FLT" : "STR");
+          buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+          for (int di = 1; di < argc; di++) {
+            buf_puts(b, ", "); emit_expr(c, argv[di], b); buf_puts(b, ")");
+          }
+        }
         return;
       }
       if (!strcmp(name, "+") && argc == 1 && a0 == rt) {
@@ -5594,7 +5783,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       const char *hn = ty_hash_cname(rt);
       if (hn) {
         int tv = ++g_tmp;
-        int is_poly_hash = (rt == TY_SYM_POLY_HASH || rt == TY_STR_POLY_HASH);
+        int is_poly_hash = (rt == TY_SYM_POLY_HASH || rt == TY_STR_POLY_HASH || rt == TY_POLY_POLY_HASH);
         buf_puts(b, "({ ");
         /* For poly hashes with scalar values, store the scalar and box it for the hash call. */
         TyKind decl_type = (is_poly_hash && vt != TY_UNKNOWN && vt != TY_POLY) ? vt : (vt != TY_UNKNOWN ? vt : TY_POLY);
@@ -5603,7 +5792,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         emit_expr(c, argv[1], b);
         buf_printf(b, "; if (sp_gc_is_frozen("); emit_expr(c, recv, b); buf_puts(b, ")) sp_raise_frozen_hash(); ");
         buf_printf(b, "sp_%sHash_set(", hn); emit_expr(c, recv, b); buf_puts(b, ", ");
-        emit_expr(c, argv[0], b); buf_puts(b, ", ");
+        if (rt == TY_POLY_POLY_HASH) emit_boxed(c, argv[0], b); else emit_expr(c, argv[0], b);
+        buf_puts(b, ", ");
         if (is_poly_hash && vt != TY_POLY) {
           char tvn[32]; snprintf(tvn, sizeof tvn, "_t%d", tv);
           emit_boxed_text(c, decl_type, tvn, b);
@@ -5779,8 +5969,10 @@ static int emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent) {
       emit_indent(b, indent);
       buf_printf(b, "sp_%sHash_set(", hn);
       emit_expr(c, recv, b); buf_puts(b, ", ");
-      emit_expr(c, argv[0], b); buf_puts(b, ", ");
-      if (rt == TY_SYM_POLY_HASH || rt == TY_STR_POLY_HASH) emit_boxed(c, argv[1], b); else emit_expr(c, argv[1], b);
+      if (rt == TY_POLY_POLY_HASH) emit_boxed(c, argv[0], b); else emit_expr(c, argv[0], b);
+      buf_puts(b, ", ");
+      if (rt == TY_SYM_POLY_HASH || rt == TY_STR_POLY_HASH || rt == TY_POLY_POLY_HASH) emit_boxed(c, argv[1], b);
+      else emit_expr(c, argv[1], b);
       buf_puts(b, ");\n");
       return 1;
     }
@@ -6252,7 +6444,14 @@ static int emit_iteration_stmt(Compiler *c, int id, Buf *b, int indent) {
       TyKind want = is_val ? ty_hash_val(rt) : ty_hash_key(rt);
       int box = pv && pv->type == TY_POLY && want != TY_POLY;
       char src[256];
-      if (is_val)
+      if (rt == TY_POLY_POLY_HASH) {
+        /* PolyPolyHash: ->order[i] is an index; keys/vals hold sp_RbVal */
+        if (is_val)
+          snprintf(src, sizeof src, "%s->vals[%s->order[_t%d]]", rb.p, rb.p, t);
+        else
+          snprintf(src, sizeof src, "%s->keys[%s->order[_t%d]]", rb.p, rb.p, t);
+      }
+      else if (is_val)
         snprintf(src, sizeof src, "sp_%sHash_get(%s, %s->order[_t%d])", hn, rb.p, rb.p, t);
       else
         snprintf(src, sizeof src, "%s->order[_t%d]", rb.p, t);
@@ -7117,8 +7316,12 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     /* predefined punctuation globals: $/ is the record separator "\n"; $! / $; /
        $, read nil (spinel doesn't honor the split/print-sep defaults) */
     if (nm && !strcmp(nm, "$/")) { emit_str_literal(b, "\n"); return; }
+    if (nm && !strcmp(nm, "$?")) { buf_puts(b, "sp_last_status"); return; }
     if (nm && (!strcmp(nm, "$!") || !strcmp(nm, "$;") || !strcmp(nm, "$,"))) { buf_puts(b, "0"); return; }
-    if (nm && comp_gvar(c, nm + 1)) { buf_printf(b, "gv_%s", nm + 1); return; }
+    if (nm && nm[0] == '$') {
+      const char *rn = comp_resolve_gvar(c, nm + 1);
+      if (comp_gvar(c, rn)) { buf_printf(b, "gv_%s", rn); return; }
+    }
     unsupported(c, id, "global variable read");
   }
   if (!strcmp(ty, "NumberedReferenceReadNode")) {
@@ -7759,6 +7962,16 @@ static int emit_output_call(Compiler *c, int id, Buf *b, int indent) {
   }
   if (!strcmp(name, "print")) { for (int k = 0; k < argc; k++) emit_print_one(c, argv[k], b, indent); return 1; }
   if (!strcmp(name, "p"))     { for (int k = 0; k < argc; k++) emit_p_one(c, argv[k], b, indent); return 1; }
+  if (!strcmp(name, "system") && argc >= 1) {
+    int ts = ++g_tmp;
+    emit_indent(b, indent);
+    buf_printf(b, "{ const char *_sys_%d[] = { ", ts);
+    for (int k = 0; k < argc; k++) { if (k > 0) buf_puts(b, ", "); emit_expr(c, argv[k], b); }
+    buf_printf(b, ", NULL }; sp_system_args(%d, _sys_%d); }\n", argc, ts);
+    return 1;
+  }
+  /* trap(...) stmt: no-op (Spinel has no signal-handler runtime) */
+  if (!strcmp(name, "trap") && argc >= 1) return 1;
   if (!strcmp(name, "warn")) {
     /* Kernel#warn: each argument to stderr with a trailing newline */
     for (int k = 0; k < argc; k++) {
@@ -8577,6 +8790,20 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     }
     if (is_block_call(c, id)) { emit_block_invoke(c, nt_ref(nt, id, "arguments"), b, indent, 0); return; }
     if (emit_output_call(c, id, b, indent)) return;
+    /* Signal.trap / ::Signal.trap stmt: no-op */
+    {
+      const char *snm = nt_str(nt, id, "name");
+      int srecv = nt_ref(nt, id, "receiver");
+      int sargs = nt_ref(nt, id, "arguments");
+      int sargc = 0; if (sargs >= 0) nt_arr(nt, sargs, "arguments", &sargc);
+      if (srecv >= 0 && snm && !strcmp(snm, "trap") && sargc >= 1) {
+        const char *rty2 = nt_type(nt, srecv);
+        if (rty2 && (!strcmp(rty2, "ConstantReadNode") || !strcmp(rty2, "ConstantPathNode"))) {
+          const char *rn = nt_str(nt, srecv, "name");
+          if (rn && !strcmp(rn, "Signal")) return;  /* no-op */
+        }
+      }
+    }
     if (emit_inline_call(c, id, b, indent)) return;
     if (emit_iteration_stmt(c, id, b, indent)) return;
     /* attr writer: obj.x = v */
@@ -8853,7 +9080,8 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
     const char *nm = nt_str(nt, id, "name");
     int isg = ty[0] == 'G';
     const char *pfx = isg ? "gv" : "cst";
-    const char *key = isg ? nm + 1 : nm;
+    const char *raw_key = isg ? nm + 1 : nm;
+    const char *key = isg ? comp_resolve_gvar(c, raw_key) : raw_key;
     LocalVar *lv = isg ? comp_gvar(c, key) : comp_const(c, key);
     if (!lv) { /* not registered (non-ident name or class const) -> ignore */ return; }
     int v = nt_ref(nt, id, "value");
@@ -8914,17 +9142,18 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
   }
   if (!strcmp(ty, "GlobalVariableOperatorWriteNode")) {
     const char *nm = nt_str(nt, id, "name");
-    LocalVar *lv = nm ? comp_gvar(c, nm + 1) : NULL;
+    const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
+    LocalVar *lv = rn ? comp_gvar(c, rn) : NULL;
     if (!lv) return;
     const char *op = nt_str(nt, id, "binary_operator");
     int v = nt_ref(nt, id, "value");
     emit_indent(b, indent);
     if (lv->type == TY_STRING && op && !strcmp(op, "+")) {
-      buf_printf(b, "gv_%s = sp_str_concat(gv_%s, ", nm + 1, nm + 1);
+      buf_printf(b, "gv_%s = sp_str_concat(gv_%s, ", rn, rn);
       emit_expr(c, v, b); buf_puts(b, ");\n");
     }
     else {
-      buf_printf(b, "gv_%s %s= ", nm + 1, op ? op : "+");
+      buf_printf(b, "gv_%s %s= ", rn, op ? op : "+");
       emit_expr(c, v, b); buf_puts(b, ";\n");
     }
     return;
@@ -9324,6 +9553,8 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
   }
   if (!strcmp(ty, "ReturnNode")) { emit_return(c, id, b, indent); return; }
   if (!strcmp(ty, "DefNode"))    { return; } /* emitted separately */
+  if (!strcmp(ty, "AliasGlobalVariableNode")) { return; } /* resolved at scan time */
+  if (!strcmp(ty, "PreExecutionNode") || !strcmp(ty, "PostExecutionNode")) { return; } /* hoisted separately */
 
   /* any remaining value expression as a bare statement (its value is used
      only when this is the last statement of an inlined expr method) */
@@ -10296,12 +10527,52 @@ char *codegen_program(const NodeTable *nt) {
   for (int i = 0; i < c->nclasses; i++) emit_class_new(c, &c->classes[i], &body);
   for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable || scope_is_shadowed(c, s)) continue; emit_method(c, &c->scopes[s], &body); }
 
+  /* Emit END block static functions for atexit registration */
+  int end_count = 0;
+  {
+    int top_body = c->scopes[0].body;
+    if (top_body >= 0) {
+      const char *tty = nt_type(c->nt, top_body);
+      int tn = 0;
+      const int *tbody = (tty && !strcmp(tty, "StatementsNode"))
+                         ? nt_arr(c->nt, top_body, "body", &tn) : NULL;
+      for (int k = 0; k < tn; k++) {
+        const char *sty = nt_type(c->nt, tbody[k]);
+        if (!sty || strcmp(sty, "PostExecutionNode")) continue;
+        int stmts = nt_ref(c->nt, tbody[k], "statements");
+        end_count++;
+        buf_printf(&body, "static void sp_end_fn_%d(void) { SP_GC_SAVE();\n", end_count);
+        emit_stmts(c, stmts, &body, 1);
+        buf_puts(&body, "}\n");
+      }
+    }
+  }
+
   buf_puts(&body, "int main(int argc,char**argv){\n");
   buf_puts(&body, "    SP_GC_SAVE();\n");
   buf_puts(&body, "    sp_re_init();\n");
   buf_puts(&body, "    { sp_argv.len = argc - 1; sp_argv.data = (const char**)malloc(sizeof(const char*) * (size_t)(argc > 1 ? argc - 1 : 1)); for (int _ai = 0; _ai < argc - 1; _ai++) sp_argv.data[_ai] = sp_str_dup_external(argv[_ai + 1]); }\n");
+  /* Register END blocks (atexit runs LIFO, so they execute in reverse registration order) */
+  for (int e = 1; e <= end_count; e++)
+    buf_printf(&body, "    atexit(sp_end_fn_%d);\n", e);
   emit_scope_decls(c, &c->scopes[0], &body);
   buf_puts(&body, "\n");
+  /* Hoist BEGIN blocks to run first */
+  {
+    int top_body = c->scopes[0].body;
+    if (top_body >= 0) {
+      const char *tty = nt_type(c->nt, top_body);
+      int tn = 0;
+      const int *tbody = (tty && !strcmp(tty, "StatementsNode"))
+                         ? nt_arr(c->nt, top_body, "body", &tn) : NULL;
+      for (int k = 0; k < tn; k++) {
+        const char *sty = nt_type(c->nt, tbody[k]);
+        if (!sty || strcmp(sty, "PreExecutionNode")) continue;
+        int stmts = nt_ref(c->nt, tbody[k], "statements");
+        emit_stmts(c, stmts, &body, 1);
+      }
+    }
+  }
   emit_stmts(c, c->scopes[0].body, &body, 1);
   if (g_needs_at_exit)
     buf_puts(&body, "  { mrb_int _ax_args[16] = {0}; for (mrb_int _ax = sp_at_exit_count - 1; _ax >= 0; _ax--) sp_proc_call(sp_at_exit_hooks[_ax], _ax_args); }\n");

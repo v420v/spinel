@@ -25,8 +25,9 @@ const char *ty_name(TyKind t) {
     case TY_STR_STR_HASH: return "str_str_hash";
     case TY_INT_INT_HASH: return "int_int_hash";
     case TY_INT_STR_HASH: return "int_str_hash";
-    case TY_SYM_POLY_HASH: return "sym_poly_hash";
-    case TY_STR_POLY_HASH: return "str_poly_hash";
+    case TY_SYM_POLY_HASH:  return "sym_poly_hash";
+    case TY_STR_POLY_HASH:  return "str_poly_hash";
+    case TY_POLY_POLY_HASH: return "poly_poly_hash";
     case TY_PROC:    return "proc";
     case TY_POLY:    return "poly";
   }
@@ -38,8 +39,9 @@ static const struct { TyKind kind, key, val; const char *cname; } hash_tbl[] = {
   {TY_STR_STR_HASH, TY_STRING, TY_STRING, "StrStr"},
   {TY_INT_INT_HASH, TY_INT,    TY_INT,    "IntInt"},
   {TY_INT_STR_HASH, TY_INT,    TY_STRING, "IntStr"},
-  {TY_SYM_POLY_HASH, TY_SYMBOL, TY_POLY,  "SymPoly"},
-  {TY_STR_POLY_HASH, TY_STRING, TY_POLY,  "StrPoly"},
+  {TY_SYM_POLY_HASH,  TY_SYMBOL, TY_POLY, "SymPoly"},
+  {TY_STR_POLY_HASH,  TY_STRING, TY_POLY, "StrPoly"},
+  {TY_POLY_POLY_HASH, TY_POLY,   TY_POLY, "PolyPoly"},
 };
 
 int ty_is_hash(TyKind t) {

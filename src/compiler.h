@@ -92,6 +92,11 @@ typedef struct {
   LocalVar *consts;   /* top-level constants (FOO) */
   int nconsts, cconsts;
 
+  /* alias $copy $orig → gvar_alias_from[i]="copy", gvar_alias_to[i]="orig" */
+  char **gvar_alias_from;
+  char **gvar_alias_to;
+  int ngvar_aliases;
+
   int *toplevel_includes;  /* class indices of modules included at top level */
   int ntoplevel_includes;
 } Compiler;
@@ -115,6 +120,8 @@ int comp_sym_intern(Compiler *c, const char *name);
 /* Global variables and top-level constants. *_intern finds or creates. */
 LocalVar *comp_gvar(Compiler *c, const char *name);
 LocalVar *comp_gvar_intern(Compiler *c, const char *name);
+const char *comp_resolve_gvar(Compiler *c, const char *name); /* alias resolution */
+void comp_add_gvar_alias(Compiler *c, const char *from, const char *to);
 LocalVar *comp_const(Compiler *c, const char *name);
 LocalVar *comp_const_intern(Compiler *c, const char *name);
 
