@@ -602,7 +602,20 @@ static TyKind infer_call(Compiler *c, int id) {
       }
     }
     int mi = comp_method_in_chain(c, cid, name, NULL);
-    if (mi >= 0) return method_call_ret(c, mi, id);
+    if (mi >= 0) {
+      TyKind r = method_call_ret(c, mi, id);
+      /* Unify with descendant direct overrides: codegen dispatch emits a
+         cls_id switch over all overrides, so the result type must cover all. */
+      for (int k = 0; k < c->nclasses; k++) {
+        int is_desc = 0;
+        for (int p = c->classes[k].parent; p >= 0; p = c->classes[p].parent)
+          if (p == cid) { is_desc = 1; break; }
+        if (!is_desc) continue;
+        int dmi = comp_method_in_class(c, k, name);
+        if (dmi >= 0) r = ty_unify(r, (TyKind)c->scopes[dmi].ret);
+      }
+      return r;
+    }
     if (!strcmp(name, "to_s") || !strcmp(name, "inspect")) return TY_STRING;
   }
 
@@ -629,10 +642,27 @@ static TyKind infer_call(Compiler *c, int id) {
           for (int p = c->classes[k].parent; p >= 0; p = c->classes[p].parent)
             if (p == self->class_id) { is_desc = 1; break; }
           if (!is_desc) continue;
-          int dmi = comp_method_in_class(c, k, name);
+          int dmi = self->is_cmethod ? comp_cmethod_in_class(c, k, name) :
+                                       comp_method_in_class(c, k, name);
           if (dmi >= 0) r = ty_unify(r, (TyKind)c->scopes[dmi].ret);
         }
         return r;
+      }
+      /* Method defined only in descendants (not in base chain):
+         unify return types of all descendant implementations. */
+      if (self->is_cmethod) {
+        TyKind r = TY_UNKNOWN; int found = 0;
+        for (int k = 0; k < c->nclasses; k++) {
+          int is_desc = 0;
+          for (int p = c->classes[k].parent; p >= 0; p = c->classes[p].parent)
+            if (p == self->class_id) { is_desc = 1; break; }
+          if (!is_desc) continue;
+          int dmi = comp_cmethod_in_class(c, k, name);
+          if (dmi < 0) continue;
+          r = found ? ty_unify(r, (TyKind)c->scopes[dmi].ret) : (TyKind)c->scopes[dmi].ret;
+          found = 1;
+        }
+        if (found) return r;
       }
     }
   }
@@ -3360,15 +3390,21 @@ static int infer_param_types(Compiler *c) {
       changed |= bind_call_params(c, id, mi);
       /* Propagate to descendant classes that directly override the same method.
          When Base#foo calls bar(arg), and Sub overrides bar, Sub#bar must also
-         receive the same arg types so the cls_id-switch dispatch is type-safe. */
-      if (mi >= 0 && caller_cid >= 0) {
+         receive the same arg types so the cls_id-switch dispatch is type-safe.
+         Also handles the case where only descendants define the method (mi < 0
+         from base chain, e.g. Base.find calls adapter_find defined only in
+         Article and Comment descendants). */
+      if (caller_cid >= 0) {
+        Scope *caller_sc = comp_scope_of(c, id);
+        int is_cm = caller_sc ? caller_sc->is_cmethod : 0;
         for (int k = 0; k < c->nclasses; k++) {
           if (k == caller_cid) continue;
           int is_desc = 0;
           for (int p = c->classes[k].parent; p >= 0; p = c->classes[p].parent)
             if (p == caller_cid) { is_desc = 1; break; }
           if (!is_desc) continue;
-          int dmi = comp_method_in_class(c, k, name);
+          int dmi = is_cm ? comp_cmethod_in_class(c, k, name) :
+                            comp_method_in_class(c, k, name);
           if (dmi >= 0) changed |= bind_call_params(c, id, dmi);
         }
       }
@@ -3436,6 +3472,17 @@ static int infer_param_types(Compiler *c) {
                       !strcmp(name, "<=") || !strcmp(name, ">=")))
         mi3 = comp_method_in_chain(c, cid3, "<=>", NULL);
       changed |= bind_call_params(c, id, mi3);
+      /* Also propagate to descendant overrides: codegen will emit a cls_id
+         switch that calls each override, so each must have the right param
+         types. */
+      for (int k = 0; k < c->nclasses; k++) {
+        int is_desc = 0;
+        for (int p = c->classes[k].parent; p >= 0; p = c->classes[p].parent)
+          if (p == cid3) { is_desc = 1; break; }
+        if (!is_desc) continue;
+        int dmi3 = comp_method_in_class(c, k, name);
+        if (dmi3 >= 0) changed |= bind_call_params(c, id, dmi3);
+      }
     }
     else if (rt == TY_POLY) {
       /* poly receiver: the call may dispatch to any user method of this name,

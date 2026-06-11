@@ -143,6 +143,8 @@ int        comp_cvar_index(ClassInfo *ci, const char *name);  /* class var; -1 i
 int        comp_cvar_intern(ClassInfo *ci, const char *name); /* find or add; returns index */
 /* Find the instance-method scope index for class_id + method name, or -1. */
 int        comp_method_in_class(Compiler *c, int class_id, const char *name);
+/* Find the class (singleton) method scope for class_id + name, or -1 (no chain). */
+int        comp_cmethod_in_class(Compiler *c, int class_id, const char *name);
 /* Find the class (singleton) method scope, walking the superclass chain. */
 int        comp_cmethod_in_chain(Compiler *c, int class_id, const char *name, int *def_class);
 /* Like comp_method_in_class but walks the superclass chain. On success,

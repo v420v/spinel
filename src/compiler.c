@@ -181,7 +181,7 @@ int comp_method_in_class(Compiler *c, int class_id, const char *name) {
   return -1;
 }
 
-static int comp_cmethod_in_class(Compiler *c, int class_id, const char *name) {
+int comp_cmethod_in_class(Compiler *c, int class_id, const char *name) {
   if (!name) return -1;
   for (int s = c->nscopes - 1; s >= 0; s--)
     if (c->scopes[s].class_id == class_id && c->scopes[s].is_cmethod &&
