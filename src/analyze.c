@@ -3052,6 +3052,8 @@ static int bind_call_params(Compiler *c, int call_id, int mi) {
       at = ty_is_array(arr) ? ty_array_elem(arr) : TY_POLY;
     } else {
       at = infer_type(c, argv[k]);
+      /* nil is not a first-class param type; a nil arg widens the param to poly */
+      if (at == TY_NIL) at = TY_POLY;
     }
     LocalVar *p = scope_local(m, m->pnames[k]);
     if (!p) continue;
