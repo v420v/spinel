@@ -3836,6 +3836,39 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       else { buf_puts(b, "("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
       return;
     }
+    if (!strcmp(name, "String") && ac == 1) {
+      TyKind at = comp_ntype(c, av[0]);
+      if (at == TY_STRING) { emit_expr(c, av[0], b); }
+      else if (at == TY_INT) { buf_puts(b, "sp_int_to_s("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else if (at == TY_FLOAT) { buf_puts(b, "sp_float_to_s("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else if (at == TY_POLY) { buf_puts(b, "sp_poly_to_s("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else if (at == TY_BOOL) { buf_puts(b, "("); emit_expr(c, av[0], b); buf_puts(b, " ? \"true\" : \"false\")"); }
+      else if (at == TY_SYMBOL) { buf_puts(b, "sp_sym_to_s("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else { buf_puts(b, "sp_poly_to_s(sp_box_nil())"); }  /* nil or unknown */
+      return;
+    }
+    if ((!strcmp(name, "format") || !strcmp(name, "sprintf")) && ac >= 1) {
+      /* format(fmt, *args) -> sp_str_format_polyarr(fmt, poly_arr) */
+      int tf = ++g_tmp, ta = ++g_tmp;
+      emit_indent(g_pre, g_indent);
+      buf_printf(g_pre, "const char *_t%d = ", tf);
+      Buf fb; memset(&fb, 0, sizeof fb);
+      emit_expr(c, av[0], &fb);
+      buf_printf(g_pre, "%s;\n", fb.p ? fb.p : "");
+      free(fb.p);
+      emit_indent(g_pre, g_indent);
+      buf_printf(g_pre, "sp_PolyArray *_t%d = sp_PolyArray_new();\n", ta);
+      for (int ai = 1; ai < ac; ai++) {
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "sp_PolyArray_push(_t%d, ", ta);
+        Buf ab; memset(&ab, 0, sizeof ab);
+        emit_boxed(c, av[ai], &ab);
+        buf_printf(g_pre, "%s);\n", ab.p ? ab.p : "sp_box_nil()");
+        free(ab.p);
+      }
+      buf_printf(b, "sp_str_format_polyarr(_t%d, _t%d)", tf, ta);
+      return;
+    }
     if (!strcmp(name, "rand")) {
       if (ac == 0) { buf_puts(b, "(mrb_float)((double)rand() / (RAND_MAX + 1.0))"); return; }
       TyKind a0t = comp_ntype(c, av[0]);
@@ -14701,7 +14734,7 @@ static void emit_method_signature(Compiler *c, Scope *s, Buf *b) {
   for (int i = 0; i < s->nparams; i++) {
     if (wrote++) buf_puts(b, ", ");
     LocalVar *p = scope_local(s, s->pnames[i]);
-    TyKind pt = p ? p->type : TY_UNKNOWN;
+    TyKind pt = (p && p->type != TY_UNKNOWN) ? p->type : TY_POLY;
     if (!is_scalar_ret(pt)) {
       fprintf(stderr, "spinelc: method '%s' param '%s' has unsupported type %s\n",
               s->name, s->pnames[i], ty_name(pt));
@@ -15192,7 +15225,8 @@ static void emit_class_new(Compiler *c, ClassInfo *ci, Buf *b) {
     for (int i = 0; i < s->nparams; i++) {
       if (i) buf_puts(b, ", ");
       LocalVar *p = scope_local(s, s->pnames[i]);
-      emit_ctype(c, p ? p->type : TY_INT, b);
+      TyKind pt = (p && p->type != TY_UNKNOWN) ? p->type : TY_POLY;
+      emit_ctype(c, pt, b);
       buf_printf(b, " lv_%s", s->pnames[i]);
     }
   }
@@ -15222,7 +15256,7 @@ static void emit_class_new(Compiler *c, ClassInfo *ci, Buf *b) {
     if (ci->ivar_types[i] == TY_POLY)
       buf_printf(b, "  self->iv_%s = sp_box_nil();\n", ci->ivars[i] + 1);
   } /* close else (non-exception subclass allocation) */
-  if (init >= 0) {
+  if (init >= 0 && c->scopes[init].reachable) {
     buf_printf(b, "  sp_%s_initialize(", c->classes[initcls].name);
     if (initcls != cid) buf_printf(b, "(sp_%s *)", c->classes[initcls].name);
     buf_puts(b, "self");
@@ -15583,7 +15617,8 @@ char *codegen_program(const NodeTable *nt) {
         for (int m = 0; m < s->nparams; m++) {
           if (m) buf_puts(&b, ", ");
           LocalVar *p = scope_local(s, s->pnames[m]);
-          emit_ctype(c, p ? p->type : TY_INT, &b);
+          TyKind pm = (p && p->type != TY_UNKNOWN) ? p->type : TY_POLY;
+          emit_ctype(c, pm, &b);
         }
         buf_puts(&b, ");\n");
       }

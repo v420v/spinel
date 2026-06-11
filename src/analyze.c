@@ -996,6 +996,8 @@ static TyKind infer_call(Compiler *c, int id) {
     /* Kernel conversions */
     if (!strcmp(name, "Integer") && (argc == 1 || argc == 2)) return TY_INT;
     if (!strcmp(name, "Float") && argc == 1) return TY_FLOAT;
+    if (!strcmp(name, "String") && argc == 1) return TY_STRING;
+    if ((!strcmp(name, "format") || !strcmp(name, "sprintf")) && argc >= 1) return TY_STRING;
     if (!strcmp(name, "system") && argc >= 1) return TY_BOOL;
     if (!strcmp(name, "trap") && argc >= 1) return TY_STRING;
     if (!strcmp(name, "rand")) {
