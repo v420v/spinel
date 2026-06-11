@@ -5074,13 +5074,16 @@ static int infer_block_params(Compiler *c) {
     }
 
     /* hash.each / each_pair { |k, v| } or { |(k,v)| } binds two params.
-       Also handles each_with_object { |(k,v), memo| }. */
+       Also handles each_with_object { |(k,v), memo| } and mutating
+       iteration (delete_if / select! / reject! / keep_if). */
     if ((!strcmp(name, "each") || !strcmp(name, "each_pair") || !strcmp(name, "map") ||
          !strcmp(name, "collect") || !strcmp(name, "flat_map") || !strcmp(name, "select") ||
          !strcmp(name, "filter") || !strcmp(name, "reject") || !strcmp(name, "find") ||
          !strcmp(name, "detect") || !strcmp(name, "sort_by") || !strcmp(name, "min_by") ||
          !strcmp(name, "max_by") || !strcmp(name, "count") || !strcmp(name, "sum") ||
          !strcmp(name, "any?") || !strcmp(name, "all?") || !strcmp(name, "none?") ||
+         !strcmp(name, "delete_if") || !strcmp(name, "select!") || !strcmp(name, "reject!") ||
+         !strcmp(name, "filter!") || !strcmp(name, "keep_if") ||
          !strcmp(name, "each_with_index") || !strcmp(name, "each_with_object")) && ty_is_hash(rt)) {
       Scope *hs = comp_scope_of(c, block);
       /* |(k,v)| or |(k,v), memo| destructuring (MultiTargetNode first param) */

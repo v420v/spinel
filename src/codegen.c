@@ -15322,7 +15322,7 @@ static void emit_class_new(Compiler *c, ClassInfo *ci, Buf *b) {
     if (ci->ivar_types[i] == TY_POLY)
       buf_printf(b, "  self->iv_%s = sp_box_nil();\n", ci->ivars[i] + 1);
   } /* close else (non-exception subclass allocation) */
-  if (init >= 0 && c->scopes[init].reachable) {
+  if (init >= 0 && c->scopes[init].reachable && !c->scopes[init].yields) {
     buf_printf(b, "  sp_%s_initialize(", c->classes[initcls].name);
     if (initcls != cid) buf_printf(b, "(sp_%s *)", c->classes[initcls].name);
     buf_puts(b, "self");
