@@ -374,6 +374,32 @@ static void emit_ctype(Compiler *c, TyKind t, Buf *b) {
   }
 }
 
+/* Emit the boxing prefix/suffix to convert a typed value to sp_RbVal.
+   Call as: emit_box_open(t, b); emit_expr(c, node, b); emit_box_close(t, b). */
+static void emit_box_open(Compiler *c, TyKind t, Buf *b) {
+  if (t == TY_INT)          buf_puts(b, "sp_box_int(");
+  else if (t == TY_STRING)  buf_puts(b, "sp_box_str(");
+  else if (t == TY_FLOAT)   buf_puts(b, "sp_box_float(");
+  else if (t == TY_BOOL)    buf_puts(b, "sp_box_bool(");
+  else if (t == TY_NIL)     buf_puts(b, "sp_box_nil(); (void)(");
+  else if (t == TY_SYMBOL)  buf_puts(b, "sp_box_sym(");
+  else if (t == TY_INT_ARRAY)   buf_puts(b, "sp_box_int_array(");
+  else if (t == TY_FLOAT_ARRAY) buf_puts(b, "sp_box_float_array(");
+  else if (t == TY_STR_ARRAY)   buf_puts(b, "sp_box_str_array(");
+  else if (t == TY_POLY_ARRAY)  buf_puts(b, "sp_box_poly_array(");
+  else if (ty_is_object(t)) {
+    int cid = ty_object_class(t);
+    buf_printf(b, "sp_box_obj((%s *)( ", c->classes[cid].name);
+  }
+  /* TY_POLY: already sp_RbVal, no prefix */
+}
+static void emit_box_close(Compiler *c, TyKind t, Buf *b) {
+  (void)c;
+  if (t == TY_POLY)           return; /* no-op */
+  if (ty_is_object(t))        { buf_printf(b, "), %d)", ty_object_class(t)); return; }
+  buf_puts(b, ")");
+}
+
 /* "Int" / "Str" / "Float" for the sp_<K>Array_* runtime family. */
 static const char *array_kind(TyKind t) {
   switch (t) {
@@ -2722,13 +2748,23 @@ static void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const ch
   for (int i = 0; i < m->nparams; i++) {
     buf_puts(out, i == 0 ? lead : ", ");
     if (m->rest_idx >= 0 && i == m->rest_idx) {
+      /* rest collects middle args; stop before post-splat params */
+      int rest_end = pos_argc - m->npost_rest;
+      if (rest_end < i) rest_end = i;
       if (splat_tmp >= 0) {
-        /* rest = splat_arr[i-splat_idx..] + argv[splat_idx+1..] */
         emit_rest_from_splat_and_argv(splat_tmp, splat_at, i - splat_idx,
-                                      c, splat_idx + 1, pos_argc, argv, out);
+                                      c, splat_idx + 1, rest_end, argv, out);
       } else {
-        emit_rest_pack(c, i, pos_argc, argv, out);
+        emit_rest_pack(c, i, rest_end, argv, out);
       }
+    } else if (m->rest_idx >= 0 && m->npost_rest > 0 && i > m->rest_idx) {
+      /* post-splat required param: take from the end of the call args */
+      int post_j = i - m->rest_idx - 1;  /* 0-based index in posts */
+      int argv_idx = pos_argc - m->npost_rest + post_j;
+      if (argv && argv_idx >= 0 && argv_idx < pos_argc)
+        emit_arg_or_default(c, m, i, argv[argv_idx], out);
+      else
+        emit_arg_or_default(c, m, i, -1, out);
     } else if (splat_tmp >= 0 && i >= splat_idx) {
       /* this param comes from the splatted array at offset (i - splat_idx) */
       emit_array_elem_at(splat_at, splat_tmp, i - splat_idx, out);
@@ -4169,17 +4205,29 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     }
   }
 
-  /* namespaced class M::Sub.new -> sp_<Sub>_new(args) (resolve by final name) */
+  /* namespaced class M::Sub.new -> check for user-defined `def self.new` first,
+     then fall back to sp_<Sub>_new(args) */
   if (recv >= 0 && !strcmp(name, "new") && nt_type(nt, recv) &&
       !strcmp(nt_type(nt, recv), "ConstantPathNode")) {
     const char *cn = nt_str(nt, recv, "name");
     int ci = cn ? comp_class_index(c, cn) : -1;
-    if (ci >= 0 && !c->classes[ci].is_struct) {
-      buf_printf(b, "sp_%s_new(", c->classes[ci].name);
-      int initm = comp_method_in_chain(c, ci, "initialize", NULL);
-      if (initm >= 0) emit_args_filled(c, initm, nt_ref(nt, id, "arguments"), "", b);
-      buf_puts(b, ")");
-      return;
+    if (ci >= 0) {
+      int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+      if (ucnew >= 0) {
+        /* user-defined def self.new: call it as a regular class method */
+        int defcls2 = -1; comp_cmethod_in_chain(c, ci, "new", &defcls2);
+        buf_printf(b, "sp_%s_s_new(", c->classes[defcls2 >= 0 ? defcls2 : ci].name);
+        emit_args_filled(c, ucnew, nt_ref(nt, id, "arguments"), "", b);
+        buf_puts(b, ")");
+        return;
+      }
+      if (!c->classes[ci].is_struct) {
+        buf_printf(b, "sp_%s_new(", c->classes[ci].name);
+        int initm = comp_method_in_chain(c, ci, "initialize", NULL);
+        if (initm >= 0) emit_args_filled(c, initm, nt_ref(nt, id, "arguments"), "", b);
+        buf_puts(b, ")");
+        return;
+      }
     }
   }
 
@@ -4209,6 +4257,15 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         return;
       }
       if (ci >= 0) {
+        /* user-defined def self.new takes precedence over the constructor */
+        int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+        if (ucnew >= 0) {
+          int defcls2 = -1; comp_cmethod_in_chain(c, ci, "new", &defcls2);
+          buf_printf(b, "sp_%s_s_new(", c->classes[defcls2 >= 0 ? defcls2 : ci].name);
+          emit_args_filled(c, ucnew, nt_ref(nt, id, "arguments"), "", b);
+          buf_puts(b, ")");
+          return;
+        }
         buf_printf(b, "sp_%s_new(", c->classes[ci].name);
         int initm = comp_method_in_chain(c, ci, "initialize", NULL);
         if (initm >= 0) emit_args_filled(c, initm, nt_ref(nt, id, "arguments"), "", b);
@@ -4618,6 +4675,71 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       }
       buf_puts(b, ")");
       return;
+    }
+  }
+
+  /* Module.field = val  /  Module.field  -> singleton accessor sg_Mod_field */
+  if (recv >= 0) {
+    const char *rty = nt_type(nt, recv);
+    if (rty && (!strcmp(rty, "ConstantReadNode") || !strcmp(rty, "ConstantPathNode"))) {
+      const char *cn = nt_str(nt, recv, "name");
+      int ci = cn ? comp_class_index(c, cn) : -1;
+      if (ci >= 0) {
+        ClassInfo *_sgcls = &c->classes[ci];
+        int nlen = (int)strlen(name);
+        if (nlen > 1 && name[nlen - 1] == '=') {
+          /* setter */
+          char base[256]; int blen = nlen - 1;
+          memcpy(base, name, (size_t)blen); base[blen] = '\0';
+          if (comp_is_sg_writer(_sgcls, base)) {
+            buf_printf(b, "(sg_%s_%s = ", cn, base);
+            if (argc >= 1) {
+              TyKind _at = comp_ntype(c, argv[0]);
+              emit_box_open(c, _at, b); emit_expr(c, argv[0], b); emit_box_close(c, _at, b);
+            }
+            else buf_puts(b, "sp_box_nil()");
+            buf_puts(b, ")");
+            return;
+          }
+        }
+        else {
+          /* getter */
+          if (comp_is_sg_reader(_sgcls, name)) {
+            buf_printf(b, "sg_%s_%s", cn, name);
+            return;
+          }
+        }
+      }
+    }
+  }
+
+  /* self.field = val  /  self.field  inside a class method or module body */
+  if (recv >= 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "SelfNode")) {
+    Scope *_sgencl = comp_scope_of(c, id);
+    int _sg_cid = (_sgencl && _sgencl->is_cmethod && _sgencl->class_id >= 0)
+                  ? _sgencl->class_id : g_class_body_id;
+    if (_sg_cid >= 0) {
+      ClassInfo *_sgcls = &c->classes[_sg_cid];
+      const char *_sgcn = _sgcls->name;
+      int _nlen = (int)strlen(name);
+      if (_nlen > 1 && name[_nlen - 1] == '=') {
+        char _base[256]; int _blen = _nlen - 1;
+        memcpy(_base, name, (size_t)_blen); _base[_blen] = '\0';
+        if (comp_is_sg_writer(_sgcls, _base)) {
+          buf_printf(b, "(sg_%s_%s = ", _sgcn, _base);
+          if (argc >= 1) {
+            TyKind _at = comp_ntype(c, argv[0]);
+            emit_box_open(c, _at, b); emit_expr(c, argv[0], b); emit_box_close(c, _at, b);
+          }
+          else buf_puts(b, "sp_box_nil()");
+          buf_puts(b, ")");
+          return;
+        }
+      }
+      else if (comp_is_sg_reader(_sgcls, name)) {
+        buf_printf(b, "sg_%s_%s", _sgcn, name);
+        return;
+      }
     }
   }
 
@@ -5096,7 +5218,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_puts(b, ")");
       return;
     }
-    if (eff_res == TY_FLOAT && strcmp(name, "%") && strcmp(name, "**")) {
+    if (eff_res == TY_FLOAT && rt != TY_TIME && strcmp(name, "%") && strcmp(name, "**")) {
       buf_puts(b, "(");
       emit_expr(c, recv, b);
       buf_printf(b, " %s ", name);
@@ -14284,6 +14406,15 @@ char *codegen_program(const NodeTable *nt) {
       buf_printf(&b, " cvar_%s_%s = %s;\n", ci->name, ci->cvars[j] + 2,
                  t == TY_RANGE ? "{0}" : default_value(t));
     }
+  }
+
+  /* singleton accessor slots: `class << self; attr_accessor :x; end`
+     backed by a file-scope sp_RbVal per (class, name), init = nil. */
+  for (int i = 0; i < c->nclasses; i++) {
+    ClassInfo *ci = &c->classes[i];
+    for (int j = 0; j < ci->nsg_readers; j++)
+      buf_printf(&b, "static sp_RbVal sg_%s_%s = {SP_TAG_NIL, 0, {0}};\n",
+                 ci->name, ci->sg_readers[j]);
   }
 
   /* module/class-level instance variables (accessed from a `def self.X`):

@@ -36,6 +36,10 @@ void comp_free(Compiler *c) {
     free(c->classes[i].readers);
     for (int j = 0; j < c->classes[i].nwriters; j++) free(c->classes[i].writers[j]);
     free(c->classes[i].writers);
+    for (int j = 0; j < c->classes[i].nsg_readers; j++) free(c->classes[i].sg_readers[j]);
+    free(c->classes[i].sg_readers);
+    for (int j = 0; j < c->classes[i].nsg_writers; j++) free(c->classes[i].sg_writers[j]);
+    free(c->classes[i].sg_writers);
     for (int j = 0; j < c->classes[i].nprep_chain; j++) {
       free(c->classes[i].prep_from[j]);
       free(c->classes[i].prep_to[j]);
@@ -228,6 +232,24 @@ void comp_add_writer(ClassInfo *ci, const char *name) {
 }
 int comp_is_reader(ClassInfo *ci, const char *name) { return name_in(ci->readers, ci->nreaders, name); }
 int comp_is_writer(ClassInfo *ci, const char *name) { return name_in(ci->writers, ci->nwriters, name); }
+void comp_add_sg_reader(ClassInfo *ci, const char *name) {
+  if (name_in(ci->sg_readers, ci->nsg_readers, name)) return;
+  if (ci->nsg_readers >= ci->csg_readers) {
+    ci->csg_readers = ci->csg_readers ? ci->csg_readers * 2 : 4;
+    ci->sg_readers = realloc(ci->sg_readers, sizeof(char *) * (size_t)ci->csg_readers);
+  }
+  ci->sg_readers[ci->nsg_readers++] = strdup(name);
+}
+void comp_add_sg_writer(ClassInfo *ci, const char *name) {
+  if (name_in(ci->sg_writers, ci->nsg_writers, name)) return;
+  if (ci->nsg_writers >= ci->csg_writers) {
+    ci->csg_writers = ci->csg_writers ? ci->csg_writers * 2 : 4;
+    ci->sg_writers = realloc(ci->sg_writers, sizeof(char *) * (size_t)ci->csg_writers);
+  }
+  ci->sg_writers[ci->nsg_writers++] = strdup(name);
+}
+int comp_is_sg_reader(ClassInfo *ci, const char *name) { return name_in(ci->sg_readers, ci->nsg_readers, name); }
+int comp_is_sg_writer(ClassInfo *ci, const char *name) { return name_in(ci->sg_writers, ci->nsg_writers, name); }
 
 void comp_add_alias(ClassInfo *ci, const char *new_name, const char *old_name) {
   if (!new_name || !old_name) return;

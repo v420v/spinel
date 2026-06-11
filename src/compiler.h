@@ -43,6 +43,7 @@ typedef struct {
   int nparams;
   int nrequired;    /* count of leading required params */
   int rest_idx;     /* index in pnames[] of *rest param, -1 if none */
+  int npost_rest;   /* number of required params AFTER the rest param (Prism "posts") */
 
   TyKind ret;       /* inferred return type */
   int ret_proc_ret; /* when ret==TY_PROC: the returned proc's body return type
@@ -66,6 +67,12 @@ typedef struct {
   int nreaders, creaders;
   char **writers;      /* attr writer base names (no '@', no '=') */
   int nwriters, cwriters;
+  /* class << self attr_accessor/reader/writer: singleton-level accessors
+     stored in static globals (cst_<Class>_<field>), not in per-instance ivars */
+  char **sg_readers;   /* singleton reader names */
+  int nsg_readers, csg_readers;
+  char **sg_writers;   /* singleton writer base names (no '=') */
+  int nsg_writers, csg_writers;
   char **alias_new;    /* `alias new old`: alias_new[i] redirects to alias_old[i] */
   char **alias_old;
   int naliases, caliases;
@@ -158,6 +165,10 @@ void       comp_add_reader(ClassInfo *ci, const char *name);
 void       comp_add_writer(ClassInfo *ci, const char *name);
 int        comp_is_reader(ClassInfo *ci, const char *name);
 int        comp_is_writer(ClassInfo *ci, const char *name);
+void       comp_add_sg_reader(ClassInfo *ci, const char *name);
+void       comp_add_sg_writer(ClassInfo *ci, const char *name);
+int        comp_is_sg_reader(ClassInfo *ci, const char *name);
+int        comp_is_sg_writer(ClassInfo *ci, const char *name);
 void       comp_add_alias(ClassInfo *ci, const char *new_name, const char *old_name);
 /* Prepend-chain helpers. */
 void        comp_prep_chain_add(ClassInfo *ci, const char *from, const char *to);

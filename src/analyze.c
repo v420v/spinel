@@ -97,6 +97,9 @@ static int g_yvt_depth = 0;
    -1 = no override; set to the receiver's class_id while inferring
    the block body so that InstanceVariableReadNode uses the right class. */
 static int g_ie_class_id = -1;
+/* Class index of the class/module body currently being analyzed (set around
+   ClassNode/ModuleNode body traversal). -1 outside any class body. */
+static int g_cbody_class_id = -1;
 
 /* The value type of `yield` / a `<&block-param>.call` inside method mi: the
    block-body value type at a (any) call site of mi. Polymorphic, resolved from
@@ -327,6 +330,47 @@ static TyKind infer_call(Compiler *c, int id) {
       nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "class"))
     return TY_STRING;
 
+  /* Module.singleton_writer= / Module.singleton_reader */
+  if (recv >= 0 && nt_type(nt, recv) &&
+      (!strcmp(nt_type(nt, recv), "ConstantReadNode") ||
+       !strcmp(nt_type(nt, recv), "ConstantPathNode"))) {
+    const char *cn = nt_str(nt, recv, "name");
+    int ci = cn ? comp_class_index(c, cn) : -1;
+    if (ci >= 0) {
+      ClassInfo *cls = &c->classes[ci];
+      int nlen = (int)strlen(name);
+      /* setter: name ends with '=' */
+      if (nlen > 1 && name[nlen - 1] == '=') {
+        char base[256]; int blen = nlen - 1;
+        if (blen > 0 && blen < (int)sizeof(base)) {
+          memcpy(base, name, (size_t)blen); base[blen] = '\0';
+          if (comp_is_sg_writer(cls, base)) return TY_VOID;
+        }
+      } else {
+        if (comp_is_sg_reader(cls, name)) return TY_POLY;
+      }
+    }
+  }
+  /* self.singleton_writer= / self.singleton_reader: inside a class method
+     or directly in a class/module body (g_cbody_class_id). */
+  if (recv >= 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "SelfNode")) {
+    Scope *_self = comp_scope_of(c, id);
+    int _sg_cid = (_self && _self->is_cmethod && _self->class_id >= 0)
+                  ? _self->class_id : g_cbody_class_id;
+    if (_sg_cid >= 0) {
+      ClassInfo *_cls = &c->classes[_sg_cid];
+      int _nlen = (int)strlen(name);
+      if (_nlen > 1 && name[_nlen - 1] == '=') {
+        char _base[256]; int _blen = _nlen - 1;
+        if (_blen > 0 && _blen < (int)sizeof(_base)) {
+          memcpy(_base, name, (size_t)_blen); _base[_blen] = '\0';
+          if (comp_is_sg_writer(_cls, _base)) return TY_VOID;
+        }
+      }
+      else if (comp_is_sg_reader(_cls, name)) return TY_POLY;
+    }
+  }
+
   /* SomeClass.name / .to_s / .inspect -> the class-name string */
   if (recv >= 0 && argc == 0 &&
       (!strcmp(name, "name") || !strcmp(name, "to_s") || !strcmp(name, "inspect") ||
@@ -350,12 +394,20 @@ static TyKind infer_call(Compiler *c, int id) {
     if (rty && !strcmp(rty, "ConstantPathNode")) {
       const char *cn = nt_str(nt, recv, "name");
       int ci = cn ? comp_class_index(c, cn) : -1;
-      if (ci >= 0) return ty_object(ci);
+      if (ci >= 0) {
+        int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+        if (ucnew >= 0) return (TyKind)c->scopes[ucnew].ret;
+        return ty_object(ci);
+      }
     }
     if (rty && !strcmp(rty, "ConstantReadNode")) {
       const char *cn = nt_str(nt, recv, "name");
       int ci = comp_class_index(c, cn);
-      if (ci >= 0) return ty_object(ci);
+      if (ci >= 0) {
+        int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+        if (ucnew >= 0) return (TyKind)c->scopes[ucnew].ret;
+        return ty_object(ci);
+      }
       if (cn && !strcmp(cn, "Array") && argc == 2) return ty_array_of(infer_type(c, argv[1]));
       if (cn && !strcmp(cn, "Array")) {
         int blk = nt_ref(nt, id, "block");
@@ -1949,6 +2001,14 @@ static void collect_def_params(Compiler *c, int def_id, Scope *s) {
       }
     }
   }
+  /* post-splat required parameters (Prism "posts" array) */
+  int postn = 0;
+  const int *posts = nt_arr(c->nt, pn, "posts", &postn);
+  for (int i = 0; i < postn; i++) {
+    const char *pname = nt_str(c->nt, posts[i], "name");
+    if (pname) scope_add_param(s, pname, -1);
+  }
+  if (postn > 0) s->npost_rest = postn;
   int kn = 0;
   const int *kws = nt_arr(c->nt, pn, "keywords", &kn);
   for (int i = 0; i < kn; i++) {
@@ -2028,6 +2088,9 @@ static void walk_scope(Compiler *c, int id, int scope_idx, int class_id) {
     child = new_idx;
   }
 
+  int saved_cbody = g_cbody_class_id;
+  if (child_class >= 0) g_cbody_class_id = child_class;
+
   int nr = nt_num_refs(c->nt, id);
   for (int i = 0; i < nr; i++) {
     int r = nt_ref_at(c->nt, id, i);
@@ -2040,6 +2103,7 @@ static void walk_scope(Compiler *c, int id, int scope_idx, int class_id) {
     for (int j = 0; j < n; j++)
       if (ids[j] >= 0) walk_scope(c, ids[j], child, child_class);
   }
+  g_cbody_class_id = saved_cbody;
 }
 
 /* Mark methods following `module_function` in a module body as class-level
@@ -2177,8 +2241,41 @@ static void register_structs(Compiler *c) {
   }
 }
 
+/* Process attr_accessor/reader/writer call: register ivars + reader/writer names.
+   If `singleton` is non-zero, registers singleton (class-level) accessors instead. */
+static void register_attr_call(Compiler *c, ClassInfo *cls, int s, int singleton) {
+  const NodeTable *nt = c->nt;
+  const char *nm = nt_str(nt, s, "name");
+  if (!nm) return;
+  int accessor = !strcmp(nm, "attr_accessor") ||
+                 !strcmp(nm, "attribute") || !strcmp(nm, "attributes");
+  int reader = !strcmp(nm, "attr_reader") || accessor;
+  int writer = !strcmp(nm, "attr_writer") || accessor;
+  if (!reader && !writer) return;
+  int args = nt_ref(nt, s, "arguments");
+  int an = 0;
+  const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+  for (int a = 0; a < an; a++) {
+    const char *aty = nt_type(nt, argv[a]);
+    if (!aty || strcmp(aty, "SymbolNode")) continue;
+    const char *base = nt_str(nt, argv[a], "value");
+    if (!base) continue;
+    if (singleton) {
+      if (reader) comp_add_sg_reader(cls, base);
+      if (writer) comp_add_sg_writer(cls, base);
+    } else {
+      char ivname[256];
+      snprintf(ivname, sizeof ivname, "@%s", base);
+      comp_ivar_intern(cls, ivname);
+      if (reader) comp_add_reader(cls, base);
+      if (writer) comp_add_writer(cls, base);
+    }
+  }
+}
+
 /* Collect attr_reader/attr_writer/attr_accessor declarations in class
-   bodies, registering backing ivars + reader/writer method names. */
+   bodies, registering backing ivars + reader/writer method names.
+   Also scans class << self bodies for singleton-level attr_accessors. */
 static void register_attrs(Compiler *c) {
   const NodeTable *nt = c->nt;
   for (int ci = 0; ci < c->nclasses; ci++) {
@@ -2189,27 +2286,21 @@ static void register_attrs(Compiler *c) {
     for (int k = 0; k < n; k++) {
       int s = stmts[k];
       const char *sty = nt_type(nt, s);
-      if (!sty || strcmp(sty, "CallNode")) continue;
-      const char *nm = nt_str(nt, s, "name");
-      if (!nm) continue;
-      int accessor = !strcmp(nm, "attr_accessor") ||
-                     !strcmp(nm, "attribute") || !strcmp(nm, "attributes");
-      int reader = !strcmp(nm, "attr_reader") || accessor;
-      int writer = !strcmp(nm, "attr_writer") || accessor;
-      if (!reader && !writer) continue;
-      int args = nt_ref(nt, s, "arguments");
-      int an = 0;
-      const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
-      for (int a = 0; a < an; a++) {
-        const char *aty = nt_type(nt, argv[a]);
-        if (!aty || strcmp(aty, "SymbolNode")) continue;
-        const char *base = nt_str(nt, argv[a], "value");
-        if (!base) continue;
-        char ivname[256];
-        snprintf(ivname, sizeof ivname, "@%s", base);
-        comp_ivar_intern(cls, ivname);
-        if (reader) comp_add_reader(cls, base);
-        if (writer) comp_add_writer(cls, base);
+      if (!sty) continue;
+      if (!strcmp(sty, "CallNode")) {
+        register_attr_call(c, cls, s, 0);
+      } else if (!strcmp(sty, "SingletonClassNode")) {
+        /* class << self; attr_accessor :x; end */
+        int sbody = nt_ref(nt, s, "body");
+        if (sbody < 0) continue;
+        int sn = 0;
+        const int *sstmts = nt_arr(nt, sbody, "body", &sn);
+        for (int j = 0; j < sn; j++) {
+          int ss = sstmts[j];
+          const char *ssty = nt_type(nt, ss);
+          if (ssty && !strcmp(ssty, "CallNode"))
+            register_attr_call(c, cls, ss, 1);
+        }
       }
     }
   }
@@ -3539,6 +3630,20 @@ static int bind_call_params(Compiler *c, int call_id, int mi) {
       if (pr != TY_UNKNOWN && p->proc_ret != (int)pr) { p->proc_ret = (int)pr; changed = 1; }
     }
   }
+  /* Post-splat required params: bind from the end of the positional args. */
+  if (m->rest_idx >= 0 && m->npost_rest > 0) {
+    for (int j = 0; j < m->npost_rest; j++) {
+      int pi = m->rest_idx + 1 + j;
+      int ai = pos_argc - m->npost_rest + j;
+      if (pi >= m->nparams || ai < 0 || ai >= pos_argc || !argv) continue;
+      TyKind at = infer_type(c, argv[ai]);
+      if (at == TY_NIL) at = TY_POLY;
+      LocalVar *p = scope_local(m, m->pnames[pi]);
+      if (!p) continue;
+      TyKind merged = ty_unify(p->type, at);
+      if (merged != p->type) { p->type = merged; changed = 1; }
+    }
+  }
   /* Keyword arguments: match KeywordHashNode elements to named params. */
   if (kwh >= 0) {
     int en = 0;
@@ -3845,8 +3950,13 @@ static int infer_param_types(Compiler *c) {
       if (rty && !strcmp(rty, "ConstantPathNode")) {
         const char *cn = nt_str(nt, recv, "name");
         int ci = cn ? comp_class_index(c, cn) : -1;
-        if (ci >= 0 && !strcmp(name, "new"))
-          changed |= bind_call_params(c, id, comp_method_in_chain(c, ci, "initialize", NULL));
+        if (ci >= 0 && !strcmp(name, "new")) {
+          int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+          if (ucnew >= 0)
+            changed |= bind_call_params(c, id, ucnew);
+          else
+            changed |= bind_call_params(c, id, comp_method_in_chain(c, ci, "initialize", NULL));
+        }
         else if (ci >= 0)
           changed |= bind_call_params(c, id, comp_cmethod_in_chain(c, ci, name, NULL));
       }
@@ -3880,8 +3990,13 @@ static int infer_param_types(Compiler *c) {
             }
             continue;
           }
-          if (!strcmp(name, "new"))
-            changed |= bind_call_params(c, id, comp_method_in_chain(c, ci, "initialize", NULL));
+          if (!strcmp(name, "new")) {
+            int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+            if (ucnew >= 0)
+              changed |= bind_call_params(c, id, ucnew);
+            else
+              changed |= bind_call_params(c, id, comp_method_in_chain(c, ci, "initialize", NULL));
+          }
           else
             changed |= bind_call_params(c, id, comp_cmethod_in_chain(c, ci, name, NULL));
           continue;
