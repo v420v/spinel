@@ -6832,6 +6832,16 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       emit_expr(c, argv[0], b); buf_printf(b, "), %d)", eq ? 0 : 1);
       return;
     }
+    /* object vs nil: identity/pointer comparison (Object#== fallback).
+       A non-nullable TY_OBJECT pointer is never NULL, so obj==nil=false
+       and obj!=nil=true. A nullable object also works correctly via NULL. */
+    if ((ty_is_object(rt) && a0 == TY_NIL) || (rt == TY_NIL && ty_is_object(a0))) {
+      int obj_n = ty_is_object(rt) ? recv : argv[0];
+      buf_puts(b, "(");
+      emit_expr(c, obj_n, b);
+      buf_printf(b, " %s NULL)", eq ? "==" : "!=");
+      return;
+    }
     unsupported(c, id, "equality");
   }
 
