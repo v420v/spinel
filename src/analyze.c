@@ -3803,10 +3803,11 @@ static int infer_write_types(Compiler *c) {
           if (_wval < 0) continue;
           TyKind _wt = infer_type(c, _wval);
           if (_wt != TY_UNKNOWN && _wt != TY_NIL) { has_typed_write = 1; break; }
-          /* @ivar = [] or @ivar = {} literal: this slot is an array/hash, not
-             subject to hash-promotion from [] read or [0]= write. */
+          /* @ivar = [] literal: this slot is an array, not subject to
+             hash-promotion from [] read or [0]= write. Empty {} does NOT
+             block promotion — the hash type is determined by key/value usage. */
           const char *_wvty = nt_type(nt, _wval);
-          if (_wvty && (!strcmp(_wvty, "ArrayNode") || !strcmp(_wvty, "HashNode")))
+          if (_wvty && !strcmp(_wvty, "ArrayNode"))
             has_typed_write = 1;
         }
         if (has_typed_write) continue;
