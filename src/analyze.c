@@ -3629,7 +3629,7 @@ static int infer_write_types(Compiler *c) {
   for (int id = 0; id < nt->count; id++) {
     const char *ty = nt_type(nt, id);
     if (!ty) continue;
-    int recv, kt = TY_UNKNOWN, vt = TY_UNKNOWN, is_push = 0;
+    int recv, kt = TY_UNKNOWN, vt = TY_UNKNOWN, is_push = 0, is_idx_write = 0;
     if (!strcmp(ty, "CallNode")) {
       recv = nt_ref(nt, id, "receiver");
       const char *name = nt_str(nt, id, "name");
@@ -3640,7 +3640,7 @@ static int infer_write_types(Compiler *c) {
         is_push = 1; vt = infer_type(c, argv[0]);
       }
       else if (name && !strcmp(name, "[]=") && an == 2) {
-        kt = infer_type(c, argv[0]); vt = infer_type(c, argv[1]);
+        is_idx_write = 1; kt = infer_type(c, argv[0]); vt = infer_type(c, argv[1]);
       }
       else if (name && (!strcmp(name, "fetch") || !strcmp(name, "[]")) && an >= 1) {
         /* hash.fetch(key,..) / hash[key]: promote TY_UNKNOWN local to a typed hash.
@@ -3688,6 +3688,7 @@ static int infer_write_types(Compiler *c) {
       else continue;
     }
     else if (!strcmp(ty, "IndexOperatorWriteNode")) {
+      is_idx_write = 1;
       recv = nt_ref(nt, id, "receiver");
       int args = nt_ref(nt, id, "arguments");
       int an = 0;
@@ -3723,7 +3724,7 @@ static int infer_write_types(Compiler *c) {
          (but allow push-driven array promotion through). Without this guard,
          @free[0] read promotes @free to poly_poly_hash before @free = []
          has been processed as an array. */
-      if (!is_push && *slot == TY_UNKNOWN && inm) {
+      if (!is_push && !is_idx_write && *slot == TY_UNKNOWN && inm) {
         int has_typed_write = 0;
         for (int _wi = 0; _wi < nt->count && !has_typed_write; _wi++) {
           if (!nt_type(nt, _wi) || strcmp(nt_type(nt, _wi), "InstanceVariableWriteNode")) continue;
@@ -3985,6 +3986,64 @@ static int is_string_only_method(const char *m) {
     "force_encoding", NULL };
   for (int i = 0; set[i]; i++) if (!strcmp(m, set[i])) return 1;
   return 0;
+}
+
+/* Infer still-unknown params from ivar hash operations in the method body.
+   For `def []=(key, val); @h[key] = val; end` where @h is a known hash type,
+   infer key/val from the hash's key/value types.  Also handles `[]` reads.
+   Runs post-fixpoint so ivar types are stable before this fires. */
+static int infer_params_from_ivar_hash_ops(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *name = nt_str(nt, id, "name");
+    if (!name) continue;
+    int is_set = !strcmp(name, "[]=");
+    int is_get = !strcmp(name, "[]");
+    if (!is_set && !is_get) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0) continue;
+    const char *rty = nt_type(nt, recv);
+    if (!rty || strcmp(rty, "InstanceVariableReadNode")) continue;
+    const char *inm = nt_str(nt, recv, "name");
+    if (!inm) continue;
+    Scope *s = comp_scope_of(c, id);
+    if (!s || s->class_id < 0) continue;
+    ClassInfo *ci = &c->classes[s->class_id];
+    int iv = comp_ivar_index(ci, inm);
+    if (iv < 0) continue;
+    TyKind ht = ci->ivar_types[iv];
+    if (!ty_is_hash(ht) || ht == TY_POLY_POLY_HASH) continue;
+    TyKind hk = ty_hash_key(ht);
+    TyKind hv = ty_hash_val(ht);
+    int args = nt_ref(nt, id, "arguments");
+    int an = 0;
+    const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+    /* [](key) => key is hash key type; []=(key, val) => key + val */
+    if (an >= 1 && argv && hk != TY_UNKNOWN) {
+      const char *aty = nt_type(nt, argv[0]);
+      if (aty && !strcmp(aty, "LocalVariableReadNode")) {
+        const char *anm = nt_str(nt, argv[0], "name");
+        LocalVar *lv = anm ? scope_local(s, anm) : NULL;
+        if (lv && lv->is_param && lv->type == TY_UNKNOWN) {
+          lv->type = hk; changed = 1;
+        }
+      }
+    }
+    if (is_set && an >= 2 && argv && hv != TY_UNKNOWN) {
+      const char *aty = nt_type(nt, argv[1]);
+      if (aty && !strcmp(aty, "LocalVariableReadNode")) {
+        const char *anm = nt_str(nt, argv[1], "name");
+        LocalVar *lv = anm ? scope_local(s, anm) : NULL;
+        if (lv && lv->is_param && lv->type == TY_UNKNOWN) {
+          lv->type = hv; changed = 1;
+        }
+      }
+    }
+  }
+  return changed;
 }
 
 /* Infer a still-unknown parameter as a typed hash when the body indexes
@@ -4534,6 +4593,12 @@ static int infer_block_params(Compiler *c) {
           const char *cname = nt_str(nt, recv, "name");
           int cid = cname ? comp_class_index(c, cname) : -1;
           if (cid >= 0) mi = comp_method_in_chain(c, cid, "initialize", NULL);
+        }
+        /* Class.method { ... }: look up the class method */
+        if (mi < 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode")) {
+          const char *cname = nt_str(nt, recv, "name");
+          int cid = cname ? comp_class_index(c, cname) : -1;
+          if (cid >= 0) mi = comp_cmethod_in_chain(c, cid, name, NULL);
         }
       }
       if (mi >= 0 && c->scopes[mi].yields) {
@@ -5754,7 +5819,7 @@ void analyze_program(Compiler *c) {
      from how it is used inside the method body (hash subscript patterns,
      array-specific calls). Runs after the main fixpoint so caller-side
      types always win; the mini-loop below propagates the new types. */
-  if (infer_hash_params(c) | infer_array_params(c)) {
+  if (infer_hash_params(c) | infer_array_params(c) | infer_params_from_ivar_hash_ops(c)) {
     for (int iter = 0; iter < 16; iter++) {
       int ch = 0;
       ch |= infer_param_types(c);
