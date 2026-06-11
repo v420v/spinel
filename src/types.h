@@ -37,6 +37,7 @@ typedef enum {
   TY_STR_POLY_HASH,  /* string keys, boxed (poly) values */
   TY_POLY_POLY_HASH, /* heterogeneous keys and values (both sp_RbVal) */
   TY_PROC,         /* a first-class Proc/lambda value (sp_Proc *) */
+  TY_CLASS,        /* a Class/Module value (sp_Class, carries cls_id) */
   TY_POLY          /* union / top: a value whose static type widened */
 } TyKind;
 

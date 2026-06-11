@@ -359,6 +359,7 @@ static const char *c_type_name(TyKind t) {
     case TY_POLY:         return "sp_RbVal";
     case TY_POLY_ARRAY:   return "sp_PolyArray *";
     case TY_PROC:         return "sp_Proc *";
+    case TY_CLASS:        return "sp_Class";
     default:             return NULL;
   }
 }
@@ -366,7 +367,7 @@ static int is_scalar_ret(TyKind t) {
   return t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_STRING ||
          t == TY_SYMBOL || t == TY_RANGE || t == TY_TIME || t == TY_STRINGIO || t == TY_STRINGSCANNER || t == TY_MATCHDATA || t == TY_REGEX || t == TY_EXCEPTION ||
          t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY ||
-         t == TY_POLY || t == TY_POLY_ARRAY || t == TY_PROC ||
+         t == TY_POLY || t == TY_POLY_ARRAY || t == TY_PROC || t == TY_CLASS ||
          ty_is_hash(t) || ty_is_object(t);
 }
 static const char *default_value(TyKind t) {
@@ -389,6 +390,7 @@ static const char *default_value(TyKind t) {
     case TY_POLY_ARRAY: return "NULL";
     case TY_PROC:    return "NULL";
     case TY_POLY:    return "sp_box_nil()";
+    case TY_CLASS:   return "((sp_Class){-1})";
     default:        return (ty_is_hash(t) || ty_is_object(t)) ? "NULL" : "0";
   }
 }
@@ -417,6 +419,7 @@ static void emit_box_open(Compiler *c, TyKind t, Buf *b) {
   else if (t == TY_FLOAT_ARRAY) buf_puts(b, "sp_box_float_array(");
   else if (t == TY_STR_ARRAY)   buf_puts(b, "sp_box_str_array(");
   else if (t == TY_POLY_ARRAY)  buf_puts(b, "sp_box_poly_array(");
+  else if (t == TY_CLASS) buf_puts(b, "sp_box_class(");
   else if (ty_is_object(t)) {
     int cid = ty_object_class(t);
     buf_printf(b, "sp_box_obj((%s *)( ", c->classes[cid].name);
@@ -4410,6 +4413,36 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (rt == TY_POLY) {
       buf_puts(b, "sp_poly_class_name("); emit_expr(c, recv, b); buf_puts(b, ")");
       return;
+    }
+  }
+
+  /* TY_CLASS method dispatch */
+  if (recv >= 0 && comp_ntype(c, recv) == TY_CLASS) {
+    int _clt = ++g_tmp;
+    if (!strcmp(name, "to_s") || !strcmp(name, "name") || !strcmp(name, "inspect")) {
+      buf_printf(b, "({ sp_Class _cl%d = ", _clt); emit_expr(c, recv, b);
+      buf_printf(b, "; sp_class_to_s(_cl%d); })", _clt);
+      return;
+    }
+    if (!strcmp(name, "nil?")) { buf_puts(b, "0"); return; }
+    if (!strcmp(name, "class")) { buf_puts(b, "SPL(\"Class\")"); return; }
+    if (!strcmp(name, "==" ) && argc == 1) {
+      TyKind at = comp_ntype(c, argv[0]);
+      if (at == TY_CLASS) {
+        buf_printf(b, "({ sp_Class _cl%d = ", _clt); emit_expr(c, recv, b);
+        buf_printf(b, "; sp_Class _cl%da = ", _clt); emit_expr(c, argv[0], b);
+        buf_printf(b, "; _cl%d.cls_id == _cl%da.cls_id; })", _clt, _clt);
+        return;
+      }
+    }
+    if (!strcmp(name, "!=" ) && argc == 1) {
+      TyKind at = comp_ntype(c, argv[0]);
+      if (at == TY_CLASS) {
+        buf_printf(b, "({ sp_Class _cl%d = ", _clt); emit_expr(c, recv, b);
+        buf_printf(b, "; sp_Class _cl%da = ", _clt); emit_expr(c, argv[0], b);
+        buf_printf(b, "; _cl%d.cls_id != _cl%da.cls_id; })", _clt, _clt);
+        return;
+      }
     }
   }
 
@@ -11735,9 +11768,9 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     if (nm) {
       int _cidx = comp_class_index(c, nm);
       if (_cidx >= 0)
-        buf_printf(b, "sp_box_class((sp_Class){%d})", _cidx);  /* class as value */
+        buf_printf(b, "((sp_Class){%d})", _cidx);  /* class as value: TY_CLASS unboxed */
       else
-        buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant %s\"), (const char*)NULL)", nm);
+        buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant %s\"), ((sp_Class){-1}))", nm);
     }
     else unsupported(c, id, "constant read");
     return;
@@ -11777,13 +11810,18 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
       buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant Integer::%s\"), 0)", nm);
       return;
     }
+    /* class/module constant as value */
+    if (nm) {
+      int _cpidx = comp_class_index(c, nm);
+      if (_cpidx >= 0) { buf_printf(b, "((sp_Class){%d})", _cpidx); return; }
+    }
     /* unresolved qualified constant: raise NameError at runtime */
     {
       char fullname[512];
       if (par_nmc && nm) snprintf(fullname, sizeof fullname, "%s::%s", par_nmc, nm);
       else if (nm) snprintf(fullname, sizeof fullname, "%s", nm);
       else snprintf(fullname, sizeof fullname, "?");
-      buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant %s\"), (mrb_int)0)", fullname);
+      buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant %s\"), ((sp_Class){-1}))", fullname);
     }
     return;
   }
@@ -15111,6 +15149,7 @@ static void emit_boxed_text(Compiler *c, TyKind t, const char *expr, Buf *b) {
     case TY_SYMBOL: fn = "sp_box_sym"; break;     case TY_RANGE: fn = "sp_box_range"; break;
     case TY_TIME: fn = "sp_box_time"; break;
     case TY_PROC: fn = "sp_box_proc"; break;
+    case TY_CLASS: fn = "sp_box_class"; break;
     case TY_INT_ARRAY: fn = "sp_box_int_array"; break;
     case TY_FLOAT_ARRAY: fn = "sp_box_float_array"; break;
     case TY_STR_ARRAY: fn = "sp_box_str_array"; break;
@@ -15159,11 +15198,9 @@ static void emit_boxed(Compiler *c, int node, Buf *b) {
   }
   /* regex values can appear in poly context (multi-typed local); box as nil */
   if (t == TY_REGEX) { buf_puts(b, "sp_box_nil()"); return; }
-  /* class constant (e.g. `A` in `slot = A`): box as sp_Class value */
-  if (t == TY_UNKNOWN && nt_type(c->nt, node) && !strcmp(nt_type(c->nt, node), "ConstantReadNode")) {
-    const char *_cnm = nt_str(c->nt, node, "name");
-    int _cidx = _cnm ? comp_class_index(c, _cnm) : -1;
-    if (_cidx >= 0) { buf_printf(b, "sp_box_class((sp_Class){%d})", _cidx); return; }
+  /* class/module value: box into poly */
+  if (t == TY_CLASS) {
+    buf_puts(b, "sp_box_class("); emit_expr(c, node, b); buf_puts(b, ")"); return;
   }
   /* an empty array literal [] has TY_UNKNOWN; box it as an empty PolyArray so
      it can hold any element type when stored into a poly slot */
@@ -15224,6 +15261,7 @@ static void declare_local(Compiler *c, Buf *b, LocalVar *lv, int vol) {
     case TY_TIME:   buf_puts(&cty, "sp_Time"); init = "{0}"; break;
     case TY_STRING: buf_puts(&cty, "const char *"); init = "(&(\"\\xff\")[1])"; ptr = 1; break;
     case TY_POLY:   buf_puts(&cty, "sp_RbVal"); init = "sp_box_nil()"; break;
+    case TY_CLASS:  buf_puts(&cty, "sp_Class"); init = "((sp_Class){-1})"; break;
     default:
       if (is_scalar_ret(t) && t != TY_UNKNOWN) { emit_ctype(c, t, &cty); init = "NULL"; ptr = 1; }
       else {

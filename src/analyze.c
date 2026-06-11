@@ -1967,6 +1967,7 @@ static TyKind infer_uncached(Compiler *c, int id) {
                !strcmp(nm, "RUBY_ENGINE_VERSION") || !strcmp(nm, "RUBY_RELEASE_DATE") ||
                !strcmp(nm, "RUBY_REVISION") || !strcmp(nm, "RUBY_COPYRIGHT"))) return TY_STRING;
     if (nm && !strcmp(nm, "ARGV")) return TY_STR_ARRAY;
+    if (nm && comp_class_index(c, nm) >= 0) return TY_CLASS;
     return TY_UNKNOWN;
   }
   if (!strcmp(ty, "DefinedNode")) return TY_STRING;  /* a label string, or nil (NULL) */
@@ -1998,6 +1999,7 @@ static TyKind infer_uncached(Compiler *c, int id) {
     if (par_nm && !strcmp(par_nm, "Integer")) {
       if (nm && (!strcmp(nm, "MAX") || !strcmp(nm, "MIN"))) return TY_UNKNOWN; /* raises NameError */
     }
+    if (nm && comp_class_index(c, nm) >= 0) return TY_CLASS;
     return TY_UNKNOWN;
   }
   if (!strcmp(ty, "SelfNode")) {
