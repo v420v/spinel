@@ -3951,18 +3951,57 @@ static int bind_call_params(Compiler *c, int call_id, int mi) {
   if (kwh >= 0) {
     int en = 0;
     const int *elems = nt_arr(nt, kwh, "elements", &en);
+    /* Check for a double-splat (**h) covering all keyword params. */
+    TyKind ds_val = TY_UNKNOWN;
     for (int e = 0; e < en; e++) {
-      int key = nt_ref(nt, elems[e], "key");
-      int val = nt_ref(nt, elems[e], "value");
-      if (key < 0 || val < 0) continue;
-      const char *kty = nt_type(nt, key);
-      const char *kname = (kty && !strcmp(kty, "SymbolNode")) ? nt_str(nt, key, "value") : NULL;
-      if (!kname) continue;
-      LocalVar *p = scope_local(m, kname);
-      if (!p) continue;
-      TyKind at = infer_type(c, val);
-      TyKind merged = ty_unify(p->type, at);
-      if (merged != p->type) { p->type = merged; changed = 1; }
+      const char *ety = nt_type(nt, elems[e]);
+      if (ety && !strcmp(ety, "AssocSplatNode")) {
+        int inner = nt_ref(nt, elems[e], "value");
+        if (inner >= 0) {
+          TyKind ht = infer_type(c, inner);
+          if (ty_is_hash(ht)) ds_val = ty_hash_val(ht);
+        }
+        break;
+      }
+    }
+    if (ds_val != TY_UNKNOWN) {
+      /* Bind all keyword params of the callee from the splat hash value type. */
+      TyKind at = (ds_val == TY_POLY) ? TY_POLY : ds_val;
+      if (at == TY_NIL) at = TY_POLY;
+      for (int i = 0; i < m->nparams; i++) {
+        if (!m->pnames[i]) continue;
+        LocalVar *p = scope_local(m, m->pnames[i]);
+        if (!p) continue;
+        TyKind merged = ty_unify(p->type, at);
+        if (merged != p->type) { p->type = merged; changed = 1; }
+      }
+    } else {
+      int any_kw_bound = 0;
+      for (int e = 0; e < en; e++) {
+        int key = nt_ref(nt, elems[e], "key");
+        int val = nt_ref(nt, elems[e], "value");
+        if (key < 0 || val < 0) continue;
+        const char *kty = nt_type(nt, key);
+        const char *kname = (kty && !strcmp(kty, "SymbolNode")) ? nt_str(nt, key, "value") : NULL;
+        if (!kname) continue;
+        LocalVar *p = scope_local(m, kname);
+        if (!p) continue;
+        TyKind at = infer_type(c, val);
+        TyKind merged = ty_unify(p->type, at);
+        if (merged != p->type) { p->type = merged; changed = 1; }
+        any_kw_bound = 1;
+      }
+      /* Ruby collapses trailing kwargs into a positional hash parameter when
+         the callee has no named keyword params (e.g. `def f(opts = {})`
+         called as `f(key: val)`). Bind the next unbound positional param
+         to TY_SYM_POLY_HASH so the backstop doesn't kill the method. */
+      if (!any_kw_bound && pos_argc < max_bind && max_bind > 0) {
+        LocalVar *p = m->pnames[pos_argc] ? scope_local(m, m->pnames[pos_argc]) : NULL;
+        if (p) {
+          TyKind merged = ty_unify(p->type, TY_SYM_POLY_HASH);
+          if (merged != p->type) { p->type = merged; changed = 1; }
+        }
+      }
     }
   }
   return changed;
@@ -4010,7 +4049,16 @@ static int infer_default_param_types(Compiler *c) {
     for (int i = 0; i < sc->nparams; i++) {
       if (sc->pdefault[i] < 0) continue;
       TyKind dt = infer_type(c, sc->pdefault[i]);
-      if (dt == TY_NIL) continue;  /* nil default doesn't pin the type */
+      /* An empty hash `{}` default returns TY_UNKNOWN from infer_type; treat
+         it as TY_SYM_POLY_HASH since it is used as a kwargs receiver. */
+      if (dt == TY_UNKNOWN) {
+        const char *dty = nt_type(c->nt, sc->pdefault[i]);
+        if (dty && (!strcmp(dty, "HashNode") || !strcmp(dty, "KeywordHashNode"))) {
+          int dn = 0; nt_arr(c->nt, sc->pdefault[i], "elements", &dn);
+          if (dn == 0) dt = TY_SYM_POLY_HASH;
+        }
+      }
+      if (dt == TY_NIL || dt == TY_UNKNOWN) continue;
       LocalVar *p = scope_local(sc, sc->pnames[i]);
       if (!p) continue;
       TyKind merged = ty_unify(p->type, dt);

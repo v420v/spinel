@@ -2859,6 +2859,31 @@ static void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const ch
     kwh = argv[argc - 1];
     pos_argc = argc - 1;
   }
+  /* Detect double-splat (**hash) inside kwh: AssocSplatNode wrapping a hash expr.
+     Pre-evaluate the hash to a temp so we can do per-param lookups. */
+  int ds_hash_tmp = -1;  TyKind ds_hash_type = TY_UNKNOWN;
+  if (kwh >= 0) {
+    int en2 = 0; const int *elems2 = nt_arr(nt, kwh, "elements", &en2);
+    for (int e = 0; e < en2; e++) {
+      const char *ety2 = nt_type(nt, elems2[e]);
+      if (ety2 && !strcmp(ety2, "AssocSplatNode")) {
+        int inner2 = nt_ref(nt, elems2[e], "value");
+        if (inner2 >= 0) {
+          ds_hash_type = comp_ntype(c, inner2);
+          if (ty_is_hash(ds_hash_type)) {
+            ds_hash_tmp = ++g_tmp;
+            emit_indent(g_pre, g_indent);
+            emit_ctype(c, ds_hash_type, g_pre);
+            buf_printf(g_pre, " _t%d = ", ds_hash_tmp);
+            emit_expr(c, inner2, g_pre);
+            buf_puts(g_pre, ";\n");
+          }
+        }
+        break;
+      }
+    }
+  }
+
   /* Find the first SplatNode in positional args. If it comes before rest_idx
      (or before nparams for rest-less methods), pre-evaluate it to a temp so
      we can index into it per fixed param. */
@@ -2912,6 +2937,31 @@ static void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const ch
       int kv = kwh >= 0 ? kwh_lookup(nt, kwh, m->pnames[i]) : -1;
       if (kv >= 0) {
         emit_arg_or_default(c, m, i, kv, out);
+      }
+      else if (ds_hash_tmp >= 0 && m->pnames[i]) {
+        /* Double-splat: extract param by name from the pre-eval'd hash. */
+        const char *hn = ty_hash_cname(ds_hash_type);
+        LocalVar *plv = scope_local(m, m->pnames[i]);
+        TyKind pt = plv ? plv->type : TY_INT;
+        if (hn) {
+          /* SymPoly: get returns sp_RbVal, unbox to param type.
+             Other sym/str keyed hashes: get returns the value type directly. */
+          TyKind hval = ty_hash_val(ds_hash_type);
+          if (hval == TY_POLY) {
+            char get_expr[128];
+            snprintf(get_expr, sizeof get_expr,
+                     "sp_%sHash_get(_t%d, sp_sym_intern(\"%s\"))",
+                     hn, ds_hash_tmp, m->pnames[i]);
+            emit_unbox_text(c, pt, get_expr, out);
+          }
+          else {
+            buf_printf(out, "sp_%sHash_get(_t%d, sp_sym_intern(\"%s\"))",
+                       hn, ds_hash_tmp, m->pnames[i]);
+          }
+        }
+        else {
+          buf_printf(out, "%s", default_value(pt));
+        }
       }
       else if (i < pos_argc) {
         emit_arg_or_default(c, m, i, argv[i], out);
@@ -3348,11 +3398,12 @@ static int emit_each_with_object_expr(Compiler *c, int id, Buf *b) {
   emit_indent(g_pre, g_indent); emit_ctype(c, accT, g_pre);
   buf_printf(g_pre, " _t%d = %s;\n", tacc, accb.p ? accb.p : default_value(accT)); free(accb.p);
 
-  /* Save outer vars if block params shadow them */
+  /* Save outer vars if block params shadow them (same-type only) */
   Scope *cs = comp_scope_of(c, id);
   LocalVar *outer_p0 = (p0 && cs) ? scope_local(cs, p0) : NULL;
   int ts_p0 = 0;
-  if (outer_p0) {
+  int p0_mismatch = outer_p0 && outer_p0->type != et;
+  if (outer_p0 && !p0_mismatch) {
     ts_p0 = ++g_tmp;
     Buf ot; memset(&ot, 0, sizeof ot); emit_ctype(c, outer_p0->type, &ot);
     emit_indent(g_pre, g_indent);
@@ -3360,61 +3411,117 @@ static int emit_each_with_object_expr(Compiler *c, int id, Buf *b) {
   }
   LocalVar *outer_p1 = (p1 && cs) ? scope_local(cs, p1) : NULL;
   int ts_p1 = 0;
-  if (outer_p1) {
+  int p1_mismatch = outer_p1 && outer_p1->type != accT;
+  if (outer_p1 && !p1_mismatch) {
     ts_p1 = ++g_tmp;
     Buf ot; memset(&ot, 0, sizeof ot); emit_ctype(c, outer_p1->type, &ot);
     emit_indent(g_pre, g_indent);
     buf_printf(g_pre, "%s _t%d = lv_%s;\n", ot.p ? ot.p : "mrb_int", ts_p1, p1); free(ot.p);
   }
 
-  /* Bind accumulator to p1 before loop */
-  if (p1) {
-    emit_indent(g_pre, g_indent);
-    TyKind p1_type = outer_p1 ? outer_p1->type : accT;
-    if (p1_type == TY_POLY && accT != TY_POLY) {
-      char tacc_s[32]; snprintf(tacc_s, sizeof tacc_s, "_t%d", tacc);
-      Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, accT, tacc_s, &bx);
-      buf_printf(g_pre, "lv_%s = %s;\n", p1, bx.p ? bx.p : tacc_s); free(bx.p);
+  /* When block params shadow outer vars with different types, open a C scope
+     and declare typed inner shadows so the body dispatches correctly. */
+  int need_scope = p0_mismatch || p1_mismatch;
+  if (need_scope) {
+    emit_indent(g_pre, g_indent); buf_puts(g_pre, "{\n");
+    g_indent++;
+    if (p1_mismatch) {
+      emit_indent(g_pre, g_indent);
+      emit_ctype(c, accT, g_pre);
+      buf_printf(g_pre, " lv_%s = _t%d;\n", p1, tacc);
     }
-    else {
+    /* Temporarily override types for body dispatch */
+    TyKind saved_p0_type = outer_p0 ? outer_p0->type : TY_UNKNOWN;
+    TyKind saved_p1_type = outer_p1 ? outer_p1->type : TY_UNKNOWN;
+    if (p0_mismatch) outer_p0->type = et;
+    if (p1_mismatch) outer_p1->type = accT;
+    for (int j = 0; j < bn; j++) infer_type(c, bb[j]);
+    /* Bind accumulator to p1 before loop (type now matches) */
+    if (p1 && !p1_mismatch) {
+      emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "lv_%s = _t%d;\n", p1, tacc);
     }
-  }
-
-  /* Loop */
-  int ti = ++g_tmp;
-  emit_indent(g_pre, g_indent);
-  buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
-             ti, ti, k, trecv, ti);
-
-  /* Assign element to p0 */
-  if (p0) {
-    emit_indent(g_pre, g_indent + 1);
-    TyKind p0_type = outer_p0 ? outer_p0->type : et;
-    if (p0_type == TY_POLY && et != TY_POLY) {
-      char elem_s[64];
-      snprintf(elem_s, sizeof elem_s, "sp_%sArray_get(_t%d, _t%d)", k, trecv, ti);
-      Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, et, elem_s, &bx);
-      buf_printf(g_pre, "lv_%s = %s;\n", p0, bx.p ? bx.p : elem_s); free(bx.p);
+    /* Loop */
+    int ti = ++g_tmp;
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
+               ti, ti, k, trecv, ti);
+    if (p0) {
+      emit_indent(g_pre, g_indent + 1);
+      if (p0_mismatch) {
+        emit_ctype(c, et, g_pre);
+        buf_printf(g_pre, " lv_%s = sp_%sArray_get(_t%d, _t%d);\n", p0, k, trecv, ti);
+      }
+      else if (outer_p0 && outer_p0->type == TY_POLY && et != TY_POLY) {
+        char elem_s[64];
+        snprintf(elem_s, sizeof elem_s, "sp_%sArray_get(_t%d, _t%d)", k, trecv, ti);
+        Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, et, elem_s, &bx);
+        buf_printf(g_pre, "lv_%s = %s;\n", p0, bx.p ? bx.p : elem_s); free(bx.p);
+      }
+      else {
+        buf_printf(g_pre, "lv_%s = sp_%sArray_get(_t%d, _t%d);\n", p0, k, trecv, ti);
+      }
     }
-    else {
-      buf_printf(g_pre, "lv_%s = sp_%sArray_get(_t%d, _t%d);\n", p0, k, trecv, ti);
+    int save_indent = g_indent; g_indent++;
+    for (int j = 0; j < bn; j++) emit_stmt(c, bb[j], g_pre, g_indent);
+    g_indent = save_indent;
+    emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+    /* Restore types */
+    if (p0_mismatch) { outer_p0->type = saved_p0_type; for (int j = 0; j < bn; j++) infer_type(c, bb[j]); }
+    if (p1_mismatch) { outer_p1->type = saved_p1_type; for (int j = 0; j < bn; j++) infer_type(c, bb[j]); }
+    g_indent--;
+    emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+  }
+  else {
+    /* Bind accumulator to p1 before loop */
+    if (p1) {
+      emit_indent(g_pre, g_indent);
+      TyKind p1_type = outer_p1 ? outer_p1->type : accT;
+      if (p1_type == TY_POLY && accT != TY_POLY) {
+        char tacc_s[32]; snprintf(tacc_s, sizeof tacc_s, "_t%d", tacc);
+        Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, accT, tacc_s, &bx);
+        buf_printf(g_pre, "lv_%s = %s;\n", p1, bx.p ? bx.p : tacc_s); free(bx.p);
+      }
+      else {
+        buf_printf(g_pre, "lv_%s = _t%d;\n", p1, tacc);
+      }
     }
-  }
 
-  /* Body */
-  int save_indent = g_indent; g_indent++;
-  for (int j = 0; j < bn; j++) emit_stmt(c, bb[j], g_pre, g_indent);
-  g_indent = save_indent;
+    /* Loop */
+    int ti = ++g_tmp;
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {\n",
+               ti, ti, k, trecv, ti);
 
-  emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+    /* Assign element to p0 */
+    if (p0) {
+      emit_indent(g_pre, g_indent + 1);
+      TyKind p0_type = outer_p0 ? outer_p0->type : et;
+      if (p0_type == TY_POLY && et != TY_POLY) {
+        char elem_s[64];
+        snprintf(elem_s, sizeof elem_s, "sp_%sArray_get(_t%d, _t%d)", k, trecv, ti);
+        Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, et, elem_s, &bx);
+        buf_printf(g_pre, "lv_%s = %s;\n", p0, bx.p ? bx.p : elem_s); free(bx.p);
+      }
+      else {
+        buf_printf(g_pre, "lv_%s = sp_%sArray_get(_t%d, _t%d);\n", p0, k, trecv, ti);
+      }
+    }
 
-  /* Restore outer vars */
-  if (p0 && ts_p0 > 0) {
-    emit_indent(g_pre, g_indent); buf_printf(g_pre, "lv_%s = _t%d;\n", p0, ts_p0);
-  }
-  if (p1 && ts_p1 > 0) {
-    emit_indent(g_pre, g_indent); buf_printf(g_pre, "lv_%s = _t%d;\n", p1, ts_p1);
+    /* Body */
+    int save_indent = g_indent; g_indent++;
+    for (int j = 0; j < bn; j++) emit_stmt(c, bb[j], g_pre, g_indent);
+    g_indent = save_indent;
+
+    emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+
+    /* Restore outer vars */
+    if (p0 && ts_p0 > 0) {
+      emit_indent(g_pre, g_indent); buf_printf(g_pre, "lv_%s = _t%d;\n", p0, ts_p0);
+    }
+    if (p1 && ts_p1 > 0) {
+      emit_indent(g_pre, g_indent); buf_printf(g_pre, "lv_%s = _t%d;\n", p1, ts_p1);
+    }
   }
 
   /* The expression evaluates to the accumulator */
@@ -15792,7 +15899,9 @@ char *codegen_program(const NodeTable *nt) {
   for (int i = 0; i < c->nclasses; i++)
     if (!is_builtin_reopen(c->classes[i].name))
       emit_class_new(c, &c->classes[i], &body);
-  for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable || scope_is_shadowed(c, s) || c->scopes[s].is_transplanted_source) continue; emit_method(c, &c->scopes[s], &body); }
+  for (int s = 1; s < c->nscopes; s++) {
+    if (c->scopes[s].yields || !c->scopes[s].reachable || scope_is_shadowed(c, s) || c->scopes[s].is_transplanted_source) continue; emit_method(c, &c->scopes[s], &body);
+  }
 
   /* Emit END block static functions for atexit registration */
   int end_count = 0;
