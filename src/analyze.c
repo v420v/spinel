@@ -3375,15 +3375,6 @@ static int infer_write_types(Compiler *c) {
       continue;
     }
     lv->type = ty_unify(lv->type, newt);
-    /* Record the proc's body return type so `<var>.call(...)` knows the
-       result type (e.g. `sq = proc { |x| x*x }; sq.call(5)` -> int). Only
-       a direct proc literal RHS carries it; escape-through-return/param is
-       a later slice. */
-    if (lv->type == TY_PROC && !strcmp(ty, "LocalVariableWriteNode")) {
-      int vnode = nt_ref(nt, id, "value");
-      TyKind pr = vnode >= 0 ? proc_ret_of(c, vnode) : TY_UNKNOWN;
-      if (pr != TY_UNKNOWN && (TyKind)lv->proc_ret != pr) { lv->proc_ret = (int)pr; changed = 1; }
-    }
   }
 
   /* Multiple assignment `a, b = e0, e1`: each target gets its element's
@@ -3898,6 +3889,24 @@ static int infer_write_types(Compiler *c) {
       *slot = TY_POLY_POLY_HASH;
     }
     if (*slot != before) changed = 1;
+  }
+
+  /* Second pass: re-compute proc_ret for proc-typed locals after body-internal
+     locals have been typed. The first pass resets all locals to TY_UNKNOWN, so
+     computing proc_ret there would see stale TY_UNKNOWN for variables assigned
+     inside the proc body. Running after the first pass ensures those locals
+     have their correct types (e.g. `x = 10` -> TY_INT) before proc_node_ret
+     evaluates the body's return type. */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "LocalVariableWriteNode")) continue;
+    const char *nm = nt_str(nt, id, "name");
+    if (!nm) continue;
+    LocalVar *lv = scope_local(comp_scope_of(c, id), nm);
+    if (!lv || lv->type != TY_PROC) continue;
+    int vnode = nt_ref(nt, id, "value");
+    TyKind pr = vnode >= 0 ? proc_ret_of(c, vnode) : TY_UNKNOWN;
+    if (pr != TY_UNKNOWN && (TyKind)lv->proc_ret != pr) { lv->proc_ret = (int)pr; changed = 1; }
   }
 
   /* detect change vs the stashed old types */
@@ -4618,6 +4627,8 @@ static int first_block_call_args(Compiler *c, int si) {
   return -1;
 }
 
+static int a_proc_params_node(Compiler *c, int create); /* forward decl */
+
 /* Bind block parameter types for supported iteration methods. */
 static int infer_block_params(Compiler *c) {
   const NodeTable *nt = c->nt;
@@ -4638,6 +4649,50 @@ static int infer_block_params(Compiler *c) {
       if (!p) continue;
       LocalVar *lv = scope_local_intern(bs, p); lv->is_block_param = 1;
       if (lv->type == TY_UNKNOWN) { lv->type = TY_INT; changed = 1; }
+    }
+  }
+
+  /* Proc/lambda call-site param inference: `f.call(:a)` propagates arg types
+     to the proc's params (e.g. `t` gets TY_SYMBOL instead of the default TY_INT). */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *cname = nt_str(nt, id, "name");
+    if (!cname || (strcmp(cname, "call") && strcmp(cname, "()") && strcmp(cname, "[]"))) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0 || infer_type(c, recv) != TY_PROC) continue;
+    const char *rty = nt_type(nt, recv);
+    if (!rty || strcmp(rty, "LocalVariableReadNode")) continue;
+    const char *varname = nt_str(nt, recv, "name");
+    if (!varname) continue;
+    int call_args = nt_ref(nt, id, "arguments");
+    int argc = 0; const int *argv = NULL;
+    if (call_args >= 0) argv = nt_arr(nt, call_args, "arguments", &argc);
+    if (argc == 0) continue;
+    Scope *call_scope = comp_scope_of(c, id);
+    /* Find proc literal(s) assigned to varname in the same scope */
+    for (int w = 0; w < nt->count; w++) {
+      const char *wty = nt_type(nt, w);
+      if (!wty || strcmp(wty, "LocalVariableWriteNode")) continue;
+      const char *wname = nt_str(nt, w, "name");
+      if (!wname || strcmp(wname, varname)) continue;
+      if (comp_scope_of(c, w) != call_scope) continue;
+      int val = nt_ref(nt, w, "value");
+      if (val < 0 || !is_proc_create(c, val)) continue;
+      int pn = a_proc_params_node(c, val);
+      if (pn < 0) continue;
+      int rn = 0; const int *reqs = nt_arr(nt, pn, "requireds", &rn);
+      Scope *bs = comp_scope_of(c, val);
+      for (int k = 0; k < rn && k < argc; k++) {
+        const char *p = nt_str(nt, reqs[k], "name");
+        if (!p) continue;
+        LocalVar *lv = scope_local(bs, p);
+        if (!lv) continue;
+        TyKind at = infer_type(c, argv[k]);
+        if (at == TY_UNKNOWN || at == lv->type) continue;
+        TyKind merged = ty_unify(lv->type, at);
+        if (merged != lv->type) { lv->type = merged; changed = 1; }
+      }
     }
   }
 
