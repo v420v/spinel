@@ -600,6 +600,23 @@ static TyKind infer_call(Compiler *c, int id) {
     }
   }
 
+  /* built-in class reopening: look up user-defined methods on scalar built-in types */
+  if (recv >= 0) {
+    const char *oc_cn = NULL;
+    if (rt == TY_STRING)       oc_cn = "String";
+    else if (rt == TY_INT)     oc_cn = "Integer";
+    else if (rt == TY_FLOAT)   oc_cn = "Float";
+    else if (rt == TY_SYMBOL)  oc_cn = "Symbol";
+    else if (rt == TY_BOOL)    oc_cn = "TrueClass";
+    if (oc_cn) {
+      int oc_ci = comp_class_index(c, oc_cn);
+      if (oc_ci >= 0) {
+        int oc_mi = comp_method_in_chain(c, oc_ci, name, NULL);
+        if (oc_mi >= 0) return method_call_ret(c, oc_mi, id);
+      }
+    }
+  }
+
   /* obj.method(...) -> the method's return type (walks the superclass chain) */
   if (recv >= 0 && ty_is_object(rt)) {
     int cid = ty_object_class(rt);
@@ -672,6 +689,84 @@ static TyKind infer_call(Compiler *c, int id) {
           if (dmi >= 0) r = ty_unify(r, (TyKind)c->scopes[dmi].ret);
         }
         return r;
+      }
+      /* Built-in class reopening: implicit self → delegate to built-in type lookup */
+      if (mi < 0 && !self->is_cmethod) {
+        const char *bcn = c->classes[self->class_id].name;
+        TyKind brt = TY_UNKNOWN;
+        if (!strcmp(bcn, "String"))        brt = TY_STRING;
+        else if (!strcmp(bcn, "Integer"))  brt = TY_INT;
+        else if (!strcmp(bcn, "Float"))    brt = TY_FLOAT;
+        else if (!strcmp(bcn, "Symbol"))   brt = TY_SYMBOL;
+        if (brt != TY_UNKNOWN) {
+          /* Temporarily set rt to the built-in type and recursively call infer_call
+             is not safe. Instead inline key return types for common method names. */
+          if (brt == TY_STRING) {
+            if (!strcmp(name, "upcase") || !strcmp(name, "downcase") ||
+                !strcmp(name, "capitalize") || !strcmp(name, "reverse") || !strcmp(name, "strip") ||
+                !strcmp(name, "lstrip") || !strcmp(name, "rstrip") || !strcmp(name, "chomp") ||
+                !strcmp(name, "chop") || !strcmp(name, "dup") || !strcmp(name, "clone") ||
+                !strcmp(name, "to_s") || !strcmp(name, "inspect") || !strcmp(name, "succ") ||
+                !strcmp(name, "next") || !strcmp(name, "chr") || !strcmp(name, "encode") ||
+                !strcmp(name, "b") || !strcmp(name, "force_encoding") || !strcmp(name, "scrub") ||
+                !strcmp(name, "squeeze") || !strcmp(name, "tr") || !strcmp(name, "delete"))
+              return TY_STRING;
+            if ((!strcmp(name, "+") || !strcmp(name, "*")) && argc >= 1) return TY_STRING;
+            if (!strcmp(name, "gsub") || !strcmp(name, "sub")) return TY_STRING;
+            if (!strcmp(name, "[]") || !strcmp(name, "slice")) return TY_STRING;
+            if (!strcmp(name, "length") || !strcmp(name, "size") || !strcmp(name, "bytesize") ||
+                !strcmp(name, "to_i") || !strcmp(name, "count") || !strcmp(name, "ord") ||
+                !strcmp(name, "hex") || !strcmp(name, "oct") || !strcmp(name, "rindex") ||
+                !strcmp(name, "index"))
+              return TY_INT;
+            if (!strcmp(name, "to_f")) return TY_FLOAT;
+            if (!strcmp(name, "to_sym")) return TY_SYMBOL;
+            if (!strcmp(name, "empty?") || !strcmp(name, "include?") ||
+                !strcmp(name, "start_with?") || !strcmp(name, "end_with?") ||
+                !strcmp(name, "==") || !strcmp(name, "!="))
+              return TY_BOOL;
+            if (!strcmp(name, "split") || !strcmp(name, "chars") || !strcmp(name, "lines") ||
+                !strcmp(name, "bytes"))
+              return TY_STR_ARRAY;
+          }
+          else if (brt == TY_INT) {
+            if (!strcmp(name, "+") || !strcmp(name, "-") || !strcmp(name, "*") ||
+                !strcmp(name, "/") || !strcmp(name, "%") || !strcmp(name, "**") ||
+                !strcmp(name, "abs") || !strcmp(name, "succ") || !strcmp(name, "next") ||
+                !strcmp(name, "pred") || !strcmp(name, "gcd") || !strcmp(name, "lcm") ||
+                !strcmp(name, "&") || !strcmp(name, "|") || !strcmp(name, "^") ||
+                !strcmp(name, "<<") || !strcmp(name, ">>"))
+              return TY_INT;
+            if (!strcmp(name, "to_f")) return TY_FLOAT;
+            if (!strcmp(name, "to_s")) return TY_STRING;
+            if (!strcmp(name, "to_r")) return TY_POLY;
+            if (!strcmp(name, "odd?") || !strcmp(name, "even?") || !strcmp(name, "zero?") ||
+                !strcmp(name, "==") || !strcmp(name, "!=") || !strcmp(name, "<") ||
+                !strcmp(name, "<=") || !strcmp(name, ">") || !strcmp(name, ">="))
+              return TY_BOOL;
+          }
+          else if (brt == TY_FLOAT) {
+            if (!strcmp(name, "+") || !strcmp(name, "-") || !strcmp(name, "*") ||
+                !strcmp(name, "/") || !strcmp(name, "abs") || !strcmp(name, "floor") ||
+                !strcmp(name, "ceil") || !strcmp(name, "round") || !strcmp(name, "truncate"))
+              return TY_FLOAT;
+            if (!strcmp(name, "to_i")) return TY_INT;
+            if (!strcmp(name, "to_s")) return TY_STRING;
+            if (!strcmp(name, "zero?") || !strcmp(name, "nan?") || !strcmp(name, "infinite?") ||
+                !strcmp(name, "finite?") || !strcmp(name, "==") || !strcmp(name, "!=") ||
+                !strcmp(name, "<") || !strcmp(name, "<=") || !strcmp(name, ">") ||
+                !strcmp(name, ">="))
+              return TY_BOOL;
+          }
+          else if (brt == TY_SYMBOL) {
+            if (!strcmp(name, "to_s") || !strcmp(name, "id2name") || !strcmp(name, "inspect"))
+              return TY_STRING;
+            if (!strcmp(name, "to_sym") || !strcmp(name, "itself")) return TY_SYMBOL;
+            if (!strcmp(name, "length") || !strcmp(name, "size")) return TY_INT;
+            if (!strcmp(name, "empty?") || !strcmp(name, "==") || !strcmp(name, "!="))
+              return TY_BOOL;
+          }
+        }
       }
       /* Method defined only in descendants (not in base chain):
          unify return types of all descendant implementations. */
@@ -1560,7 +1655,15 @@ static TyKind infer_uncached(Compiler *c, int id) {
   }
   if (!strcmp(ty, "SelfNode")) {
     Scope *s = comp_scope_of(c, id);
-    return s->class_id >= 0 ? ty_object(s->class_id) : TY_UNKNOWN;
+    if (s->class_id < 0) return TY_UNKNOWN;
+    const char *cn = c->classes[s->class_id].name;
+    if (!strcmp(cn, "String"))  return TY_STRING;
+    if (!strcmp(cn, "Integer")) return TY_INT;
+    if (!strcmp(cn, "Float"))   return TY_FLOAT;
+    if (!strcmp(cn, "Symbol"))  return TY_SYMBOL;
+    if (!strcmp(cn, "TrueClass") || !strcmp(cn, "FalseClass") || !strcmp(cn, "NilClass")) return TY_BOOL;
+    if (!strcmp(cn, "Array"))   return TY_POLY_ARRAY;
+    return ty_object(s->class_id);
   }
   if (!strcmp(ty, "InstanceVariableReadNode")) {
     const char *nm = nt_str(nt, id, "name");

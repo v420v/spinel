@@ -3640,6 +3640,97 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         emit_dispatch(c, self->class_id, name, g_self, nt_ref(nt, id, "arguments"), nt_ref(nt, id, "block"), b);
         return;
       }
+      /* Built-in class reopening: implicit self → dispatch as self.builtin_method() */
+      if (mi < 0 && !self->is_cmethod) {
+        const char *bcn = c->classes[self->class_id].name;
+        TyKind brt = TY_UNKNOWN;
+        if (!strcmp(bcn, "String"))        brt = TY_STRING;
+        else if (!strcmp(bcn, "Integer"))  brt = TY_INT;
+        else if (!strcmp(bcn, "Float"))    brt = TY_FLOAT;
+        else if (!strcmp(bcn, "Symbol"))   brt = TY_SYMBOL;
+        if (brt != TY_UNKNOWN) {
+          int args2 = nt_ref(nt, id, "arguments");
+          int ac2 = 0; const int *av2 = args2 >= 0 ? nt_arr(nt, args2, "arguments", &ac2) : NULL;
+          const char *s = g_self;
+          if (brt == TY_STRING) {
+            if (!strcmp(name, "upcase"))     { buf_printf(b, "sp_str_upcase(%s)", s); return; }
+            if (!strcmp(name, "downcase"))   { buf_printf(b, "sp_str_downcase(%s)", s); return; }
+            if (!strcmp(name, "capitalize")) { buf_printf(b, "sp_str_capitalize(%s)", s); return; }
+            if (!strcmp(name, "reverse"))    { buf_printf(b, "sp_str_reverse(%s)", s); return; }
+            if (!strcmp(name, "strip"))      { buf_printf(b, "sp_str_strip(%s)", s); return; }
+            if (!strcmp(name, "lstrip"))     { buf_printf(b, "sp_str_lstrip(%s)", s); return; }
+            if (!strcmp(name, "rstrip"))     { buf_printf(b, "sp_str_rstrip(%s)", s); return; }
+            if (!strcmp(name, "chomp"))      { buf_printf(b, "sp_str_chomp(%s, NULL)", s); return; }
+            if (!strcmp(name, "chop"))       { buf_printf(b, "sp_str_chop(%s)", s); return; }
+            if (!strcmp(name, "dup") || !strcmp(name, "clone")) { buf_printf(b, "sp_str_dup(%s)", s); return; }
+            if (!strcmp(name, "to_s") || !strcmp(name, "itself")) { buf_puts(b, s); return; }
+            if (!strcmp(name, "to_sym"))     { buf_printf(b, "sp_sym_intern(%s)", s); return; }
+            if (!strcmp(name, "to_i"))       { buf_printf(b, "sp_str_to_i(%s)", s); return; }
+            if (!strcmp(name, "to_f"))       { buf_printf(b, "sp_str_to_f(%s)", s); return; }
+            if (!strcmp(name, "length") || !strcmp(name, "size")) { buf_printf(b, "sp_str_length(%s)", s); return; }
+            if (!strcmp(name, "bytesize"))   { buf_printf(b, "sp_str_bytesize(%s)", s); return; }
+            if (!strcmp(name, "empty?"))     { buf_printf(b, "(!%s || !*%s)", s, s); return; }
+            if (!strcmp(name, "inspect"))    { buf_printf(b, "sp_str_inspect(%s)", s); return; }
+            if (!strcmp(name, "+") && ac2 == 1) {
+              buf_printf(b, "sp_str_concat(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+            if (!strcmp(name, "*") && ac2 == 1) {
+              buf_printf(b, "sp_str_repeat(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+          }
+          else if (brt == TY_INT) {
+            if (!strcmp(name, "to_s"))   { buf_printf(b, "sp_int_to_s(%s)", s); return; }
+            if (!strcmp(name, "to_f"))   { buf_printf(b, "((double)(%s))", s); return; }
+            if (!strcmp(name, "abs"))    { buf_printf(b, "sp_int_abs(%s)", s); return; }
+            if (!strcmp(name, "odd?"))   { buf_printf(b, "((%s) %% 2 != 0)", s); return; }
+            if (!strcmp(name, "even?"))  { buf_printf(b, "((%s) %% 2 == 0)", s); return; }
+            if (!strcmp(name, "zero?"))  { buf_printf(b, "((%s) == 0)", s); return; }
+            if (!strcmp(name, "succ") || !strcmp(name, "next")) { buf_printf(b, "sp_int_add(%s, 1LL)", s); return; }
+            if (!strcmp(name, "+") && ac2 == 1) {
+              buf_printf(b, "sp_int_add(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+            if (!strcmp(name, "-") && ac2 == 1) {
+              buf_printf(b, "sp_int_sub(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+            if (!strcmp(name, "*") && ac2 == 1) {
+              buf_printf(b, "sp_int_mul(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+            if (!strcmp(name, "/") && ac2 == 1) {
+              buf_printf(b, "sp_idiv(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+            if (!strcmp(name, "%") && ac2 == 1) {
+              buf_printf(b, "sp_imod(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+          }
+          else if (brt == TY_FLOAT) {
+            if (!strcmp(name, "to_s"))   { buf_printf(b, "sp_float_to_s(%s)", s); return; }
+            if (!strcmp(name, "to_i"))   { buf_printf(b, "((mrb_int)(%s))", s); return; }
+            if (!strcmp(name, "abs"))    { buf_printf(b, "fabs(%s)", s); return; }
+            if (!strcmp(name, "floor"))  { buf_printf(b, "((double)((mrb_int)floor(%s)))", s); return; }
+            if (!strcmp(name, "ceil"))   { buf_printf(b, "((double)((mrb_int)ceil(%s)))", s); return; }
+            if (!strcmp(name, "round"))  { buf_printf(b, "((double)((mrb_int)round(%s)))", s); return; }
+            if (!strcmp(name, "+") && ac2 == 1) {
+              buf_puts(b, "("); buf_puts(b, s); buf_puts(b, " + "); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+            if (!strcmp(name, "-") && ac2 == 1) {
+              buf_puts(b, "("); buf_puts(b, s); buf_puts(b, " - "); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+            if (!strcmp(name, "*") && ac2 == 1) {
+              buf_puts(b, "("); buf_puts(b, s); buf_puts(b, " * "); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+            if (!strcmp(name, "/") && ac2 == 1) {
+              buf_puts(b, "("); buf_puts(b, s); buf_puts(b, " / "); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+            }
+          }
+          else if (brt == TY_SYMBOL) {
+            if (!strcmp(name, "to_s") || !strcmp(name, "id2name")) {
+              buf_printf(b, "sp_sym_to_s(%s)", s); return;
+            }
+            if (!strcmp(name, "inspect")) { buf_printf(b, "sp_sym_inspect(%s)", s); return; }
+            if (!strcmp(name, "to_sym") || !strcmp(name, "itself")) { buf_puts(b, s); return; }
+          }
+        }
+      }
     }
   }
 
@@ -7821,6 +7912,29 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (recv >= 0 && argc == 0 && !strcmp(name, "nil?") && ty_is_object(rt)) {
     buf_puts(b, "((void)("); emit_expr(c, recv, b); buf_puts(b, "), 0)");
     return;
+  }
+
+  /* dispatch user-defined methods on reopened built-in types */
+  if (recv >= 0) {
+    const char *oc_cn = NULL;
+    if (rt == TY_STRING)       oc_cn = "String";
+    else if (rt == TY_INT)     oc_cn = "Integer";
+    else if (rt == TY_FLOAT)   oc_cn = "Float";
+    else if (rt == TY_SYMBOL)  oc_cn = "Symbol";
+    else if (rt == TY_BOOL)    oc_cn = "TrueClass";
+    if (oc_cn) {
+      int oc_ci = comp_class_index(c, oc_cn);
+      if (oc_ci >= 0) {
+        int oc_mi = comp_method_in_chain(c, oc_ci, name, NULL);
+        if (oc_mi >= 0) {
+          buf_printf(b, "sp_%s_%s(", oc_cn, mc(name));
+          emit_expr(c, recv, b);
+          emit_args_filled(c, oc_mi, nt_ref(nt, id, "arguments"), ", ", b);
+          buf_puts(b, ")");
+          return;
+        }
+      }
+    }
   }
 
   unsupported(c, id, "call");
@@ -12828,8 +12942,14 @@ static void emit_method_signature(Compiler *c, Scope *s, Buf *b) {
   buf_puts(b, "(");
   int wrote = 0;
   if (s->class_id >= 0 && !s->is_cmethod) {
-    /* self: by pointer (reference semantics for ivar mutation) */
-    buf_printf(b, "sp_%s *self", c->classes[s->class_id].name);
+    const char *cn = c->classes[s->class_id].name;
+    if (!strcmp(cn, "String"))       { buf_puts(b, "const char *self"); }
+    else if (!strcmp(cn, "Integer")) { buf_puts(b, "mrb_int self"); }
+    else if (!strcmp(cn, "Float"))   { buf_puts(b, "double self"); }
+    else if (!strcmp(cn, "Symbol"))  { buf_puts(b, "mrb_int self"); }
+    else if (!strcmp(cn, "TrueClass") || !strcmp(cn, "FalseClass") || !strcmp(cn, "NilClass")) { buf_puts(b, "int self"); }
+    else if (!strcmp(cn, "Array"))   { buf_puts(b, "sp_PolyArray *self"); }
+    else { buf_printf(b, "sp_%s *self", cn); }
     wrote = 1;
   }
   for (int i = 0; i < s->nparams; i++) {
@@ -13145,6 +13265,15 @@ static void emit_proc_literal(Compiler *c, int create, Buf *b) {
 }
 
 /* Emit the struct + the constructor (sp_<Class>_new) for one class. */
+/* Returns 1 if the class name shadows a built-in runtime type (no struct/new to emit). */
+static int is_builtin_reopen(const char *name) {
+  return !strcmp(name, "String")    || !strcmp(name, "Integer") ||
+         !strcmp(name, "Float")     || !strcmp(name, "Symbol")  ||
+         !strcmp(name, "TrueClass") || !strcmp(name, "FalseClass") ||
+         !strcmp(name, "NilClass")  || !strcmp(name, "Array")   ||
+         !strcmp(name, "Object")    || !strcmp(name, "Numeric");
+}
+
 static void emit_class_struct(Compiler *c, ClassInfo *ci, Buf *b) {
   /* the typedef is forward-declared for every class first (see codegen_program)
      so a class can embed a pointer to a class defined later in the file */
@@ -13461,9 +13590,14 @@ char *codegen_program(const NodeTable *nt) {
   /* class structs + GC scan functions. Forward-declare every typedef first so
      a class struct may embed a pointer to a class defined later. */
   for (int i = 0; i < c->nclasses; i++)
-    buf_printf(&b, "typedef struct sp_%s_s sp_%s;\n", c->classes[i].name, c->classes[i].name);
-  for (int i = 0; i < c->nclasses; i++) emit_class_struct(c, &c->classes[i], &b);
-  for (int i = 0; i < c->nclasses; i++) emit_class_scan(c, &c->classes[i], &b);
+    if (!is_builtin_reopen(c->classes[i].name))
+      buf_printf(&b, "typedef struct sp_%s_s sp_%s;\n", c->classes[i].name, c->classes[i].name);
+  for (int i = 0; i < c->nclasses; i++)
+    if (!is_builtin_reopen(c->classes[i].name))
+      emit_class_struct(c, &c->classes[i], &b);
+  for (int i = 0; i < c->nclasses; i++)
+    if (!is_builtin_reopen(c->classes[i].name))
+      emit_class_scan(c, &c->classes[i], &b);
   if (c->nclasses > 0) buf_puts(&b, "\n");
 
   /* class variables: one file-scope static per (class, @@var) */
@@ -13499,6 +13633,7 @@ char *codegen_program(const NodeTable *nt) {
   /* constructor prototypes + definitions (after method protos: new calls initialize) */
   for (int i = 0; i < c->nclasses; i++) {
     ClassInfo *ci = &c->classes[i];
+    if (is_builtin_reopen(ci->name)) continue;
     if (ci->is_struct) {
       /* struct constructor takes typed member params -- the prototype must
          match the definition (an empty () prototype + a _Bool param differ) */
@@ -13551,7 +13686,9 @@ char *codegen_program(const NodeTable *nt) {
      g_proc_protos; we splice those in ahead of these bodies, since a proc
      function must be declared before the body that references it. */
   Buf body; memset(&body, 0, sizeof body);
-  for (int i = 0; i < c->nclasses; i++) emit_class_new(c, &c->classes[i], &body);
+  for (int i = 0; i < c->nclasses; i++)
+    if (!is_builtin_reopen(c->classes[i].name))
+      emit_class_new(c, &c->classes[i], &body);
   for (int s = 1; s < c->nscopes; s++) { if (c->scopes[s].yields || !c->scopes[s].reachable || scope_is_shadowed(c, s)) continue; emit_method(c, &c->scopes[s], &body); }
 
   /* Emit END block static functions for atexit registration */
