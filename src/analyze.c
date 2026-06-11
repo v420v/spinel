@@ -541,6 +541,15 @@ static TyKind infer_call(Compiler *c, int id) {
     }
   }
 
+  /* Regexp.compile is an alias for Regexp.new */
+  if (recv >= 0 && !strcmp(name, "compile")) {
+    const char *rty = nt_type(nt, recv);
+    if (rty && !strcmp(rty, "ConstantReadNode")) {
+      const char *cn = nt_str(nt, recv, "name");
+      if (cn && !strcmp(cn, "Regexp")) return TY_REGEX;
+    }
+  }
+
   /* StringScanner instance methods */
   if (recv >= 0 && rt == TY_STRINGSCANNER) {
     if (!strcmp(name, "scan") || !strcmp(name, "check") || !strcmp(name, "scan_until") ||
@@ -1910,6 +1919,9 @@ static TyKind infer_uncached(Compiler *c, int id) {
     if (nm && !strcmp(nm, "$?")) return TY_INT;  /* last child exit status */
     if (nm && (!strcmp(nm, "$PROGRAM_NAME") || !strcmp(nm, "$0"))) return TY_STRING;
     if (nm && (!strcmp(nm, "$!") || !strcmp(nm, "$;") || !strcmp(nm, "$,"))) return TY_NIL;
+    /* regex match globals: nullable strings ($~ == $&, $`, $', $+) */
+    if (nm && (!strcmp(nm, "$~") || !strcmp(nm, "$&") || !strcmp(nm, "$`") ||
+               !strcmp(nm, "$'") || !strcmp(nm, "$+"))) return TY_STRING;
     const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
     LocalVar *lv = rn ? comp_gvar(c, rn) : NULL;
     return lv ? lv->type : TY_UNKNOWN;
