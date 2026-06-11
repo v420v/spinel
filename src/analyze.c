@@ -802,6 +802,20 @@ static TyKind infer_call(Compiler *c, int id) {
         return TY_POLY;
       }
     }
+    if (!strcmp(name, "[]") && argc == 1) {
+      /* struct[:sym] or struct[int]: return specific member type if known */
+      int mi = struct_member_idx(c, sc, argv[0]);
+      if (mi >= 0) return sc->ivar_types[mi];
+      /* integer index: try to resolve literal */
+      const char *kty = nt_type(nt, argv[0]);
+      if (kty && !strcmp(kty, "IntegerNode")) {
+        long long idx = (long long)nt_int(nt, argv[0], "value", 0);
+        if (idx < 0) idx += (long long)sc->nivars;
+        if (idx >= 0 && idx < sc->nivars) return sc->ivar_types[(int)idx];
+      }
+      return TY_POLY;
+    }
+    if (!strcmp(name, "[]=") && argc == 2) return sc->nivars > 0 ? sc->ivar_types[0] : TY_POLY;
   }
 
   /* built-in class reopening: look up user-defined methods on scalar built-in types */
@@ -2475,6 +2489,41 @@ static void register_structs(Compiler *c) {
       const char *cname = cp >= 0 ? nt_str(nt, cp, "name") : NULL;
       int ci = cname ? comp_class_index(c, cname) : -1;
       if (ci >= 0) register_struct_members(c, &c->classes[ci], sup);
+    }
+  }
+}
+
+/* Fix scope class_id for DefNodes inside Struct.new { } blocks.
+   walk_scope runs before register_structs, so defs in struct blocks get
+   class_id=-1. This pass corrects them after the class is registered. */
+static void fix_struct_block_scopes(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "ConstantWriteNode")) continue;
+    const char *cname = nt_str(nt, id, "name");
+    int val = nt_ref(nt, id, "value");
+    if (!cname || val < 0 || !is_struct_call(c, val)) continue;
+    int blk = nt_ref(nt, val, "block");
+    if (blk < 0) continue;
+    int ci = comp_class_index(c, cname);
+    if (ci < 0) continue;
+    /* Walk the block body and fix any DefNode scopes */
+    int bbody = nt_ref(nt, blk, "body");
+    if (bbody < 0) continue;
+    int bn = 0;
+    const int *stmts = nt_arr(nt, bbody, "body", &bn);
+    for (int k = 0; k < bn; k++) {
+      const char *sty = nt_type(nt, stmts[k]);
+      if (!sty || strcmp(sty, "DefNode")) continue;
+      int dn = stmts[k];
+      /* Find the scope whose def_node == dn and fix its class_id */
+      for (int s = 0; s < c->nscopes; s++) {
+        if (c->scopes[s].def_node == dn) {
+          c->scopes[s].class_id = ci;
+          break;
+        }
+      }
     }
   }
 }
@@ -5903,6 +5952,7 @@ void analyze_program(Compiler *c) {
 
   walk_scope(c, c->nt->root_id, 0, -1);
   register_structs(c);
+  fix_struct_block_scopes(c);
   register_module_functions(c);
   register_locals(c);
   register_attrs(c);

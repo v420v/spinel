@@ -6644,6 +6644,45 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         return;
       }
     }
+    if (!strcmp(name, "[]") && argc == 1) {
+      /* struct[:sym] or struct[int_literal]: return member value boxed to poly */
+      int mi = -1;
+      const char *kty = nt_type(nt, argv[0]);
+      if (kty && !strcmp(kty, "SymbolNode") && nt_str(nt, argv[0], "value")) {
+        char ivn[256]; snprintf(ivn, sizeof ivn, "@%s", nt_str(nt, argv[0], "value"));
+        mi = comp_ivar_index(sc, ivn);
+      }
+      else if (kty && !strcmp(kty, "IntegerNode")) {
+        long long v = (long long)nt_int(nt, argv[0], "value", 0);
+        if (v < 0) v += (long long)sc->nivars;
+        if (v >= 0 && v < sc->nivars) mi = (int)v;
+      }
+      if (mi >= 0) {
+        int t = ++g_tmp;
+        Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+        buf_printf(b, "({ sp_%s *_t%d = %s; ", sc->name, t, rb.p ? rb.p : ""); free(rb.p);
+        buf_printf(b, "_t%d->iv_%s; })", t, sc->ivars[mi] + 1);
+        return;
+      }
+      /* general: generate chain of comparisons */
+      if (sc->nivars > 0) {
+        int t = ++g_tmp, tk = ++g_tmp;
+        Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+        buf_printf(b, "({ sp_%s *_t%d = %s; sp_RbVal _t%d = ", sc->name, t, rb.p ? rb.p : "", tk);
+        free(rb.p);
+        emit_boxed(c, argv[0], b);
+        buf_puts(b, ";");
+        for (int i = 0; i < sc->nivars; i++) {
+          buf_printf(b, " if(sp_rbval_eql_key(_t%d,sp_box_sym((sp_sym)%d))||sp_rbval_eql_key(_t%d,sp_box_int(%dLL))){",
+                     tk, comp_sym_intern(c, sc->ivars[i]+1), tk, (long long)i);
+          char fld2[300]; snprintf(fld2, sizeof fld2, "_t%d->iv_%s", t, sc->ivars[i] + 1);
+          emit_boxed_text(c, sc->ivar_types[i], fld2, b);
+          buf_printf(b, ";} else");
+        }
+        buf_puts(b, " sp_box_nil(); })");
+        return;
+      }
+    }
   }
 
   /* object method call: sp_<DefClass>_<m>((sp_<DefClass>*)&recv, args) */
