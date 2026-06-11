@@ -3254,6 +3254,14 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (recv < 0) {
     Scope *encl = comp_scope_of(c, id);
     if (encl && encl->is_cmethod && encl->class_id >= 0) {
+      /* bare `new` inside a class method -> construct self's class */
+      if (!strcmp(name, "new")) {
+        buf_printf(b, "sp_%s_new(", c->classes[encl->class_id].name);
+        int initm = comp_method_in_chain(c, encl->class_id, "initialize", NULL);
+        if (initm >= 0) emit_args_filled(c, initm, nt_ref(nt, id, "arguments"), "", b);
+        buf_puts(b, ")");
+        return;
+      }
       int smi = comp_cmethod_in_chain(c, encl->class_id, name, NULL);
       if (smi >= 0) {
         Scope *ms = &c->scopes[smi];
@@ -3285,6 +3293,71 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "class")) {
     emit_expr(c, recv, b);
     return;
+  }
+  /* obj.class.cmeth(...) -> dispatch class method on obj's runtime class
+     Emits a cls_id switch: each case calls the right class method. */
+  if (recv >= 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+      nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "class")) {
+    int robj = nt_ref(nt, recv, "receiver");
+    TyKind rrt = robj >= 0 ? comp_ntype(c, robj) : TY_UNKNOWN;
+    if (ty_is_object(rrt)) {
+      int cid = ty_object_class(rrt);
+      int defmi = comp_cmethod_in_chain(c, cid, name, NULL);
+      if (defmi >= 0) {
+        /* Count distinct class method impls across the hierarchy */
+        int nimpl = 0;
+        for (int k = 0; k < c->nclasses; k++) {
+          if (!is_descendant(c, k, cid)) continue;
+          if (comp_cmethod_in_class(c, k, name) >= 0) nimpl++;
+        }
+        TyKind cret = (TyKind)c->scopes[defmi].ret;
+        /* Stash the receiver object in a temp (referenced in every switch case) */
+        char objptr[64];
+        const char *rty = nt_type(nt, robj);
+        if (rty && (!strcmp(rty, "LocalVariableReadNode") || !strcmp(rty, "InstanceVariableReadNode") || !strcmp(rty, "SelfNode"))) {
+          Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, robj, &rb);
+          snprintf(objptr, sizeof objptr, "%s", rb.p ? rb.p : "");
+          free(rb.p);
+        }
+        else {
+          int ot = ++g_tmp;
+          Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, robj, &rb);
+          emit_indent(g_pre, g_indent);
+          emit_ctype(c, rrt, g_pre);
+          buf_printf(g_pre, " _t%d = %s;\n", ot, rb.p ? rb.p : ""); free(rb.p);
+          snprintf(objptr, sizeof objptr, "_t%d", ot);
+        }
+        if (nimpl <= 1) {
+          /* single implementation: call directly */
+          emit_method_cname(c, &c->scopes[defmi], b);
+          buf_puts(b, "(");
+          emit_args_filled(c, defmi, nt_ref(nt, id, "arguments"), "", b);
+          buf_puts(b, ")");
+        }
+        else {
+          int rtmp = ++g_tmp;
+          buf_puts(b, "({ ");
+          emit_ctype(c, cret, b);
+          buf_printf(b, " _t%d; switch ((%s)->cls_id) {", rtmp, objptr);
+          for (int k = 0; k < c->nclasses; k++) {
+            if (!is_descendant(c, k, cid)) continue;
+            int kmi = comp_cmethod_in_chain(c, k, name, NULL);
+            if (kmi < 0) continue;
+            buf_printf(b, " case %d: _t%d = ", k, rtmp);
+            emit_method_cname(c, &c->scopes[kmi], b);
+            buf_puts(b, "(");
+            emit_args_filled(c, kmi, nt_ref(nt, id, "arguments"), "", b);
+            buf_puts(b, "); break;");
+          }
+          buf_printf(b, " default: _t%d = ", rtmp);
+          emit_method_cname(c, &c->scopes[defmi], b);
+          buf_puts(b, "(");
+          emit_args_filled(c, defmi, nt_ref(nt, id, "arguments"), "", b);
+          buf_printf(b, "); break; } _t%d; })", rtmp);
+        }
+        return;
+      }
+    }
   }
   /* SomeClass.name / .to_s / .inspect -> the class-name string */
   if (recv >= 0 && argc == 0 &&

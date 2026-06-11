@@ -537,6 +537,28 @@ static TyKind infer_call(Compiler *c, int id) {
         if (mi >= 0) return c->scopes[mi].ret;
       }
     }
+    /* obj.class.cmeth(...) -> unify class method return types across hierarchy */
+    if (rty && !strcmp(rty, "CallNode") &&
+        nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "class")) {
+      int robj = nt_ref(nt, recv, "receiver");
+      TyKind rrt = robj >= 0 ? infer_type(c, robj) : TY_UNKNOWN;
+      if (ty_is_object(rrt)) {
+        int cid = ty_object_class(rrt);
+        int mi = comp_cmethod_in_chain(c, cid, name, NULL);
+        if (mi >= 0) {
+          TyKind r = (TyKind)c->scopes[mi].ret;
+          for (int k = 0; k < c->nclasses; k++) {
+            int _desc = 0;
+            for (int _p = c->classes[k].parent; _p >= 0; _p = c->classes[_p].parent)
+              if (_p == cid) { _desc = 1; break; }
+            if (!_desc) continue;
+            int kmi = comp_cmethod_in_class(c, k, name);
+            if (kmi >= 0) r = ty_unify(r, (TyKind)c->scopes[kmi].ret);
+          }
+          return r;
+        }
+      }
+    }
   }
 
   /* Struct instance methods */
@@ -629,6 +651,9 @@ static TyKind infer_call(Compiler *c, int id) {
         int iv = comp_ivar_index(&c->classes[self->class_id], ivn);
         if (iv >= 0) return c->classes[self->class_id].ivar_types[iv];
       }
+      /* bare `new` inside a class method returns an instance of self's class */
+      if (self->is_cmethod && !strcmp(name, "new"))
+        return ty_object(self->class_id);
       int mi = comp_method_in_chain(c, self->class_id, name, NULL);
       if (mi < 0 && self->is_cmethod)
         mi = comp_cmethod_in_chain(c, self->class_id, name, NULL);
