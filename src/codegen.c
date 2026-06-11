@@ -637,6 +637,9 @@ static void emit_method_call(Compiler *c, int id, Buf *b) {
   buf_puts(b, ")");
 }
 
+static int patch_lv_reads(Compiler *c, int id, const char *nm, TyKind ty,
+                           int *ids_out, TyKind *ty_out, int cap);
+
 /* hash.map / collect { |k, v| ... } as an expression -> an array of the block
    values, built via a loop over the hash entries in the statement prelude. */
 static int emit_hash_collect_expr(Compiler *c, int id, Buf *b) {
@@ -651,36 +654,101 @@ static int emit_hash_collect_expr(Compiler *c, int id, Buf *b) {
   TyKind rt = comp_ntype(c, recv);
   const char *hn = ty_hash_cname(rt);
   if (!hn) return 0;
-  const char *p0 = block_param_name(c, block, 0); if (p0) p0 = rename_local(p0);
-  const char *p1 = block_param_name(c, block, 1); if (p1) p1 = rename_local(p1);
+  TyKind kt = ty_hash_key(rt), vt = ty_hash_val(rt);
+  (void)kt;
+
+  const char *p0_orig = block_param_name(c, block, 0);
+  const char *p1_orig = block_param_name(c, block, 1);
+  const char *p0 = p0_orig ? rename_local(p0_orig) : NULL;
+  const char *p1 = p1_orig ? rename_local(p1_orig) : NULL;
+
   int body = nt_ref(nt, block, "body");
   int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
   if (bn < 1) return 0;
+
+  /* Detect type mismatch: block params unified with other blocks in same scope.
+     For 2-param |k,v|: p0=key, p1=value. For 1-param |v|: p0=value. */
+  Scope *pscope = comp_scope_of(c, block);
+  TyKind p0_actual = p1_orig ? kt : vt;   /* p0 is key if 2 params, else value */
+  TyKind p1_actual = vt;
+  LocalVar *p0_lv = p0_orig ? scope_local(pscope, p0_orig) : NULL;
+  LocalVar *p1_lv = p1_orig ? scope_local(pscope, p1_orig) : NULL;
+  TyKind p0_decl = p0_lv ? p0_lv->type : TY_UNKNOWN;
+  TyKind p1_decl = p1_lv ? p1_lv->type : TY_UNKNOWN;
+  int ns0 = p0_orig && p0_actual != TY_UNKNOWN && p0_decl != TY_UNKNOWN && p0_decl != p0_actual;
+  int ns1 = p1_orig && p1_actual != TY_UNKNOWN && p1_decl != TY_UNKNOWN && p1_decl != p1_actual;
+  int st0 = -1, sri0 = -1, srn0 = 0; char sro0[112]; sro0[0] = '\0';
+  int st1 = -1, sri1 = -1, srn1 = 0; char sro1[112]; sro1[0] = '\0';
+
   int trecv = ++g_tmp, tres = ++g_tmp, ti = ++g_tmp;
-  emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre); buf_printf(g_pre, " _t%d = ", trecv); emit_expr(c, recv, g_pre); buf_puts(g_pre, ";\n");
+  { Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+    emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+    buf_printf(g_pre, " _t%d = ", trecv); buf_puts(g_pre, rb.p ? rb.p : ""); buf_puts(g_pre, ";\n"); free(rb.p); }
+
   if (is_sel || is_rej) {
     /* select/reject: produce a same-type hash with matching pairs */
-    emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre); buf_printf(g_pre, " _t%d = sp_%sHash_new();\n", tres, hn);
+    emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre);
+    buf_printf(g_pre, " _t%d = sp_%sHash_new();\n", tres, hn);
     emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tres);
-    emit_indent(g_pre, g_indent); buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, trecv, ti);
-    if (p0) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = _t%d->order[_t%d];\n", p0, trecv, ti); }
-    if (p1) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = sp_%sHash_get(_t%d, _t%d->order[_t%d]);\n", p1, hn, trecv, trecv, ti); }
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, trecv, ti);
+    if (p0_orig) {
+      emit_indent(g_pre, g_indent + 1);
+      if (ns0) {
+        st0 = ++g_tmp; emit_ctype(c, p0_actual, g_pre);
+        buf_printf(g_pre, " lv__bp%d = _t%d->order[_t%d];\n", st0, trecv, ti);
+        for (int ri = 0; ri < g_nren; ri++) {
+          if (strcmp(g_ren_from[ri], p0_orig) == 0) {
+            sri0 = ri; strncpy(sro0, g_ren_to[ri], sizeof sro0 - 1);
+            snprintf(g_ren_to[ri], sizeof g_ren_to[0], "_bp%d", st0); break;
+          }
+        }
+        if (sri0 < 0) { sri0 = g_nren; srn0 = 1;
+          snprintf(g_ren_from[g_nren], sizeof g_ren_from[0], "%s", p0_orig);
+          snprintf(g_ren_to[g_nren++], sizeof g_ren_to[0], "_bp%d", st0);
+        }
+      }
+      else buf_printf(g_pre, "lv_%s = _t%d->order[_t%d];\n", p0, trecv, ti);
+    }
+    if (p1_orig) {
+      emit_indent(g_pre, g_indent + 1);
+      if (ns1) {
+        st1 = ++g_tmp; emit_ctype(c, p1_actual, g_pre);
+        buf_printf(g_pre, " lv__bp%d = sp_%sHash_get(_t%d, _t%d->order[_t%d]);\n", st1, hn, trecv, trecv, ti);
+        for (int ri = 0; ri < g_nren; ri++) {
+          if (strcmp(g_ren_from[ri], p1_orig) == 0) {
+            sri1 = ri; strncpy(sro1, g_ren_to[ri], sizeof sro1 - 1);
+            snprintf(g_ren_to[ri], sizeof g_ren_to[0], "_bp%d", st1); break;
+          }
+        }
+        if (sri1 < 0) { sri1 = g_nren; srn1 = 1;
+          snprintf(g_ren_from[g_nren], sizeof g_ren_from[0], "%s", p1_orig);
+          snprintf(g_ren_to[g_nren++], sizeof g_ren_to[0], "_bp%d", st1);
+        }
+      }
+      else buf_printf(g_pre, "lv_%s = sp_%sHash_get(_t%d, _t%d->order[_t%d]);\n", p1, hn, trecv, trecv, ti);
+    }
+    if (ns0 && p0_lv) p0_lv->type = p0_actual;
+    if (ns1 && p1_lv) p1_lv->type = p1_actual;
     for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
     int save = g_indent; g_indent++;
     Buf vb; memset(&vb, 0, sizeof vb); emit_expr(c, bb[bn - 1], &vb); g_indent = save;
+    if (ns0 && p0_lv) p0_lv->type = p0_decl;
+    if (ns1 && p1_lv) p1_lv->type = p1_decl;
+    if (sri1 >= 0) { if (srn1) g_nren = sri1; else strncpy(g_ren_to[sri1], sro1, sizeof g_ren_to[0]-1); }
+    if (sri0 >= 0) { if (srn0) g_nren = sri0; else strncpy(g_ren_to[sri0], sro0, sizeof g_ren_to[0]-1); }
     emit_indent(g_pre, g_indent + 1);
-    /* emit: if (cond) sp_XXHash_set(out, key, val); */
-    TyKind kt = ty_hash_key(rt), vt = ty_hash_val(rt);
+    TyKind vtt = ty_hash_val(rt);
     buf_printf(g_pre, "if (%s(%s)) { ", is_rej ? "!" : "", vb.p ? vb.p : "0"); free(vb.p);
     if (rt == TY_POLY_POLY_HASH) {
       buf_printf(g_pre, "sp_%sHash_set(_t%d, ", hn, tres);
-      if (p0) buf_printf(g_pre, "lv_%s", p0); else buf_printf(g_pre, "_t%d->order[_t%d]", trecv, ti);
+      if (p0_orig) buf_printf(g_pre, "_t%d->order[_t%d]", trecv, ti);
+      else buf_printf(g_pre, "_t%d->order[_t%d]", trecv, ti);
       buf_printf(g_pre, ", sp_%sHash_get(_t%d, _t%d->order[_t%d])); }", hn, trecv, trecv, ti);
     }
     else {
       buf_printf(g_pre, "sp_%sHash_set(_t%d, _t%d->order[_t%d], sp_%sHash_%s(_t%d, _t%d->order[_t%d])); }",
-                 hn, tres, trecv, ti, hn, vt == TY_INT ? "get_opt" : "get", trecv, trecv, ti);
-      (void)kt;
+                 hn, tres, trecv, ti, hn, vtt == TY_INT ? "get_opt" : "get", trecv, trecv, ti);
     }
     buf_puts(g_pre, "\n");
     emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
@@ -691,17 +759,71 @@ static int emit_hash_collect_expr(Compiler *c, int id, Buf *b) {
     int res_poly = (restype == TY_POLY_ARRAY);
     const char *rk = res_poly ? "Poly" : array_kind(restype);
     if (!rk) return 0;
-    emit_indent(g_pre, g_indent); buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", rk, tres, rk);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", rk, tres, rk);
     emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tres);
-    emit_indent(g_pre, g_indent); buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, trecv, ti);
-    if (p0) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = _t%d->order[_t%d];\n", p0, trecv, ti); }
-    if (p1) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "lv_%s = sp_%sHash_get(_t%d, _t%d->order[_t%d]);\n", p1, hn, trecv, trecv, ti); }
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "for (mrb_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, trecv, ti);
+    if (p0_orig) {
+      emit_indent(g_pre, g_indent + 1);
+      if (ns0) {
+        st0 = ++g_tmp; emit_ctype(c, p0_actual, g_pre);
+        if (p1_orig) buf_printf(g_pre, " lv__bp%d = _t%d->order[_t%d];\n", st0, trecv, ti);
+        else buf_printf(g_pre, " lv__bp%d = sp_%sHash_get(_t%d, _t%d->order[_t%d]);\n", st0, hn, trecv, trecv, ti);
+        for (int ri = 0; ri < g_nren; ri++) {
+          if (strcmp(g_ren_from[ri], p0_orig) == 0) {
+            sri0 = ri; strncpy(sro0, g_ren_to[ri], sizeof sro0 - 1);
+            snprintf(g_ren_to[ri], sizeof g_ren_to[0], "_bp%d", st0); break;
+          }
+        }
+        if (sri0 < 0) { sri0 = g_nren; srn0 = 1;
+          snprintf(g_ren_from[g_nren], sizeof g_ren_from[0], "%s", p0_orig);
+          snprintf(g_ren_to[g_nren++], sizeof g_ren_to[0], "_bp%d", st0);
+        }
+      }
+      else {
+        if (p1_orig) buf_printf(g_pre, "lv_%s = _t%d->order[_t%d];\n", p0, trecv, ti);
+        else buf_printf(g_pre, "lv_%s = sp_%sHash_get(_t%d, _t%d->order[_t%d]);\n", p0, hn, trecv, trecv, ti);
+      }
+    }
+    if (p1_orig) {
+      emit_indent(g_pre, g_indent + 1);
+      if (ns1) {
+        st1 = ++g_tmp; emit_ctype(c, p1_actual, g_pre);
+        buf_printf(g_pre, " lv__bp%d = sp_%sHash_get(_t%d, _t%d->order[_t%d]);\n", st1, hn, trecv, trecv, ti);
+        for (int ri = 0; ri < g_nren; ri++) {
+          if (strcmp(g_ren_from[ri], p1_orig) == 0) {
+            sri1 = ri; strncpy(sro1, g_ren_to[ri], sizeof sro1 - 1);
+            snprintf(g_ren_to[ri], sizeof g_ren_to[0], "_bp%d", st1); break;
+          }
+        }
+        if (sri1 < 0) { sri1 = g_nren; srn1 = 1;
+          snprintf(g_ren_from[g_nren], sizeof g_ren_from[0], "%s", p1_orig);
+          snprintf(g_ren_to[g_nren++], sizeof g_ren_to[0], "_bp%d", st1);
+        }
+      }
+      else buf_printf(g_pre, "lv_%s = sp_%sHash_get(_t%d, _t%d->order[_t%d]);\n", p1, hn, trecv, trecv, ti);
+    }
+    /* Temporarily set scope LocalVar types so infer_type reads the shadow type.
+       This ensures both c->ntype cache and emit_call see the correct operand types. */
+    if (ns0 && p0_lv) p0_lv->type = p0_actual;
+    if (ns1 && p1_lv) p1_lv->type = p1_actual;
+    TyKind bret = infer_type(c, bb[bn - 1]);
+    if (bret == TY_UNKNOWN) bret = (ns1 ? p1_actual : p0_actual);
     for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
     int save = g_indent; g_indent++;
     Buf vb; memset(&vb, 0, sizeof vb); emit_expr(c, bb[bn - 1], &vb); g_indent = save;
+    if (ns0 && p0_lv) p0_lv->type = p0_decl;
+    if (ns1 && p1_lv) p1_lv->type = p1_decl;
+    if (sri1 >= 0) { if (srn1) g_nren = sri1; else strncpy(g_ren_to[sri1], sro1, sizeof g_ren_to[0]-1); }
+    if (sri0 >= 0) { if (srn0) g_nren = sri0; else strncpy(g_ren_to[sri0], sro0, sizeof g_ren_to[0]-1); }
     emit_indent(g_pre, g_indent + 1);
     buf_printf(g_pre, "sp_%sArray_push(_t%d, ", rk, tres);
-    if (res_poly && comp_ntype(c, bb[bn - 1]) != TY_POLY) { Buf bx; memset(&bx, 0, sizeof bx); emit_boxed_text(c, comp_ntype(c, bb[bn - 1]), vb.p ? vb.p : "", &bx); buf_puts(g_pre, bx.p ? bx.p : ""); free(bx.p); }
+    if (res_poly && bret != TY_POLY) {
+      Buf bx; memset(&bx, 0, sizeof bx);
+      emit_boxed_text(c, bret, vb.p ? vb.p : "", &bx);
+      buf_puts(g_pre, bx.p ? bx.p : ""); free(bx.p);
+    }
     else buf_puts(g_pre, vb.p ? vb.p : "");
     buf_puts(g_pre, ");\n"); free(vb.p);
     emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
@@ -785,15 +907,12 @@ static int emit_transform_hash_expr(Compiler *c, int id, Buf *b) {
   }
   TyKind skt = ty_hash_key(rt), svt = ty_hash_val(rt);
   TyKind dvt = ty_hash_val(dt);
-  /* Detect type mismatch: block param unified with other blocks in same scope */
-  TyKind param_ty = keys ? skt : svt;
-  Scope *pscope = comp_scope_of(c, block);
-  LocalVar *param_lv = p0_orig ? scope_local(pscope, p0_orig) : NULL;
-  TyKind declared_ty = param_lv ? param_lv->type : TY_UNKNOWN;
-  int need_shadow = p0_orig && param_ty != TY_UNKNOWN &&
-                    declared_ty != TY_UNKNOWN && declared_ty != param_ty;
-  int shadow_tmp = -1, shadow_ren_idx = -1, shadow_ren_new = 0;
-  char shadow_ren_old[112]; shadow_ren_old[0] = '\0';
+  /* When the scope declares v as TY_POLY but the hash has typed (non-poly) values,
+     box the value on assignment so the poly variable receives sp_RbVal. */
+  Scope *pscope_tv = comp_scope_of(c, block);
+  LocalVar *p0_lv_tv = p0_orig ? scope_local(pscope_tv, p0_orig) : NULL;
+  TyKind p0_scope_ty = p0_lv_tv ? p0_lv_tv->type : TY_UNKNOWN;
+  int needs_box_assign = (p0_scope_ty == TY_POLY && (!keys ? svt != TY_POLY : skt != TY_POLY));
   int ts = ++g_tmp, td = ++g_tmp, ti = ++g_tmp, tk = ++g_tmp;
   Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);  /* recv preludes flush to g_pre first */
   emit_indent(g_pre, g_indent); emit_ctype(c, rt, g_pre); buf_printf(g_pre, " _t%d = ", ts); buf_puts(g_pre, rb.p ? rb.p : ""); buf_puts(g_pre, ";\n"); free(rb.p);
@@ -802,49 +921,28 @@ static int emit_transform_hash_expr(Compiler *c, int id, Buf *b) {
   emit_indent(g_pre, g_indent + 1); emit_ctype(c, skt, g_pre); buf_printf(g_pre, " _t%d = _t%d->order[_t%d];\n", tk, ts, ti);
   if (p0) {
     emit_indent(g_pre, g_indent + 1);
-    if (need_shadow) {
-      shadow_tmp = ++g_tmp;
-      emit_ctype(c, param_ty, g_pre);
-      if (keys) buf_printf(g_pre, " lv__bp%d = _t%d;\n", shadow_tmp, tk);
-      else buf_printf(g_pre, " lv__bp%d = sp_%sHash_get(_t%d, _t%d);\n", shadow_tmp, shn, ts, tk);
-      for (int ri = 0; ri < g_nren; ri++) {
-        if (strcmp(g_ren_from[ri], p0_orig) == 0) {
-          shadow_ren_idx = ri;
-          strncpy(shadow_ren_old, g_ren_to[ri], sizeof shadow_ren_old - 1);
-          snprintf(g_ren_to[ri], sizeof g_ren_to[0], "_bp%d", shadow_tmp);
-          break;
-        }
+    if (keys) {
+      if (needs_box_assign) {
+        Buf bx; memset(&bx, 0, sizeof bx); char gk[64]; snprintf(gk, sizeof gk, "_t%d", tk);
+        emit_boxed_text(c, skt, gk, &bx);
+        buf_printf(g_pre, "lv_%s = %s;\n", p0, bx.p ? bx.p : ""); free(bx.p);
       }
-      if (shadow_ren_idx < 0) {
-        shadow_ren_idx = g_nren; shadow_ren_new = 1;
-        snprintf(g_ren_from[g_nren], sizeof g_ren_from[0], "%s", p0_orig);
-        snprintf(g_ren_to[g_nren], sizeof g_ren_to[0], "_bp%d", shadow_tmp);
-        g_nren++;
-      }
+      else buf_printf(g_pre, "lv_%s = _t%d;\n", p0, tk);
     }
     else {
-      if (keys) buf_printf(g_pre, "lv_%s = _t%d;\n", p0, tk);
+      if (needs_box_assign) {
+        char gv[128]; snprintf(gv, sizeof gv, "sp_%sHash_get(_t%d, _t%d)", shn, ts, tk);
+        Buf bx; memset(&bx, 0, sizeof bx);
+        emit_boxed_text(c, svt, gv, &bx);
+        buf_printf(g_pre, "lv_%s = %s;\n", p0, bx.p ? bx.p : ""); free(bx.p);
+      }
       else buf_printf(g_pre, "lv_%s = sp_%sHash_get(_t%d, _t%d);\n", p0, shn, ts, tk);
     }
-  }
-  /* Patch ntype for block param reads so emit_call sees the correct type */
-  int patched_ids[64]; TyKind patched_old[64]; int npatched = 0;
-  if (need_shadow) {
-    for (int j = 0; j < bn && npatched < 64; j++)
-      npatched += patch_lv_reads(c, bb[j], p0_orig, param_ty,
-                                  patched_ids + npatched, patched_old + npatched, 64 - npatched);
   }
   for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
   int save = g_indent; g_indent++;
   Buf vb; memset(&vb, 0, sizeof vb); emit_expr(c, bb[bn - 1], &vb); g_indent = save;
-  /* Restore patched ntypes and rename */
-  for (int j = 0; j < npatched; j++) c->ntype[patched_ids[j]] = patched_old[j];
-  if (shadow_ren_idx >= 0) {
-    if (shadow_ren_new) g_nren = shadow_ren_idx;
-    else strncpy(g_ren_to[shadow_ren_idx], shadow_ren_old, sizeof g_ren_to[0] - 1);
-  }
   TyKind bret = comp_ntype(c, bb[bn - 1]);
-  if (need_shadow && bret == TY_UNKNOWN) bret = param_ty;
   emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "sp_%sHash_set(_t%d, ", dhn, td);
   if (keys) {
     /* new key = block result; value carried over (box if dst value is poly) */
@@ -4986,13 +5084,19 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         return;
       }
     }
-    if (res == TY_INT) {
+    /* Re-derive result type when cache may be stale due to block-param widening */
+    TyKind eff_res = res;
+    if (eff_res != TY_INT && eff_res != TY_FLOAT && eff_res != TY_BIGINT) {
+      if (rt == TY_FLOAT || a0 == TY_FLOAT) eff_res = TY_FLOAT;
+      else if (rt == TY_INT && (a0 == TY_INT || a0 == TY_UNKNOWN)) eff_res = TY_INT;
+    }
+    if (eff_res == TY_INT) {
       buf_printf(b, "%s(", int_arith_fn(name));
       emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
       buf_puts(b, ")");
       return;
     }
-    if (res == TY_FLOAT && strcmp(name, "%") && strcmp(name, "**")) {
+    if (eff_res == TY_FLOAT && strcmp(name, "%") && strcmp(name, "**")) {
       buf_puts(b, "(");
       emit_expr(c, recv, b);
       buf_printf(b, " %s ", name);
