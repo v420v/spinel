@@ -3567,25 +3567,89 @@ static void emit_call(Compiler *c, int id, Buf *b) {
           buf_puts(b, ")");
         }
         else {
+          /* Check if all descendants agree on return type */
+          TyKind unified = cret;
+          for (int k2 = 0; k2 < c->nclasses; k2++) {
+            if (!is_descendant(c, k2, cid)) continue;
+            int kmi2 = comp_cmethod_in_chain(c, k2, name, NULL);
+            if (kmi2 < 0) continue;
+            TyKind kr = (TyKind)c->scopes[kmi2].ret;
+            if (kr != unified) { unified = TY_POLY; break; }
+          }
           int rtmp = ++g_tmp;
           buf_puts(b, "({ ");
-          emit_ctype(c, cret, b);
+          if (unified == TY_POLY) buf_puts(b, "sp_RbVal");
+          else emit_ctype(c, unified, b);
           buf_printf(b, " _t%d; switch ((%s)->cls_id) {", rtmp, objptr);
           for (int k = 0; k < c->nclasses; k++) {
             if (!is_descendant(c, k, cid)) continue;
             int kmi = comp_cmethod_in_chain(c, k, name, NULL);
             if (kmi < 0) continue;
-            buf_printf(b, " case %d: _t%d = ", k, rtmp);
-            emit_method_cname(c, &c->scopes[kmi], b);
-            buf_puts(b, "(");
-            emit_args_filled(c, kmi, nt_ref(nt, id, "arguments"), "", b);
-            buf_puts(b, "); break;");
+            TyKind kr = (TyKind)c->scopes[kmi].ret;
+            buf_printf(b, " case %d: ", k);
+            if (unified == TY_POLY && (kr == TY_UNKNOWN || kr == TY_VOID)) {
+              /* void-return (raises): call then fall through with nil */
+              emit_method_cname(c, &c->scopes[kmi], b);
+              buf_puts(b, "(");
+              emit_args_filled(c, kmi, nt_ref(nt, id, "arguments"), "", b);
+              buf_printf(b, "); _t%d = sp_box_nil(); break;", rtmp);
+            }
+            else {
+              buf_printf(b, "_t%d = ", rtmp);
+              if (unified == TY_POLY) {
+                const char *boxfn = (kr == TY_INT) ? "sp_box_int" :
+                                    (kr == TY_STRING) ? "sp_box_str" :
+                                    (kr == TY_FLOAT) ? "sp_box_float" :
+                                    (kr == TY_BOOL) ? "sp_box_bool" : NULL;
+                if (boxfn) buf_printf(b, "%s(", boxfn);
+              }
+              emit_method_cname(c, &c->scopes[kmi], b);
+              buf_puts(b, "(");
+              emit_args_filled(c, kmi, nt_ref(nt, id, "arguments"), "", b);
+              buf_puts(b, ")");
+              if (unified == TY_POLY) {
+                const char *boxfn = (kr == TY_INT) ? "sp_box_int" :
+                                    (kr == TY_STRING) ? "sp_box_str" :
+                                    (kr == TY_FLOAT) ? "sp_box_float" :
+                                    (kr == TY_BOOL) ? "sp_box_bool" : NULL;
+                if (boxfn) buf_puts(b, ")");
+              }
+              buf_puts(b, "; break;");
+            }
           }
-          buf_printf(b, " default: _t%d = ", rtmp);
-          emit_method_cname(c, &c->scopes[defmi], b);
-          buf_puts(b, "(");
-          emit_args_filled(c, defmi, nt_ref(nt, id, "arguments"), "", b);
-          buf_printf(b, "); break; } _t%d; })", rtmp);
+          buf_printf(b, " default: ");
+          {
+            TyKind dr = (TyKind)c->scopes[defmi].ret;
+            if (unified == TY_POLY && (dr == TY_UNKNOWN || dr == TY_VOID)) {
+              emit_method_cname(c, &c->scopes[defmi], b);
+              buf_puts(b, "(");
+              emit_args_filled(c, defmi, nt_ref(nt, id, "arguments"), "", b);
+              buf_printf(b, "); _t%d = sp_box_nil(); break;", rtmp);
+            }
+            else {
+              buf_printf(b, "_t%d = ", rtmp);
+              if (unified == TY_POLY) {
+                const char *boxfn = (dr == TY_INT) ? "sp_box_int" :
+                                    (dr == TY_STRING) ? "sp_box_str" :
+                                    (dr == TY_FLOAT) ? "sp_box_float" :
+                                    (dr == TY_BOOL) ? "sp_box_bool" : NULL;
+                if (boxfn) buf_printf(b, "%s(", boxfn);
+              }
+              emit_method_cname(c, &c->scopes[defmi], b);
+              buf_puts(b, "(");
+              emit_args_filled(c, defmi, nt_ref(nt, id, "arguments"), "", b);
+              buf_puts(b, ")");
+              if (unified == TY_POLY) {
+                const char *boxfn = (dr == TY_INT) ? "sp_box_int" :
+                                    (dr == TY_STRING) ? "sp_box_str" :
+                                    (dr == TY_FLOAT) ? "sp_box_float" :
+                                    (dr == TY_BOOL) ? "sp_box_bool" : NULL;
+                if (boxfn) buf_puts(b, ")");
+              }
+              buf_printf(b, "; break;");
+            }
+          }
+          buf_printf(b, " } _t%d; })", rtmp);
         }
         return;
       }
