@@ -6099,6 +6099,20 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (yes >= 0) { buf_puts(b, "((void)("); emit_expr(c, recv, b); buf_printf(b, "), %d)", yes); return; }
   }
 
+  /* poly.is_a?(class_var) where the argument is a TY_CLASS typed expression */
+  if (recv >= 0 && rt == TY_POLY && argc == 1 &&
+      (!strcmp(name, "is_a?") || !strcmp(name, "kind_of?") || !strcmp(name, "instance_of?")) &&
+      comp_ntype(c, argv[0]) == TY_CLASS) {
+    int t = ++g_tmp, k = ++g_tmp;
+    buf_printf(b, "({ sp_RbVal _t%d = ", t); emit_expr(c, recv, b); buf_printf(b, "; ");
+    buf_printf(b, "sp_Class _t%d = ", k); emit_expr(c, argv[0], b); buf_printf(b, "; ");
+    if (!strcmp(name, "instance_of?"))
+      buf_printf(b, "sp_poly_get_class(_t%d).cls_id == _t%d.cls_id; })", t, k);
+    else
+      buf_printf(b, "sp_poly_is_a(_t%d, _t%d); })", t, k);
+    return;
+  }
+
   /* poly.is_a?(Class) / kind_of?: runtime tag/cls_id check */
   if (recv >= 0 && rt == TY_POLY && argc == 1 &&
       (!strcmp(name, "is_a?") || !strcmp(name, "kind_of?") || !strcmp(name, "instance_of?"))) {
@@ -6637,8 +6651,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     unsupported(c, id, "equality");
   }
 
-  /* obj.is_a?/kind_of?/instance_of?(Class): resolved at compile time from
-     the receiver's static class. */
+  /* obj.is_a?/kind_of?/instance_of?(Class): resolved via sp_class_le for
+     correctness with module includes; falls back to constant for builtins. */
   if (recv >= 0 && ty_is_object(rt) && argc == 1 &&
       (!strcmp(name, "is_a?") || !strcmp(name, "kind_of?") || !strcmp(name, "instance_of?"))) {
     const char *cn = nt_type(nt, argv[0]) && !strcmp(nt_type(nt, argv[0]), "ConstantReadNode")
@@ -6646,12 +6660,22 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (cn) {
       int cid = ty_object_class(rt);
       int target = comp_class_index(c, cn);
-      int yes;
-      if (target >= 0) yes = !strcmp(name, "instance_of?") ? (cid == target) : is_descendant(c, cid, target);
-      else yes = 0;  /* a user object is not a builtin (Integer/String/...) */
-      /* evaluate the receiver for side effects, then the constant result */
-      buf_puts(b, "(("); emit_expr(c, recv, b); buf_printf(b, "), %d)", yes);
-      return;
+      if (target >= 0) {
+        if (!strcmp(name, "instance_of?")) {
+          buf_puts(b, "((void)("); emit_expr(c, recv, b);
+          buf_printf(b, "), %d)", cid == target);
+        }
+        else {
+          /* use sp_class_le_mod (via macro) so includes chain is checked */
+          buf_puts(b, "((void)("); emit_expr(c, recv, b);
+          buf_printf(b, "), sp_class_le(((sp_Class){%d}),((sp_Class){%d})))", cid, target);
+        }
+        return;
+      }
+      else {
+        buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, "), 0)");
+        return;
+      }
     }
   }
 
@@ -16436,10 +16460,19 @@ char *codegen_program(const NodeTable *nt) {
     buf_puts(&b, "  sp_Class cur=c;\n");
     int depth2 = c->nclasses + 20;
     buf_printf(&b, "  for(int _i=0;_i<%d;_i++){\n", depth2);
-    /* For builtin parent (negative cls_id), follow builtin chain. */
+    /* When we reach a builtin class while walking user-class ancestors:
+       if we STARTED from a builtin (c.cls_id<0), follow the full builtin
+       chain with module includes; if we STARTED from a user class (c.cls_id>=0),
+       stop here so that user-class .ancestors only returns user ancestors. */
     buf_puts(&b, "    if(cur.cls_id<0){\n");
+    buf_puts(&b, "      if(c.cls_id>=0)break;\n");  /* started from user class: stop */
     buf_puts(&b, "      while(1){\n");
     buf_puts(&b, "        sp_PolyArray_push(a,sp_box_class(cur));\n");
+    /* Numeric includes Comparable; Array/Hash include Enumerable; String includes Comparable */
+    buf_puts(&b, "        if(cur.cls_id==-113) sp_PolyArray_push(a,sp_box_class(((sp_Class){-114})));\n");  /* Numeric->Comparable */
+    buf_puts(&b, "        if(cur.cls_id==-104||cur.cls_id==-105) sp_PolyArray_push(a,sp_box_class(((sp_Class){-115})));\n");  /* Array/Hash->Enumerable */
+    buf_puts(&b, "        if(cur.cls_id==-102) sp_PolyArray_push(a,sp_box_class(((sp_Class){-114})));\n");  /* String->Comparable */
+    buf_puts(&b, "        if(cur.cls_id==-116) sp_PolyArray_push(a,sp_box_class(((sp_Class){-119})));\n");  /* Object->Kernel */
     buf_puts(&b, "        sp_Class bn=sp_builtin_superclass(cur);\n");
     buf_puts(&b, "        if(bn.cls_id==cur.cls_id)break;\n");
     buf_puts(&b, "        cur=bn;\n");
@@ -16471,11 +16504,32 @@ char *codegen_program(const NodeTable *nt) {
     buf_puts(&b, "    sp_RbVal v=sp_PolyArray_get(ancs,_i);\n");
     buf_puts(&b, "    if(v.tag==7&&(int)v.cls_id==b.cls_id)return 1;\n");
     buf_puts(&b, "  }\n");
+    /* User-class sp_class_ancestors stops before builtin parents.
+       If the target is a builtin, fall back to the chain-walking check. */
+    buf_puts(&b, "  if(b.cls_id<0)return sp_class_is_ancestor(b,a);\n");
     buf_puts(&b, "  return 0;\n}\n");
     buf_puts(&b, "#undef sp_class_le\n#define sp_class_le sp_class_le_mod\n");
     buf_puts(&b, "#undef sp_class_lt\n#define sp_class_lt(a,b) ((a).cls_id!=(b).cls_id&&sp_class_le_mod(a,b))\n");
     buf_puts(&b, "#undef sp_class_gt\n#define sp_class_gt(a,b) ((a).cls_id!=(b).cls_id&&sp_class_le_mod(b,a))\n");
     buf_puts(&b, "#undef sp_class_ge\n#define sp_class_ge(a,b) sp_class_le_mod(b,a)\n");
+    /* sp_poly_get_class: maps a poly value to its sp_Class for dynamic is_a? */
+    buf_puts(&b,
+      "static sp_Class sp_poly_get_class(sp_RbVal v){\n"
+      "  switch(v.tag){\n"
+      "  case SP_TAG_INT: return ((sp_Class){-100});\n"
+      "  case SP_TAG_STR: return ((sp_Class){-102});\n"
+      "  case SP_TAG_FLT: return ((sp_Class){-101});\n"
+      "  case SP_TAG_BOOL: return v.v.b?((sp_Class){-111}):((sp_Class){-112});\n"
+      "  case SP_TAG_NIL: return ((sp_Class){-110});\n"
+      "  case SP_TAG_SYM: return ((sp_Class){-103});\n"
+      "  case SP_TAG_OBJ: if(v.cls_id>=0)return ((sp_Class){v.cls_id});\n"
+      "    if(v.cls_id>=-12)return ((sp_Class){-104});\n"  /* arrays */
+      "    if(v.cls_id>=-20)return ((sp_Class){-105});\n"  /* hashes */
+      "    return ((sp_Class){-116});\n"
+      "  default: return ((sp_Class){-116});\n"
+      "  }\n}\n"
+      "static int sp_poly_is_a(sp_RbVal obj,sp_Class klass){\n"
+      "  return sp_class_le(sp_poly_get_class(obj),klass);\n}\n");
     for (int ci = 0; ci < c->nclasses; ci++) free(cls_incs[ci]);
     free(cls_incs); free(cls_nincs);
   }
