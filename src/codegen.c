@@ -5850,6 +5850,15 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (!strcmp(name, "chr"))        { buf_puts(b, "sp_box_str(sp_str_chr(sp_poly_to_s("); emit_expr(c, recv, b); buf_puts(b, ")))"); return; }
     if (!strcmp(name, "freeze"))     { emit_expr(c, recv, b); return; }
   }
+  /* poly receiver: arr[start, len] = src -- 3-arg splice assign */
+  if (recv >= 0 && rt == TY_POLY && !strcmp(name, "[]=") && argc == 3) {
+    int tv = ++g_tmp;
+    buf_puts(b, "({ sp_RbVal _t"); buf_printf(b, "%d = ", tv); emit_boxed(c, argv[2], b);
+    buf_puts(b, "; sp_poly_splice("); emit_expr(c, recv, b); buf_puts(b, ", ");
+    emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b);
+    buf_printf(b, ", _t%d); _t%d; })", tv, tv);
+    return;
+  }
   /* poly receiver: []= with symbol, string, int, or poly key -> runtime dispatch */
   if (recv >= 0 && rt == TY_POLY && !strcmp(name, "[]=") && argc == 2) {
     TyKind at = comp_ntype(c, argv[0]);
@@ -5879,6 +5888,12 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     return;
   }
   /* poly receiver: [] with symbol or string key -> runtime dispatch */
+  /* poly receiver: arr[start, len] -> sp_poly_slice (string or typed array) */
+  if (recv >= 0 && rt == TY_POLY && !strcmp(name, "[]") && argc == 2) {
+    buf_puts(b, "sp_poly_slice("); emit_expr(c, recv, b); buf_puts(b, ", ");
+    emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
+    return;
+  }
   if (recv >= 0 && rt == TY_POLY && !strcmp(name, "[]") && argc == 1) {
     TyKind at = comp_ntype(c, argv[0]);
     /* Only use the fast single-call path when no user class defines [].

@@ -3270,6 +3270,48 @@ static sp_RbVal sp_poly_arr_get(sp_RbVal a, mrb_int i) {
 /* Issues #770, #789: NULL + bounds guard. Out-of-range set no-ops. */
 static void sp_PolyArray_set(sp_PolyArray *a, mrb_int i, sp_RbVal v) { if (!a) return; if (a->frozen) { sp_raise_frozen_array(); return; } mrb_int orig=i; if (i < 0) i += a->len; if (i < 0) sp_raise_cls("IndexError", sp_sprintf("index %lld too small for array; minimum: %lld",(long long)orig,(long long)-a->len)); if (i >= a->len) return; a->data[i] = v; }
 static sp_PolyArray *sp_PolyArray_slice(sp_PolyArray *a, mrb_int start, mrb_int len) { if (start < 0) start += a->len; if (start < 0) start = 0; sp_PolyArray *b = sp_PolyArray_new(); if (start >= a->len || len <= 0) return b; if (start + len > a->len) len = a->len - start; for (mrb_int i = 0; i < len; i++) sp_PolyArray_push(b, a->data[start + i]); return b; }
+/* 2-arg slice on a poly receiver: dispatch to the typed slice functions. */
+static sp_RbVal sp_poly_slice(sp_RbVal a, mrb_int start, mrb_int len) {
+  if (a.tag == SP_TAG_STR) return sp_box_str(sp_str_sub_range(a.v.s ? a.v.s : "", start, len));
+  if (a.tag != SP_TAG_OBJ) return sp_box_nil();
+  switch (a.cls_id) {
+    case SP_BUILTIN_INT_ARRAY:  return sp_box_int_array(sp_IntArray_slice((sp_IntArray*)a.v.p, start, len));
+    case SP_BUILTIN_FLT_ARRAY:  return sp_box_float_array(sp_FloatArray_slice((sp_FloatArray*)a.v.p, start, len));
+    case SP_BUILTIN_STR_ARRAY:  return sp_box_str_array(sp_StrArray_slice((sp_StrArray*)a.v.p, start, len));
+    case SP_BUILTIN_POLY_ARRAY: return sp_box_poly_array(sp_PolyArray_slice((sp_PolyArray*)a.v.p, start, len));
+    default: return sp_box_nil();
+  }
+}
+/* 3-arg []=: replace `len` elements at `start` with elements from `src`. */
+static void sp_poly_splice(sp_RbVal recv, mrb_int start, mrb_int len, sp_RbVal src) {
+  if (recv.tag != SP_TAG_OBJ) return;
+  mrb_int rlen = 0;
+  if (recv.cls_id == SP_BUILTIN_INT_ARRAY) rlen = ((sp_IntArray*)recv.v.p)->len;
+  else if (recv.cls_id == SP_BUILTIN_POLY_ARRAY) rlen = ((sp_PolyArray*)recv.v.p)->len;
+  else return;
+  if (start < 0) start += rlen;
+  if (start < 0) start = 0;
+  if (len < 0) len = 0;
+  if (start + len > rlen) len = rlen - start;
+  if (recv.cls_id == SP_BUILTIN_INT_ARRAY && src.tag == SP_TAG_OBJ && src.cls_id == SP_BUILTIN_INT_ARRAY) {
+    sp_IntArray *a = (sp_IntArray*)recv.v.p, *s = (sp_IntArray*)src.v.p;
+    mrb_int n = len < s->len ? len : s->len;
+    for (mrb_int i = 0; i < n; i++) a->data[a->start + start + i] = s->data[s->start + i];
+  }
+  else if (recv.cls_id == SP_BUILTIN_POLY_ARRAY) {
+    sp_PolyArray *a = (sp_PolyArray*)recv.v.p;
+    if (src.tag == SP_TAG_OBJ && src.cls_id == SP_BUILTIN_INT_ARRAY) {
+      sp_IntArray *s = (sp_IntArray*)src.v.p;
+      mrb_int n = len < s->len ? len : s->len;
+      for (mrb_int i = 0; i < n; i++) a->data[start + i] = sp_box_int(s->data[s->start + i]);
+    }
+    else if (src.tag == SP_TAG_OBJ && src.cls_id == SP_BUILTIN_POLY_ARRAY) {
+      sp_PolyArray *s = (sp_PolyArray*)src.v.p;
+      mrb_int n = len < s->len ? len : s->len;
+      for (mrb_int i = 0; i < n; i++) a->data[start + i] = s->data[i];
+    }
+  }
+}
 static sp_PolyArray *sp_PolyArray_slice_bang(sp_PolyArray *a, mrb_int from, mrb_int n) {
   if (!a) return sp_PolyArray_new();
   if (a->frozen) { sp_raise_frozen_array(); return sp_PolyArray_new(); }

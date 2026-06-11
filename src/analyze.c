@@ -1310,6 +1310,7 @@ static TyKind infer_call(Compiler *c, int id) {
       if (!strcmp(name, "to_i") || !strcmp(name, "length") || !strcmp(name, "size")) return TY_INT;
       if (!strcmp(name, "to_f")) return TY_FLOAT;
       if (!strcmp(name, "[]") && argc == 1) return TY_POLY;  /* boxed array element access */
+      if (!strcmp(name, "[]") && argc == 2) return TY_POLY;  /* 2-arg poly slice */
       if (!strcmp(name, "dig") && argc >= 1) return TY_POLY;
       {
         int blk = nt_ref(nt, id, "block");
