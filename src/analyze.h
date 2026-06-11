@@ -21,4 +21,13 @@ TyKind infer_type(Compiler *c, int id);
 /* Name of a block's idx-th required parameter, or NULL. */
 const char *block_param_name(Compiler *c, int block, int idx);
 
+/* Returns 1 if the idx-th required param is a MultiTargetNode (tuple destructure). */
+int block_param_is_multi(Compiler *c, int block, int idx);
+
+/* Returns the number of leaves in the MultiTargetNode at requireds[idx]. */
+int block_param_multi_count(Compiler *c, int block, int idx);
+
+/* Returns the name of the leaf_idx-th leaf inside the MultiTargetNode at requireds[idx]. */
+const char *block_param_multi_leaf(Compiler *c, int block, int idx, int leaf_idx);
+
 #endif

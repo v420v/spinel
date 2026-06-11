@@ -878,6 +878,37 @@ static TyKind infer_call(Compiler *c, int id) {
     }
   }
 
+  /* each_cons(n).map/collect { |...| } chain: return array of block result type */
+  if (recv >= 0 && rt == TY_UNKNOWN && (!strcmp(name, "map") || !strcmp(name, "collect")) &&
+      nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+      nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "each_cons") &&
+      nt_ref(nt, recv, "block") < 0) {
+    int blk_ec = nt_ref(nt, id, "block");
+    if (blk_ec >= 0) {
+      int body_ec = nt_ref(nt, blk_ec, "body");
+      int bn_ec = 0; const int *bb_ec = body_ec >= 0 ? nt_arr(nt, body_ec, "body", &bn_ec) : NULL;
+      return ty_array_of(bn_ec > 0 ? infer_type(c, bb_ec[bn_ec - 1]) : TY_UNKNOWN);
+    }
+  }
+
+  /* each_cons(n).with_index(off).map/collect { |...| } chain */
+  if (recv >= 0 && rt == TY_UNKNOWN && (!strcmp(name, "map") || !strcmp(name, "collect")) &&
+      nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+      nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "with_index") &&
+      nt_ref(nt, recv, "block") < 0) {
+    int wi_recv = nt_ref(nt, recv, "receiver");
+    if (wi_recv >= 0 && nt_type(nt, wi_recv) && !strcmp(nt_type(nt, wi_recv), "CallNode") &&
+        nt_str(nt, wi_recv, "name") && !strcmp(nt_str(nt, wi_recv, "name"), "each_cons") &&
+        nt_ref(nt, wi_recv, "block") < 0) {
+      int blk_wi = nt_ref(nt, id, "block");
+      if (blk_wi >= 0) {
+        int body_wi = nt_ref(nt, blk_wi, "body");
+        int bn_wi = 0; const int *bb_wi = body_wi >= 0 ? nt_arr(nt, body_wi, "body", &bn_wi) : NULL;
+        return ty_array_of(bn_wi > 0 ? infer_type(c, bb_wi[bn_wi - 1]) : TY_UNKNOWN);
+      }
+    }
+  }
+
   /* array receiver methods */
   if (recv >= 0 && ty_is_array(rt)) {
     int block = nt_ref(nt, id, "block");
@@ -3696,6 +3727,45 @@ const char *block_param_name(Compiler *c, int block, int idx) {
   return NULL;
 }
 
+int block_param_is_multi(Compiler *c, int block, int idx) {
+  int bp = nt_ref(c->nt, block, "parameters");
+  if (bp < 0) return 0;
+  int pn = nt_ref(c->nt, bp, "parameters");
+  if (pn < 0) return 0;
+  int n = 0;
+  const int *reqs = nt_arr(c->nt, pn, "requireds", &n);
+  if (idx >= n) return 0;
+  const char *ty = nt_type(c->nt, reqs[idx]);
+  return (ty && !strcmp(ty, "MultiTargetNode"));
+}
+
+int block_param_multi_count(Compiler *c, int block, int idx) {
+  int bp = nt_ref(c->nt, block, "parameters");
+  if (bp < 0) return 0;
+  int pn = nt_ref(c->nt, bp, "parameters");
+  if (pn < 0) return 0;
+  int n = 0;
+  const int *reqs = nt_arr(c->nt, pn, "requireds", &n);
+  if (idx >= n) return 0;
+  int lc = 0;
+  nt_arr(c->nt, reqs[idx], "lefts", &lc);
+  return lc;
+}
+
+const char *block_param_multi_leaf(Compiler *c, int block, int idx, int leaf_idx) {
+  int bp = nt_ref(c->nt, block, "parameters");
+  if (bp < 0) return NULL;
+  int pn = nt_ref(c->nt, bp, "parameters");
+  if (pn < 0) return NULL;
+  int n = 0;
+  const int *reqs = nt_arr(c->nt, pn, "requireds", &n);
+  if (idx >= n) return NULL;
+  int lc = 0;
+  const int *lefts = nt_arr(c->nt, reqs[idx], "lefts", &lc);
+  if (!lefts || leaf_idx >= lc) return NULL;
+  return nt_str(c->nt, lefts[leaf_idx], "name");
+}
+
 /* First YieldNode belonging to scope `si`, or -1. */
 static int first_yield(Compiler *c, int si) {
   for (int id = 0; id < c->nt->count; id++) {
@@ -3837,10 +3907,10 @@ static int infer_block_params(Compiler *c) {
     if (recv < 0) continue;
     TyKind rt = infer_type(c, recv);
     const char *p0 = block_param_name(c, block, 0);
-    if (!p0) continue;
+    if (!p0 && !block_param_is_multi(c, block, 0)) continue;
 
     /* then / yield_self: block param receives the receiver value */
-    if (!strcmp(name, "then") || !strcmp(name, "yield_self")) {
+    if ((!strcmp(name, "then") || !strcmp(name, "yield_self")) && p0) {
       Scope *bs = comp_scope_of(c, block);
       LocalVar *lv = scope_local_intern(bs, p0); lv->is_block_param = 1;
       TyKind m = ty_unify(lv->type, rt);
@@ -3917,23 +3987,38 @@ static int infer_block_params(Compiler *c) {
       pt = TY_POLY;
 
     /* array.each_cons(n) / each_slice(n) { |a, b, ...| } -- a single param
-       binds the n-element sub-array; multiple params destructure elements */
+       binds the n-element sub-array; multiple params destructure elements.
+       Also handles |(a, b)| destructuring: leaves bind to element type. */
     if ((!strcmp(name, "each_cons") || !strcmp(name, "each_slice")) && ty_is_array(rt)) {
       Scope *es = comp_scope_of(c, block);
       int np = 0; while (block_param_name(c, block, np)) np++;
-      for (int pj = 0; pj < np; pj++) {
-        const char *pn = block_param_name(c, block, pj);
-        LocalVar *lp = scope_local_intern(es, pn); lp->is_block_param = 1;
-        TyKind want = (np == 1) ? rt : ty_array_elem(rt);
-        TyKind m = ty_unify(lp->type, want);
-        if (m != lp->type) { lp->type = m; changed = 1; }
+      if (np == 0 && block_param_is_multi(c, block, 0)) {
+        TyKind elem = ty_array_elem(rt);
+        int lc = block_param_multi_count(c, block, 0);
+        for (int li = 0; li < lc; li++) {
+          const char *ln = block_param_multi_leaf(c, block, 0, li);
+          if (!ln) continue;
+          LocalVar *lp = scope_local_intern(es, ln); lp->is_block_param = 1;
+          TyKind m = ty_unify(lp->type, elem);
+          if (m != lp->type) { lp->type = m; changed = 1; }
+        }
+      }
+      else {
+        for (int pj = 0; pj < np; pj++) {
+          const char *pn = block_param_name(c, block, pj);
+          LocalVar *lp = scope_local_intern(es, pn); lp->is_block_param = 1;
+          TyKind want = (np == 1) ? rt : ty_array_elem(rt);
+          TyKind m = ty_unify(lp->type, want);
+          if (m != lp->type) { lp->type = m; changed = 1; }
+        }
       }
       continue;
     }
 
     /* array.each_slice(n).map/collect { |x, y, ...| } chain: each block param
        gets the element type of the original array (slice elements).
-       array.each_cons(n).map { |pair| } chain: block param gets the array type. */
+       array.each_cons(n).map { |pair| } chain: block param gets the array type.
+       Also handles |(a, b)| destructuring as the first param. */
     if ((!strcmp(name, "map") || !strcmp(name, "collect")) && rt == TY_UNKNOWN &&
         nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
         nt_str(nt, recv, "name") && (!strcmp(nt_str(nt, recv, "name"), "each_slice") ||
@@ -3943,18 +4028,78 @@ static int infer_block_params(Compiler *c) {
       TyKind arr_t2 = es_recv2 >= 0 ? infer_type(c, es_recv2) : TY_UNKNOWN;
       int is_cons2 = !strcmp(nt_str(nt, recv, "name"), "each_cons");
       if (ty_is_array(arr_t2)) {
-        /* each_slice: block params get element type; each_cons: single param
-           gets the array type (a sub-array slice of the original). */
         TyKind bp_t2 = is_cons2 ? arr_t2 : ty_array_elem(arr_t2);
         if (bp_t2 != TY_UNKNOWN) {
           Scope *es2 = comp_scope_of(c, block);
           int np2 = 0; while (block_param_name(c, block, np2)) np2++;
-          for (int pj2 = 0; pj2 < np2; pj2++) {
-            const char *pn2 = block_param_name(c, block, pj2);
-            if (!pn2) break;
-            LocalVar *lp2 = scope_local_intern(es2, pn2); lp2->is_block_param = 1;
-            TyKind m2 = ty_unify(lp2->type, bp_t2);
-            if (m2 != lp2->type) { lp2->type = m2; changed = 1; }
+          if (np2 == 0 && is_cons2 && block_param_is_multi(c, block, 0)) {
+            /* |(a, b)| destructuring: each leaf gets element type */
+            TyKind elem2 = ty_array_elem(arr_t2);
+            if (elem2 != TY_UNKNOWN) {
+              int lc2 = block_param_multi_count(c, block, 0);
+              for (int li = 0; li < lc2; li++) {
+                const char *ln = block_param_multi_leaf(c, block, 0, li);
+                if (!ln) continue;
+                LocalVar *lp = scope_local_intern(es2, ln); lp->is_block_param = 1;
+                TyKind m2 = ty_unify(lp->type, elem2);
+                if (m2 != lp->type) { lp->type = m2; changed = 1; }
+              }
+            }
+          }
+          else {
+            for (int pj2 = 0; pj2 < np2; pj2++) {
+              const char *pn2 = block_param_name(c, block, pj2);
+              if (!pn2) break;
+              LocalVar *lp2 = scope_local_intern(es2, pn2); lp2->is_block_param = 1;
+              TyKind m2 = ty_unify(lp2->type, bp_t2);
+              if (m2 != lp2->type) { lp2->type = m2; changed = 1; }
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    /* array.each_cons(n).with_index(off).map { |pair, i| } or { |(a,b), i| } chain */
+    if ((!strcmp(name, "map") || !strcmp(name, "collect")) && rt == TY_UNKNOWN &&
+        nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+        nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "with_index") &&
+        nt_ref(nt, recv, "block") < 0) {
+      int wi_recv = nt_ref(nt, recv, "receiver");
+      if (wi_recv >= 0 && nt_type(nt, wi_recv) && !strcmp(nt_type(nt, wi_recv), "CallNode") &&
+          nt_str(nt, wi_recv, "name") && !strcmp(nt_str(nt, wi_recv, "name"), "each_cons") &&
+          nt_ref(nt, wi_recv, "block") < 0) {
+        int ec_recv = nt_ref(nt, wi_recv, "receiver");
+        TyKind ec_arr_t = ec_recv >= 0 ? infer_type(c, ec_recv) : TY_UNKNOWN;
+        if (ty_is_array(ec_arr_t)) {
+          Scope *wi_es = comp_scope_of(c, block);
+          TyKind elem_t = ty_array_elem(ec_arr_t);
+          /* p0 is the pair (array) or |(a,b)| multi-target; p1 is the int index */
+          const char *idx_p = block_param_name(c, block, 1);
+          if (idx_p) {
+            LocalVar *ip = scope_local_intern(wi_es, idx_p); ip->is_block_param = 1;
+            TyKind im = ty_unify(ip->type, TY_INT);
+            if (im != ip->type) { ip->type = im; changed = 1; }
+          }
+          if (block_param_is_multi(c, block, 0)) {
+            /* |(a, b), i|: destructure first multi-target param */
+            int lc3 = block_param_multi_count(c, block, 0);
+            for (int li = 0; li < lc3; li++) {
+              const char *ln = block_param_multi_leaf(c, block, 0, li);
+              if (!ln) continue;
+              LocalVar *lp = scope_local_intern(wi_es, ln); lp->is_block_param = 1;
+              TyKind m3 = ty_unify(lp->type, elem_t);
+              if (m3 != lp->type) { lp->type = m3; changed = 1; }
+            }
+          }
+          else {
+            /* |pair, i|: pair gets the sub-array type */
+            const char *pair_p = block_param_name(c, block, 0);
+            if (pair_p) {
+              LocalVar *pp = scope_local_intern(wi_es, pair_p); pp->is_block_param = 1;
+              TyKind m3 = ty_unify(pp->type, ec_arr_t);
+              if (m3 != pp->type) { pp->type = m3; changed = 1; }
+            }
           }
           continue;
         }
@@ -4196,6 +4341,7 @@ static int infer_block_params(Compiler *c) {
         continue;
       }
     }
+    if (!p0) continue;
     LocalVar *lv = scope_local_intern(s, p0); lv->is_block_param = 1;
     /* Don't widen an array-typed variable to a scalar via block-param
        inference.  When the variable already holds an array (set by a write
