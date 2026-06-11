@@ -4488,7 +4488,11 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       return;
     }
     if (!strcmp(name, "nil?")) { buf_puts(b, "0"); return; }
-    if (!strcmp(name, "class")) { buf_puts(b, "SPL(\"Class\")"); return; }
+    if (!strcmp(name, "class")) {
+      buf_printf(b, "({ sp_Class _cl%da = ", _clt); emit_expr(c, recv, b);
+      buf_printf(b, "; sp_class_is_module_val(_cl%da)?SPL(\"Module\"):SPL(\"Class\"); })", _clt);
+      return;
+    }
     if (!strcmp(name, "superclass") && argc == 0) {
       buf_printf(b, "({ sp_Class _cl%d = ", _clt); emit_expr(c, recv, b);
       buf_printf(b, "; sp_class_superclass(_cl%d); })", _clt);
@@ -4526,6 +4530,35 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "({ sp_Class _cl%d = ", _clt); emit_expr(c, recv, b);
         buf_printf(b, "; sp_Class _cl%da = ", _clt); emit_expr(c, argv[0], b);
         buf_printf(b, "; %s(_cl%d, _cl%da); })", fn, _clt, _clt);
+        return;
+      }
+    }
+    /* klass.is_a?/kind_of?(Module|Class|Object|BasicObject) */
+    if (argc == 1 && (!strcmp(name, "is_a?") || !strcmp(name, "kind_of?") || !strcmp(name, "instance_of?"))) {
+      int exact = !strcmp(name, "instance_of?");
+      const char *cn2 = nt_type(nt, argv[0]) && !strcmp(nt_type(nt, argv[0]), "ConstantReadNode")
+                        ? nt_str(nt, argv[0], "name") : NULL;
+      if (cn2) {
+        buf_printf(b, "({ sp_Class _cl%d = ", _clt); emit_expr(c, recv, b); buf_puts(b, "; ");
+        /* Module: all class/module values are instances of Module */
+        if (!strcmp(cn2, "Module")) {
+          if (exact) buf_printf(b, "sp_class_is_module_val(_cl%d); })", _clt);
+          else buf_printf(b, "1; })");
+        }
+        /* Class: user classes only (not modules); builtin Class constant is -109 */
+        else if (!strcmp(cn2, "Class")) {
+          if (exact)
+            buf_printf(b, "(_cl%d.cls_id>=0?!sp_class_is_module_val(_cl%d):(_cl%d.cls_id==-109)); })", _clt, _clt, _clt);
+          else
+            buf_printf(b, "(_cl%d.cls_id>=0?!sp_class_is_module_val(_cl%d):(_cl%d.cls_id==-109||_cl%d.cls_id==-108)); })", _clt, _clt, _clt, _clt);
+        }
+        else if (!strcmp(cn2, "Object") || !strcmp(cn2, "BasicObject")) {
+          buf_printf(b, "1; })");
+        }
+        else {
+          /* Unknown target: emit 0 with side effect */
+          buf_printf(b, "((void)_cl%d, 0); })", _clt);
+        }
         return;
       }
     }
@@ -4804,6 +4837,25 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         }
       }
     }
+  }
+
+  /* TY_CLASS variable .new -> runtime switch over user classes, returns TY_POLY */
+  if (recv >= 0 && !strcmp(name, "new") && comp_ntype(c, recv) == TY_CLASS &&
+      nt_type(nt, recv) &&
+      strcmp(nt_type(nt, recv), "ConstantReadNode") != 0 &&
+      strcmp(nt_type(nt, recv), "ConstantPathNode") != 0 &&
+      argc == 0) {
+    int kt = ++g_tmp, rt2 = ++g_tmp;
+    buf_printf(b, "({ sp_Class _t%d = ", kt); emit_expr(c, recv, b); buf_printf(b, "; ");
+    buf_printf(b, "sp_RbVal _t%d = sp_box_nil(); ", rt2);
+    buf_printf(b, "switch(_t%d.cls_id){", kt);
+    for (int ci = 0; ci < c->nclasses; ci++) {
+      if (is_builtin_reopen(c->classes[ci].name)) continue;
+      buf_printf(b, "case %d: _t%d=sp_box_obj(sp_%s_new(),%d);break;",
+                 ci, rt2, c->classes[ci].name, ci);
+    }
+    buf_printf(b, "} _t%d; })", rt2);
+    return;
   }
 
   /* self.class.new(args) in a leaf-class instance method -> construct the
@@ -6676,6 +6728,18 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, "), 0)");
         return;
       }
+    }
+    /* Dynamic klass argument typed as TY_CLASS: runtime sp_class_le check */
+    if (comp_ntype(c, argv[0]) == TY_CLASS) {
+      int cid = ty_object_class(rt);
+      int k = ++g_tmp;
+      buf_puts(b, "((void)("); emit_expr(c, recv, b); buf_printf(b, "), ");
+      buf_printf(b, "({ sp_Class _t%d = ", k); emit_expr(c, argv[0], b); buf_printf(b, "; ");
+      if (!strcmp(name, "instance_of?"))
+        buf_printf(b, "((sp_Class){%d}).cls_id == _t%d.cls_id; }))", cid, k);
+      else
+        buf_printf(b, "sp_class_le(((sp_Class){%d}),_t%d); }))", cid, k);
+      return;
     }
   }
 
@@ -16313,8 +16377,11 @@ char *codegen_program(const NodeTable *nt) {
   {
     buf_puts(&b, "static const char *sp_class_to_s(sp_Class c){switch(c.cls_id){");
     for (int i = 0; i < c->nclasses; i++) {
-      if (!is_builtin_reopen(c->classes[i].name))
-        buf_printf(&b, "case %d:return SPL(\"%s\");", i, c->classes[i].name);
+      if (!is_builtin_reopen(c->classes[i].name)) {
+        const char *qname = class_ruby_name(c, i);
+        if (!qname) qname = c->classes[i].name;
+        buf_printf(&b, "case %d:return SPL(\"%s\");", i, qname);
+      }
     }
     /* builtin class name cases (negative cls_ids) */
     buf_puts(&b, "case -100:return SPL(\"Integer\");case -101:return SPL(\"Float\");");
@@ -16335,6 +16402,23 @@ char *codegen_program(const NodeTable *nt) {
     buf_puts(&b, "case -130:return SPL(\"Math\");case -131:return SPL(\"Complex\");");
     buf_puts(&b, "default:return \"\";} }\n\n");
   }
+  /* sp_cls_is_module[i]: 1 if user class i was defined as a module, 0 if class */
+  if (c->nclasses > 0) {
+    buf_printf(&b, "static const int sp_cls_is_module[%d] = {", c->nclasses);
+    for (int i = 0; i < c->nclasses; i++) {
+      if (i) buf_puts(&b, ",");
+      const char *dt = nt_type(c->nt, c->classes[i].def_node);
+      buf_printf(&b, "%d", (dt && !strcmp(dt, "ModuleNode")) ? 1 : 0);
+    }
+    buf_puts(&b, "};\n");
+  }
+  /* sp_class_is_module_val: true if sp_Class c is a module (not a class) */
+  buf_puts(&b, "static int sp_class_is_module_val(sp_Class c){\n");
+  if (c->nclasses > 0)
+    buf_printf(&b, "  if(c.cls_id>=0&&c.cls_id<%d)return sp_cls_is_module[c.cls_id];\n", c->nclasses);
+  /* builtin modules: Comparable(-114), Enumerable(-115), Kernel(-119) */
+  buf_puts(&b, "  return(c.cls_id==-114||c.cls_id==-115||c.cls_id==-119);\n}\n");
+
   /* sp_class_superclass: parent class for user classes (negative ids map to
      Object builtin). Returns ((sp_Class){-116}) for unknown/root. */
   {

@@ -414,8 +414,12 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "parameters")) return TY_POLY_ARRAY;
   }
 
-  /* TY_CLASS method dispatch -- do NOT intercept .new here; fall through to
-     the AST-based handler that knows which class the constant refers to. */
+  /* TY_CLASS method dispatch -- .new on a dynamic class variable returns TY_POLY */
+  if (recv >= 0 && rt == TY_CLASS && !strcmp(name, "new") &&
+      nt_type(nt, recv) && strcmp(nt_type(nt, recv), "ConstantReadNode") != 0 &&
+      strcmp(nt_type(nt, recv), "ConstantPathNode") != 0)
+    return TY_POLY;
+
   if (recv >= 0 && rt == TY_CLASS && strcmp(name, "new") != 0) {
     if (argc == 0 && (!strcmp(name, "to_s") || !strcmp(name, "name") || !strcmp(name, "inspect")))
       return TY_STRING;
@@ -425,6 +429,8 @@ static TyKind infer_call(Compiler *c, int id) {
     if (argc == 1 && (!strcmp(name, "==") || !strcmp(name, "eql?") || !strcmp(name, "!="))) return TY_BOOL;
     if (argc == 1 && (!strcmp(name, "<") || !strcmp(name, ">") || !strcmp(name, "<=") || !strcmp(name, ">="))) return TY_BOOL;
     if (argc == 0 && !strcmp(name, "ancestors")) return TY_POLY_ARRAY;
+    if (argc == 1 && (!strcmp(name, "is_a?") || !strcmp(name, "kind_of?") || !strcmp(name, "instance_of?"))) return TY_BOOL;
+    if (argc == 0 && !strcmp(name, "instance_methods")) return TY_POLY_ARRAY;
   }
 
   /* __method__ / __callee__ -> the enclosing method's name (a symbol) */
