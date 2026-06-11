@@ -425,7 +425,7 @@ static void emit_box_open(Compiler *c, TyKind t, Buf *b) {
 }
 static void emit_box_close(Compiler *c, TyKind t, Buf *b) {
   (void)c;
-  if (t == TY_POLY)           return; /* no-op */
+  if (t == TY_POLY || t == TY_UNKNOWN) return; /* no-op: already sp_RbVal */
   if (ty_is_object(t))        { buf_printf(b, "), %d)", ty_object_class(t)); return; }
   buf_puts(b, ")");
 }
@@ -11732,11 +11732,14 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     if (nm && !strcmp(nm, "RUBY_REVISION"))    { buf_puts(b, "SPL(\"0\")"); return; }
     if (nm && !strcmp(nm, "RUBY_COPYRIGHT"))   { buf_puts(b, "SPL(\"ruby - Copyright (C) 1993-2023 Yukihiro Matsumoto\")"); return; }
     if (nm && !strcmp(nm, "ARGV")) { buf_puts(b, "sp_get_ARGV()"); return; }
-    /* unregistered or untyped constant: emit a runtime NameError raise */
-    if (nm && comp_class_index(c, nm) < 0)
-      buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant %s\"), (const char*)NULL)", nm);
-    else
-      unsupported(c, id, "constant read");
+    if (nm) {
+      int _cidx = comp_class_index(c, nm);
+      if (_cidx >= 0)
+        buf_printf(b, "sp_box_class((sp_Class){%d})", _cidx);  /* class as value */
+      else
+        buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant %s\"), (const char*)NULL)", nm);
+    }
+    else unsupported(c, id, "constant read");
     return;
   }
   if (!strcmp(ty, "ConstantPathNode")) {
@@ -15156,6 +15159,12 @@ static void emit_boxed(Compiler *c, int node, Buf *b) {
   }
   /* regex values can appear in poly context (multi-typed local); box as nil */
   if (t == TY_REGEX) { buf_puts(b, "sp_box_nil()"); return; }
+  /* class constant (e.g. `A` in `slot = A`): box as sp_Class value */
+  if (t == TY_UNKNOWN && nt_type(c->nt, node) && !strcmp(nt_type(c->nt, node), "ConstantReadNode")) {
+    const char *_cnm = nt_str(c->nt, node, "name");
+    int _cidx = _cnm ? comp_class_index(c, _cnm) : -1;
+    if (_cidx >= 0) { buf_printf(b, "sp_box_class((sp_Class){%d})", _cidx); return; }
+  }
   /* an empty array literal [] has TY_UNKNOWN; box it as an empty PolyArray so
      it can hold any element type when stored into a poly slot */
   if (t == TY_UNKNOWN && nt_type(c->nt, node) && !strcmp(nt_type(c->nt, node), "ArrayNode")) {
