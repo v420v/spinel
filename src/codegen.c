@@ -1694,6 +1694,28 @@ static int emit_inject_expr(Compiler *c, int id, Buf *b) {
     int en = 0; nt_arr(nt, recv, "elements", &en);
     if (en == 0) rt = TY_INT_ARRAY;
   }
+  /* `[[ints],...].inject(&:&|:||:-)`: fold the inner int arrays with a set op.
+     Handled before the typed-array path since poly arrays have no array_kind. */
+  if (rt == TY_POLY_ARRAY && comp_is_nested_int_array_literal(c, recv)) {
+    int sblk = nt_ref(nt, id, "block");
+    const char *sop = NULL;
+    if (sblk >= 0 && nt_type(nt, sblk) && !strcmp(nt_type(nt, sblk), "BlockArgumentNode")) {
+      int ex = nt_ref(nt, sblk, "expression");
+      if (ex >= 0 && nt_type(nt, ex) && !strcmp(nt_type(nt, ex), "SymbolNode")) sop = nt_str(nt, ex, "value");
+    }
+    if (sop && (!strcmp(sop, "&") || !strcmp(sop, "|") || !strcmp(sop, "-"))) {
+      const char *sfn = !strcmp(sop, "&") ? "sp_IntArray_intersect"
+                      : !strcmp(sop, "|") ? "sp_IntArray_union" : "sp_IntArray_difference";
+      int ta = ++g_tmp, tn = ++g_tmp, tacc = ++g_tmp, ti = ++g_tmp;
+      buf_printf(b, "({ sp_PolyArray *_t%d = ", ta); emit_expr(c, recv, b);
+      buf_printf(b, "; mrb_int _t%d = sp_PolyArray_length(_t%d); ", tn, ta);
+      buf_printf(b, "sp_IntArray *_t%d = _t%d > 0 ? (sp_IntArray *)sp_PolyArray_get(_t%d, 0).v.p : sp_IntArray_new(); ", tacc, tn, ta);
+      buf_printf(b, "for (mrb_int _t%d = 1; _t%d < _t%d; _t%d++) _t%d = %s(_t%d, (sp_IntArray *)sp_PolyArray_get(_t%d, _t%d).v.p); ",
+                 ti, ti, tn, ti, tacc, sfn, tacc, ta, ti);
+      buf_printf(b, "_t%d; })", tacc);
+      return 1;
+    }
+  }
   if (!ty_is_array(rt)) return 0;
   const char *k = array_kind(rt);
   if (!k) return 0;
@@ -1756,9 +1778,14 @@ static int emit_reduce_block_expr(Compiler *c, int id, Buf *b) {
   if (recv < 0) return 0;
   TyKind rt = comp_ntype(c, recv);
   if (!ty_is_array(rt)) return 0;
+  /* `[[ints],...].inject { |a, b| a & b }`: the inner int arrays are boxed in a
+     poly array; fold them as int arrays (unboxing each element). The poly array
+     itself has no array_kind, so detect this before the typed-array bail. */
+  int nested = (rt == TY_POLY_ARRAY && comp_is_nested_int_array_literal(c, recv));
   const char *k = array_kind(rt);
-  if (!k) return 0;
-  TyKind et = ty_array_elem(rt);
+  if (!k && !nested) return 0;
+  if (nested) k = "Poly";  /* length via sp_PolyArray_length; elements unboxed below */
+  TyKind et = nested ? TY_INT_ARRAY : ty_array_elem(rt);
   int block = nt_ref(nt, id, "block");
   if (block < 0) return 0;
   const char *bty = nt_type(nt, block);
@@ -1787,6 +1814,7 @@ static int emit_reduce_block_expr(Compiler *c, int id, Buf *b) {
   emit_ctype(c, acc_ty, b); buf_printf(b, " _t%d = ", tacc);
   int start;
   if (init >= 0) { emit_expr(c, init, b); buf_puts(b, "; "); start = 0; }
+  else if (nested) { buf_printf(b, "sp_PolyArray_length(_t%d) > 0 ? (sp_IntArray *)sp_PolyArray_get(_t%d, 0).v.p : sp_IntArray_new(); ", ta, ta); start = 1; }
   else { buf_printf(b, "sp_%sArray_length(_t%d) > 0 ? sp_%sArray_get(_t%d, 0) : 0; ", k, ta, k, ta); start = 1; }
   /* Temporarily override block param types to match acc_ty/et so the body
      expression uses the correct C types (same pattern as emit_sort_cmp_expr). */
@@ -1802,7 +1830,8 @@ static int emit_reduce_block_expr(Compiler *c, int id, Buf *b) {
              ti, start, ti, k, ta, ti);
   buf_puts(b, "{ ");
   emit_ctype(c, acc_ty, b); buf_printf(b, " lv_%s = _t%d; ", p0, tacc);
-  emit_ctype(c, et, b); buf_printf(b, " lv_%s = sp_%sArray_get(_t%d, _t%d); ", p1, k, ta, ti);
+  if (nested) { emit_ctype(c, et, b); buf_printf(b, " lv_%s = (sp_IntArray *)sp_PolyArray_get(_t%d, _t%d).v.p; ", p1, ta, ti); }
+  else { emit_ctype(c, et, b); buf_printf(b, " lv_%s = sp_%sArray_get(_t%d, _t%d); ", p1, k, ta, ti); }
   for (int j = 0; j < bn - 1; j++) {
     emit_stmt(c, bb[j], b, 0);
     buf_puts(b, " ");

@@ -1595,6 +1595,17 @@ static TyKind infer_call(Compiler *c, int id) {
       return ty_array_elem(rt);
     }
     if (!strcmp(name, "inject") || !strcmp(name, "reduce")) {
+      /* inject(&:&|:||:-) over a literal array of int arrays: set operation
+         folding the inner arrays -> an int array. */
+      if (rt == TY_POLY_ARRAY && comp_is_nested_int_array_literal(c, recv)) {
+        int blk = nt_ref(nt, id, "block");
+        const char *sop = NULL;
+        if (blk >= 0 && nt_type(nt, blk) && !strcmp(nt_type(nt, blk), "BlockArgumentNode")) {
+          int ex = nt_ref(nt, blk, "expression");
+          if (ex >= 0 && nt_type(nt, ex) && !strcmp(nt_type(nt, ex), "SymbolNode")) sop = nt_str(nt, ex, "value");
+        }
+        if (sop && (!strcmp(sop, "&") || !strcmp(sop, "|") || !strcmp(sop, "-"))) return TY_INT_ARRAY;
+      }
       /* When an init argument is provided, the return type matches the init type.
          inject(:op) is the no-init operator form — the sole symbol arg is the
          operator, NOT an init value, so skip the "return argv[0] type" path. */
@@ -6478,6 +6489,10 @@ static int infer_block_params(Compiler *c) {
       if (!p0) continue;
       Scope *rs = comp_scope_of(c, block);
       TyKind et2 = ty_array_elem(rt);
+      /* `[[ints],...].inject { |a, b| a & b }`: the inner arrays are int arrays,
+         so type both fold params as int arrays rather than poly. */
+      if (rt == TY_POLY_ARRAY && comp_is_nested_int_array_literal(c, nt_ref(nt, id, "receiver")))
+        et2 = TY_INT_ARRAY;
       /* Determine accumulator type from initial value argument (if any) */
       int rargs = nt_ref(nt, id, "arguments");
       int rargc = 0;
@@ -7321,13 +7336,16 @@ static int blkp_needs_rename(Compiler *c, int L) {
   const char *ty = nt_type(nt, L);
   if (ty && !strcmp(ty, "LambdaNode")) return 1;
   if (!ty || strcmp(ty, "BlockNode")) return 0;
-  /* find the CallNode that owns this block; rename only instance_eval/exec
-     splice bodies (runs pre-walk_scope, so no type info to identify
-     trampolines -- those reuse param names rarely and are left to the inliner). */
+  /* Find the CallNode that owns this block. Rename for forms whose block
+     params are typed by a dedicated param-inference pass (so a renamed slot
+     still gets a type): instance_eval/exec splice bodies and inject/reduce
+     folds. Ordinary iteration blocks (each/map/...) keep the inliner's
+     save/restore over the shared slot and must not be renamed. */
   for (int id = 0; id < nt->count; id++) {
     if (nt_ref(nt, id, "block") != L) continue;
     const char *cn = nt_str(nt, id, "name");
-    if (cn && (!strcmp(cn, "instance_eval") || !strcmp(cn, "instance_exec"))) return 1;
+    if (cn && (!strcmp(cn, "instance_eval") || !strcmp(cn, "instance_exec") ||
+               !strcmp(cn, "inject") || !strcmp(cn, "reduce"))) return 1;
     return 0;
   }
   return 0;
@@ -7355,11 +7373,22 @@ static void rename_shadowing_block_params(Compiler *c) {
     for (int i = 0; i < rn; i++) {
       const char *p = nt_str(nt, reqs[i], "name");
       if (!p) continue;
-      /* collision: a write to `p` anywhere outside this block's body */
+      /* collision: the name is used outside this block's body -- as a local
+         write/read or as another block's parameter (param-vs-param, e.g. two
+         inject folds sharing `|a, b|` with different element types). Both pollute
+         the shared LocalVar's type. */
       int collide = 0;
       for (int w = 0; w < n && !collide; w++) {
         if (inbody[w]) continue;
-        if (!lv_node_is_write(nt_type(nt, w))) continue;
+        const char *wty = nt_type(nt, w);
+        int is_param_node = wty && !strcmp(wty, "RequiredParameterNode");
+        if (!lv_node_is_write(wty) && !is_param_node) continue;
+        /* don't let this block's own parameter nodes count as a collision */
+        if (is_param_node) {
+          int own = 0;
+          for (int q = 0; q < rn; q++) if (reqs[q] == w) { own = 1; break; }
+          if (own) continue;
+        }
         const char *wn = nt_str(nt, w, "name");
         if (wn && !strcmp(wn, p)) collide = 1;
       }

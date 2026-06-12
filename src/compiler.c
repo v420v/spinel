@@ -321,6 +321,33 @@ int comp_sg_reader_const(Compiler *c, int call_id) {
   return comp_sg_const_binding(c, ci, nm);
 }
 
+/* A literal ArrayNode whose elements are all integer literals (or empty). */
+static int is_int_array_literal(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, node);
+  if (!ty || strcmp(ty, "ArrayNode")) return 0;
+  int en = 0; const int *els = nt_arr(nt, node, "elements", &en);
+  for (int i = 0; i < en; i++) {
+    const char *et = nt_type(nt, els[i]);
+    if (!et || strcmp(et, "IntegerNode")) return 0;
+  }
+  return 1;
+}
+
+/* A literal nested array `[[..ints..], ...]` -- every element is itself an
+   int-array literal. Used to type the inner arrays of a poly-array for fold
+   operations (e.g. inject(&:&) set intersection over arrays of int arrays). */
+int comp_is_nested_int_array_literal(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, node);
+  if (!ty || strcmp(ty, "ArrayNode")) return 0;
+  int en = 0; const int *els = nt_arr(nt, node, "elements", &en);
+  if (en == 0) return 0;
+  for (int i = 0; i < en; i++)
+    if (!is_int_array_literal(c, els[i])) return 0;
+  return 1;
+}
+
 static int name_in(char **list, int n, const char *name) {
   for (int i = 0; i < n; i++) if (strcmp(list[i], name) == 0) return 1;
   return 0;
