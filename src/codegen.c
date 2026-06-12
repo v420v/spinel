@@ -3176,13 +3176,14 @@ static void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const ch
         emit_arg_or_default(c, m, i, argv[i], out);
       }
       else {
-        /* No positional arg and no keyword match. If the param is a hash-typed
-           optional (e.g. `def f(opts = {})`) and the call site passed a
-           KeywordHashNode (e.g. `f(key: val)`), treat the whole kwh as the
+        /* No positional arg and no keyword match. If the param is hash-typed
+           (required `def f(attrs)` or optional `def f(opts = {})`) and the
+           call site passed a KeywordHashNode (e.g. `f(key: val)`), Ruby packs
+           the keywords into that hash parameter -- treat the whole kwh as the
            implicit hash argument rather than using the default. */
         LocalVar *p = scope_local(m, m->pnames[i]);
         TyKind pt = p ? p->type : TY_INT;
-        int use_kwh = (kwh >= 0 && ty_is_hash(pt) && m->pdefault[i] >= 0);
+        int use_kwh = (kwh >= 0 && ty_is_hash(pt));
         emit_arg_or_default(c, m, i, use_kwh ? kwh : -1, out);
       }
     }
