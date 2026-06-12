@@ -59,6 +59,9 @@ typedef struct {
                           don't overwrite it from the shared body in the fixpoint */
   int ret_proc_ret; /* when ret==TY_PROC: the returned proc's body return type
                        (TyKind), so a caller's `m.call` knows the result type */
+  int blk_ret;      /* for a method with a &block param: the unified value type
+                       its block yields across all call sites, so blocks passed
+                       to it are emitted returning that (common) type */
 
   LocalVar *locals; /* params + body locals */
   int nlocals, clocals;

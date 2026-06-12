@@ -259,10 +259,15 @@ static TyKind yield_value_type(Compiler *c, int mi) {
     if (rmi != mi) continue;
     int bb = nt_ref(nt, blk, "body");
     int bn = 0; const int *bd = bb >= 0 ? nt_arr(nt, bb, "body", &bn) : NULL;
-    if (bn == 0) { result = TY_NIL; break; }
-    TyKind bt = infer_type(c, bd[bn - 1]);
-    result = bt == TY_VOID ? TY_NIL : bt;  /* a void last-expr's block value is nil */
-    break;
+    TyKind bt = (bn == 0) ? TY_NIL : infer_type(c, bd[bn - 1]);
+    if (bt == TY_VOID) bt = TY_NIL;
+    /* A yield-inlined (or self-recursive-lowered) method is specialized per
+       call site, so its internal block type is the first concrete block. A
+       non-inlined method (an escaping &block called via the proc ABI) has one
+       body, so its block value type must unify ALL call sites (string + int
+       block -> poly). */
+    if (c->scopes[mi].yields || c->scopes[mi].is_lowered_yield) { result = bt; break; }
+    result = ty_unify(result, bt);
   }
   g_yvt_depth--;
   return result;
@@ -6880,6 +6885,13 @@ static int infer_return_types(Compiler *c) {
         r = ty_unify(r, return_node_type(c, id));
     }
     if (r != sc->ret) { sc->ret = r; changed = 1; }
+    /* For a method with a &block param, record the value type its block yields
+       (unified across all call sites). Blocks passed to it are emitted returning
+       this common type so the sp_proc_call ABI is consistent. */
+    if (sc->blk_param && sc->blk_param[0] && !sc->yields && !sc->is_lowered_yield) {
+      TyKind bvt = yield_value_type(c, (int)(sc - c->scopes));
+      if (bvt != TY_UNKNOWN && sc->blk_ret != (int)bvt) { sc->blk_ret = (int)bvt; changed = 1; }
+    }
     /* When the method returns a proc, record the proc's body return type so a
        caller's `m.call(...)` resolves its result type (factory pattern). */
     if (r == TY_PROC) {
@@ -7159,15 +7171,49 @@ static int a_proc_body(Compiler *c, int create) {
    scope OUTSIDE any proc body. (A name assigned only inside the proc is a
    proc-local, not a capture -- Ruby's block-local rule.) Captured enclosing
    locals get a heap cell. */
+/* A plain block `m(args) { ... }` passed to a method that keeps a real &block
+   parameter (not yield-inlined) is lifted to a standalone proc function, so it
+   captures enclosing variables exactly like a proc literal. */
+static int a_block_is_lifted(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, id);
+  if (!ty || strcmp(ty, "CallNode")) return 0;
+  int blk = nt_ref(nt, id, "block");
+  if (blk < 0 || !nt_type(nt, blk) || strcmp(nt_type(nt, blk), "BlockNode")) return 0;
+  const char *name = nt_str(nt, id, "name");
+  if (!name) return 0;
+  int recv = nt_ref(nt, id, "receiver");
+  int mi = -1;
+  if (recv < 0) {
+    mi = comp_method_index(c, name);
+    if (mi < 0) { Scope *self = comp_scope_of(c, id); if (self && self->class_id >= 0) mi = comp_method_in_chain(c, self->class_id, name, NULL); }
+  } else {
+    TyKind rt = infer_type(c, recv);
+    if (ty_is_object(rt)) mi = comp_method_in_chain(c, ty_object_class(rt), name, NULL);
+  }
+  if (mi < 0) return 0;
+  Scope *m = &c->scopes[mi];
+  if (!m->blk_param || !m->blk_param[0] || m->yields || m->is_lowered_yield) return 0;
+  /* instance_eval/exec trampolines splice their block at the call site rather
+     than lifting it to a proc, so they are not lifted-block captures. */
+  if (m->class_id >= 0 && !m->is_cmethod && m->name &&
+      comp_trampoline_kind(c, m->class_id, m->name, NULL)) return 0;
+  return 1;
+}
+
+static int a_proc_create_or_lifted(Compiler *c, int id) {
+  return is_proc_create(c, id) || a_block_is_lifted(c, id);
+}
+
 static void mark_proc_captures(Compiler *c) {
   const NodeTable *nt = c->nt;
   char *inproc = (char *)calloc((size_t)nt->count, 1);
   if (!inproc) return;
   for (int id = 0; id < nt->count; id++)
-    if (is_proc_create(c, id)) { int body = a_proc_body(c, id); if (body >= 0) a_mark_subtree(c, body, inproc); }
+    if (a_proc_create_or_lifted(c, id)) { int body = a_proc_body(c, id); if (body >= 0) a_mark_subtree(c, body, inproc); }
 
   for (int id = 0; id < nt->count; id++) {
-    if (!is_proc_create(c, id)) continue;
+    if (!a_proc_create_or_lifted(c, id)) continue;
     int body = a_proc_body(c, id);
     if (body < 0) continue;
     int encl = c->nscope[id];

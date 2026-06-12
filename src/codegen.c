@@ -304,7 +304,11 @@ static void emit_local_ref(Compiler *c, int scope_node, const char *name, Buf *b
     return;
   }
   LocalVar *lv = scope_node >= 0 ? scope_local(comp_scope_of(c, scope_node), name) : NULL;
-  if (lv && lv->is_cell) { buf_printf(b, "(*_cell_%s)", name); return; }
+  if (lv && lv->is_cell) {
+    if (lv->type == TY_PROC) buf_printf(b, "(sp_Proc *)(uintptr_t)(*_cell_%s)", name);
+    else buf_printf(b, "(*_cell_%s)", name);
+    return;
+  }
   buf_printf(b, "lv_%s", rename_local(name));
 }
 
@@ -18123,6 +18127,26 @@ static void emit_proc_literal(Compiler *c, int create, Buf *b) {
   TyKind ret = TY_NIL;
   { int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
     if (bn > 0) ret = comp_ntype(c, bb[bn - 1]); }
+  /* A block passed as a method's &block argument must return the value type the
+     method expects across all its call sites (its blk_ret): if that unified type
+     is poly, return poly here so the sp_proc_call ABI is consistent. */
+  if (ret != TY_POLY) {
+    int owner = -1;
+    for (int oid = 0; oid < nt->count; oid++) if (nt_ref(nt, oid, "block") == create) { owner = oid; break; }
+    if (owner >= 0 && nt_type(nt, owner) && !strcmp(nt_type(nt, owner), "CallNode")) {
+      const char *onm = nt_str(nt, owner, "name");
+      int orecv = nt_ref(nt, owner, "receiver");
+      int mi = -1;
+      if (orecv < 0 && onm) {
+        mi = comp_method_index(c, onm);
+        if (mi < 0) { Scope *osc = comp_scope_of(c, owner); if (osc && osc->class_id >= 0) mi = comp_method_in_chain(c, osc->class_id, onm, NULL); }
+      } else if (orecv >= 0 && onm) {
+        TyKind ort = comp_ntype(c, orecv);
+        if (ty_is_object(ort)) mi = comp_method_in_chain(c, ty_object_class(ort), onm, NULL);
+      }
+      if (mi >= 0 && (TyKind)c->scopes[mi].blk_ret == TY_POLY) ret = TY_POLY;
+    }
+  }
   /* The proc fn returns mrb_int (the ABI); heap-pointer values (strings,
      arrays, hashes, objects) are laundered through (mrb_int)(uintptr_t).
      TY_POLY values are stored in _sp_proc_poly_ret (file-static sp_RbVal)
