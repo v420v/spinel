@@ -7238,11 +7238,148 @@ static int ie_class_of(Compiler *c, int node) {
   return (g_ie_node_class && node >= 0) ? g_ie_node_class[node] : -1;
 }
 
+/* ---- Block/lambda parameter alpha-renaming ----------------------------
+ * Block and lambda parameters are interned into the *enclosing* scope, so a
+ * parameter sharing a name with an enclosing local collapses onto a single
+ * LocalVar (hence one type), corrupting both. Ruby semantics say the two are
+ * distinct (the parameter shadows). When the name is also assigned outside the
+ * block body -- the case that pollutes the shared type -- rename the parameter
+ * and its in-body references to a fresh, collision-free name so they become
+ * separate variables. Runs before walk_scope so all downstream interning and
+ * codegen see the disambiguated names. */
+
+/* The ParametersNode for a block (BlockParametersNode -> ParametersNode) or a
+   lambda (ParametersNode directly). -1 if none / not a plain ParametersNode. */
+static int blkp_params_node(Compiler *c, int create) {
+  const NodeTable *nt = c->nt;
+  int pn = nt_ref(nt, create, "parameters");
+  if (pn < 0) return -1;
+  const char *pty = nt_type(nt, pn);
+  if (pty && !strcmp(pty, "BlockParametersNode")) pn = nt_ref(nt, pn, "parameters");
+  return pn;
+}
+
+static int blkp_binds_param(Compiler *c, int create, const char *name) {
+  int pn = blkp_params_node(c, create);
+  if (pn < 0) return 0;
+  const char *pty = nt_type(c->nt, pn);
+  if (!pty || strcmp(pty, "ParametersNode")) return 0;
+  int rn = 0; const int *reqs = nt_arr(c->nt, pn, "requireds", &rn);
+  for (int i = 0; i < rn; i++) {
+    const char *p = nt_str(c->nt, reqs[i], "name");
+    if (p && !strcmp(p, name)) return 1;
+  }
+  return 0;
+}
+
+static int lv_node_is_named_ref(const char *ty) {
+  return ty && (!strcmp(ty, "LocalVariableReadNode") || !strcmp(ty, "LocalVariableWriteNode") ||
+                !strcmp(ty, "LocalVariableTargetNode") || !strcmp(ty, "LocalVariableOperatorWriteNode") ||
+                !strcmp(ty, "LocalVariableOrWriteNode") || !strcmp(ty, "LocalVariableAndWriteNode"));
+}
+static int lv_node_is_write(const char *ty) {
+  return ty && (!strcmp(ty, "LocalVariableWriteNode") || !strcmp(ty, "LocalVariableTargetNode") ||
+                !strcmp(ty, "LocalVariableOperatorWriteNode") || !strcmp(ty, "LocalVariableOrWriteNode") ||
+                !strcmp(ty, "LocalVariableAndWriteNode"));
+}
+
+/* Rewrite references to `oldn` -> `newn`, stopping at nested defs/classes and
+   at nested blocks/lambdas that re-bind `oldn`. */
+static void blkp_rewrite_refs(Compiler *c, int node, const char *oldn, const char *newn) {
+  if (node < 0) return;
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, node);
+  if (!ty) return;
+  if (!strcmp(ty, "DefNode") || !strcmp(ty, "ClassNode") || !strcmp(ty, "ModuleNode")) return;
+  if ((!strcmp(ty, "BlockNode") || !strcmp(ty, "LambdaNode")) && blkp_binds_param(c, node, oldn)) return;
+  if (lv_node_is_named_ref(ty)) {
+    const char *nm = nt_str(nt, node, "name");
+    if (nm && !strcmp(nm, oldn)) nt_set_str((NodeTable *)nt, node, "name", newn);
+  }
+  int nr = nt_num_refs(nt, node);
+  for (int i = 0; i < nr; i++) blkp_rewrite_refs(c, nt_ref_at(nt, node, i), oldn, newn);
+  int na = nt_num_arrs(nt, node);
+  for (int i = 0; i < na; i++) { int n = 0; const int *ids = nt_arr_at(nt, node, i, &n); for (int k = 0; k < n; k++) blkp_rewrite_refs(c, ids[k], oldn, newn); }
+}
+
+static void blkp_mark_subtree(const NodeTable *nt, int node, char *marks) {
+  if (node < 0) return;
+  marks[node] = 1;
+  int nr = nt_num_refs(nt, node);
+  for (int i = 0; i < nr; i++) blkp_mark_subtree(nt, nt_ref_at(nt, node, i), marks);
+  int na = nt_num_arrs(nt, node);
+  for (int i = 0; i < na; i++) { int n = 0; const int *ids = nt_arr_at(nt, node, i, &n); for (int k = 0; k < n; k++) blkp_mark_subtree(nt, ids[k], marks); }
+}
+
+/* Iteration block parameters (each/map/select/...) are already shadow-safe via
+   a codegen save/restore around the inlined body. Renaming is only needed for
+   forms the inliner does not cover: lambdas lowered to standalone proc
+   functions, and instance_eval/exec (and trampoline) block bodies spliced at
+   the call site. Returns 1 if `L` is such a node. */
+static int blkp_needs_rename(Compiler *c, int L) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, L);
+  if (ty && !strcmp(ty, "LambdaNode")) return 1;
+  if (!ty || strcmp(ty, "BlockNode")) return 0;
+  /* find the CallNode that owns this block; rename only instance_eval/exec
+     splice bodies (runs pre-walk_scope, so no type info to identify
+     trampolines -- those reuse param names rarely and are left to the inliner). */
+  for (int id = 0; id < nt->count; id++) {
+    if (nt_ref(nt, id, "block") != L) continue;
+    const char *cn = nt_str(nt, id, "name");
+    if (cn && (!strcmp(cn, "instance_eval") || !strcmp(cn, "instance_exec"))) return 1;
+    return 0;
+  }
+  return 0;
+}
+
+static void rename_shadowing_block_params(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int n = nt->count;
+  char *inbody = malloc((size_t)n);
+  if (!inbody) return;
+  for (int L = 0; L < n; L++) {
+    const char *ty = nt_type(nt, L);
+    if (!ty || (strcmp(ty, "BlockNode") && strcmp(ty, "LambdaNode"))) continue;
+    if (!blkp_needs_rename(c, L)) continue;
+    int pn = blkp_params_node(c, L);
+    if (pn < 0) continue;
+    const char *pty = nt_type(nt, pn);
+    if (!pty || strcmp(pty, "ParametersNode")) continue;  /* numbered params handled elsewhere */
+    int rn = 0; const int *reqs = nt_arr(nt, pn, "requireds", &rn);
+    if (rn == 0) continue;
+    int body = nt_ref(nt, L, "body");
+    if (body < 0) continue;
+    memset(inbody, 0, (size_t)n);
+    blkp_mark_subtree(nt, body, inbody);
+    for (int i = 0; i < rn; i++) {
+      const char *p = nt_str(nt, reqs[i], "name");
+      if (!p) continue;
+      /* collision: a write to `p` anywhere outside this block's body */
+      int collide = 0;
+      for (int w = 0; w < n && !collide; w++) {
+        if (inbody[w]) continue;
+        if (!lv_node_is_write(nt_type(nt, w))) continue;
+        const char *wn = nt_str(nt, w, "name");
+        if (wn && !strcmp(wn, p)) collide = 1;
+      }
+      if (!collide) continue;
+      char oldn[160], newn[176];
+      snprintf(oldn, sizeof oldn, "%s", p);   /* copy: nt_set_str frees p's storage */
+      snprintf(newn, sizeof newn, "%s__bp%d", oldn, L);
+      nt_set_str((NodeTable *)nt, reqs[i], "name", newn);
+      blkp_rewrite_refs(c, body, oldn, newn);
+    }
+  }
+  free(inbody);
+}
+
 void analyze_program(Compiler *c) {
   /* scope 0 = top level */
   Scope *top = comp_scope_new(c, NULL, -1);
   top->body = nt_ref(c->nt, c->nt->root_id, "statements");
 
+  rename_shadowing_block_params(c);
   walk_scope(c, c->nt->root_id, 0, -1);
   register_structs(c);
   fix_struct_block_scopes(c);

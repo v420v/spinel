@@ -369,6 +369,22 @@ const char *nt_str(const NodeTable *nt, int id, const char *key) {
   return NULL;
 }
 
+int nt_set_str(NodeTable *nt, int id, const char *key, const char *val) {
+  SpNode *nd = (SpNode *)node_at(nt, id);
+  if (!nd) return 0;
+  size_t vlen = strlen(val);
+  for (int j = 0; j < nd->ns; j++) {
+    if (strcmp(nd->s[j].key, key) == 0) {
+      free(nd->s[j].val);
+      nd->s[j].val = malloc(vlen + 1);
+      memcpy(nd->s[j].val, val, vlen + 1);
+      nd->s[j].val_len = vlen;
+      return 1;
+    }
+  }
+  return 0;
+}
+
 size_t nt_str_len(const NodeTable *nt, int id, const char *key) {
   const SpNode *nd = node_at(nt, id);
   if (!nd) return 0;

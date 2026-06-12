@@ -54,6 +54,9 @@ int nt_clone_subtree(NodeTable *nt, int root);
    given defaults so callers can walk freely without bounds checks. */
 const char *nt_type(const NodeTable *nt, int id);          /* NULL if unset */
 const char *nt_str(const NodeTable *nt, int id, const char *key);   /* NULL */
+/* Overwrite an existing string field's value (no-op if the key is absent).
+   Returns 1 if the field was found and updated. */
+int         nt_set_str(NodeTable *nt, int id, const char *key, const char *val);
 size_t      nt_str_len(const NodeTable *nt, int id, const char *key); /* 0 if absent */
 long long   nt_int(const NodeTable *nt, int id, const char *key, long long dflt);
 int         nt_ref(const NodeTable *nt, int id, const char *key);   /* -1 */
