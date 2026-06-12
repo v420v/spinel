@@ -1,0 +1,2564 @@
+#include "analyze_internal.h"
+
+int infer_write_types(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+
+  /* Recompute non-param local types FRESH each iteration: reset to UNKNOWN
+     (saving the old value), then unify all write-site RHS types. This lets
+     a local NARROW as block-param/return inference improves, instead of
+     monotonically widening to POLY from a stale early estimate. */
+  for (int s = 0; s < c->nscopes; s++)
+    for (int i = 0; i < c->scopes[s].nlocals; i++) {
+      LocalVar *lv = &c->scopes[s].locals[i];
+      /* stash old type in gc_root (unused by codegen) so we can detect
+         change; block params are typed elsewhere, so leave them alone */
+      if (!lv->is_param && !lv->is_block_param) { lv->gc_root = (int)lv->type; lv->type = TY_UNKNOWN; }
+    }
+
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty) continue;
+    const char *nm = NULL;
+    TyKind newt = TY_UNKNOWN;
+    if (!strcmp(ty, "LocalVariableWriteNode")) {
+      nm = nt_str(nt, id, "name");
+      int val_id = nt_ref(nt, id, "value");
+      newt = infer_type(c, val_id);
+      /* a `x = nil` write doesn't pin the type: nil is the absent/default
+         value, so the variable takes its non-nil assignments' type */
+      if (newt == TY_NIL) newt = TY_POLY;
+      /* Empty-collection literal `x = []` / `x = {}` returns TY_UNKNOWN from
+         infer_type. If the container-fold from a prior iteration already gave
+         this local a meaningful type (stored in gc_root), preserve it so that
+         downstream uses like `x.map {...}` are not starved of type information. */
+      if (newt == TY_UNKNOWN && nm) {
+        const char *vty2 = nt_type(nt, val_id);
+        int is_empty_col = vty2 && ((!strcmp(vty2, "ArrayNode") &&
+          ({ int _n = 0; nt_arr(nt, val_id, "elements", &_n); _n; }) == 0) ||
+          (!strcmp(vty2, "HashNode") &&
+          ({ int _n2 = 0; nt_arr(nt, val_id, "elements", &_n2); _n2; }) == 0));
+        if (is_empty_col) {
+          Scope *s2 = comp_scope_of(c, id);
+          LocalVar *lv2 = scope_local(s2, nm);
+          if (lv2 && (TyKind)lv2->gc_root != TY_UNKNOWN) newt = (TyKind)lv2->gc_root;
+        }
+        /* `d = h.dup/clone`: inherit receiver's hash type from prior iteration */
+        if (newt == TY_UNKNOWN) {
+          const char *rvty2 = nt_type(nt, val_id);
+          if (rvty2 && !strcmp(rvty2, "CallNode")) {
+            const char *rvnm2 = nt_str(nt, val_id, "name");
+            int rvrecv2 = nt_ref(nt, val_id, "receiver");
+            if (rvrecv2 >= 0 && rvnm2 &&
+                (!strcmp(rvnm2, "dup") || !strcmp(rvnm2, "clone"))) {
+              const char *rrt2 = nt_type(nt, rvrecv2);
+              if (rrt2 && !strcmp(rrt2, "LocalVariableReadNode")) {
+                const char *rrn2 = nt_str(nt, rvrecv2, "name");
+                LocalVar *rlv2 = rrn2 ? scope_local(comp_scope_of(c, rvrecv2), rrn2) : NULL;
+                if (rlv2 && ty_is_hash((TyKind)rlv2->gc_root)) newt = (TyKind)rlv2->gc_root;
+              }
+            }
+          }
+        }
+      }
+    }
+    else if (!strcmp(ty, "LocalVariableOperatorWriteNode")) {
+      nm = nt_str(nt, id, "name");
+      Scope *s = comp_scope_of(c, id);
+      LocalVar *cur = nm ? scope_local(s, nm) : NULL;
+      TyKind vt = infer_type(c, nt_ref(nt, id, "value"));
+      TyKind ct = cur ? (TyKind)cur->gc_root : TY_UNKNOWN; /* old type */
+      if (ct == TY_STRING) newt = TY_STRING;
+      else if (ty_is_numeric(ct) && ty_is_numeric(vt)) {
+        if (ct == TY_FLOAT || vt == TY_FLOAT) newt = TY_FLOAT;
+        else if (ct == TY_BIGINT || vt == TY_BIGINT) newt = TY_BIGINT;
+        else newt = TY_INT;
+      }
+      else newt = ct;
+    }
+    else if (!strcmp(ty, "LocalVariableOrWriteNode") ||
+             !strcmp(ty, "LocalVariableAndWriteNode")) {
+      /* a ||= v / a &&= v : the variable can hold its prior value or v */
+      nm = nt_str(nt, id, "name");
+      Scope *s = comp_scope_of(c, id);
+      LocalVar *cur = nm ? scope_local(s, nm) : NULL;
+      TyKind ct = cur ? (TyKind)cur->gc_root : TY_UNKNOWN;
+      newt = ty_unify(ct, infer_type(c, nt_ref(nt, id, "value")));
+    }
+    else {
+      continue;
+    }
+    if (!nm) continue;
+    LocalVar *lv = scope_local(comp_scope_of(c, id), nm);
+    if (!lv || lv->is_block_param) continue;
+    /* Params are typed from call sites (monotonic widen); a body assignment
+       of a different type widens them too (e.g. `x = "s"` in an int param's
+       body -> poly). Only widen -- never let an unknown RHS reset them. */
+    if (lv->is_param) {
+      if (newt != TY_UNKNOWN) {
+        TyKind m2 = ty_unify(lv->type, newt);
+        if (m2 != lv->type) { lv->type = m2; changed = 1; }
+      }
+      continue;
+    }
+    lv->type = ty_unify(lv->type, newt);
+  }
+
+  /* Second targeted pass for `x = recv.instance_eval/exec { ... }` (and
+     trampoline calls): the call's value is the block's last expression, which
+     may read a block-body local defined at a higher node id than this write.
+     Those locals were just typed by the main loop above, so recompute here so
+     `x` is not stranded at UNKNOWN by within-pass node ordering. */
+  for (int id = 0; id < nt->count; id++) {
+    if (strcmp(nt_type(nt, id) ? nt_type(nt, id) : "", "LocalVariableWriteNode")) continue;
+    int val_id = nt_ref(nt, id, "value");
+    if (val_id < 0 || strcmp(nt_type(nt, val_id) ? nt_type(nt, val_id) : "", "CallNode")) continue;
+    if (nt_ref(nt, val_id, "block") < 0) continue;
+    const char *vnm = nt_str(nt, val_id, "name");
+    int vrecv = nt_ref(nt, val_id, "receiver");
+    if (!vnm || vrecv < 0) continue;
+    int is_ie = !strcmp(vnm, "instance_eval") || !strcmp(vnm, "instance_exec");
+    if (!is_ie) {
+      TyKind vrt = infer_type(c, vrecv);
+      if (!ty_is_object(vrt) || !comp_trampoline_kind(c, ty_object_class(vrt), vnm, NULL)) continue;
+    }
+    const char *nm = nt_str(nt, id, "name");
+    LocalVar *lv = nm ? scope_local(comp_scope_of(c, id), nm) : NULL;
+    if (!lv || lv->is_param || lv->is_block_param) continue;
+    TyKind newt = infer_type(c, val_id);
+    if (newt == TY_NIL) newt = TY_POLY;
+    TyKind m2 = ty_unify(lv->type, newt);
+    if (m2 != lv->type) { lv->type = m2; changed = 1; }
+  }
+
+  /* Multiple assignment `a, b = e0, e1`: each target gets its element's
+     type (the RHS ArrayNode is a tuple here, not an array value). */
+  for (int id = 0; id < nt->count; id++) {
+    if (strcmp(nt_type(nt, id) ? nt_type(nt, id) : "", "MultiWriteNode")) continue;
+    int ln = 0;
+    const int *lefts = nt_arr(nt, id, "lefts", &ln);
+    int value = nt_ref(nt, id, "value");
+    const char *vty = nt_type(nt, value);
+    /* `r, w = IO.pipe` -> both targets are IO handles. */
+    if (ln == 2 && vty && !strcmp(vty, "CallNode") && nt_str(nt, value, "name") &&
+        !strcmp(nt_str(nt, value, "name"), "pipe")) {
+      int vrecv = nt_ref(nt, value, "receiver");
+      if (vrecv >= 0 && nt_type(nt, vrecv) && !strcmp(nt_type(nt, vrecv), "ConstantReadNode") &&
+          nt_str(nt, vrecv, "name") && !strcmp(nt_str(nt, vrecv, "name"), "IO")) {
+        for (int i = 0; i < 2; i++) {
+          if (strcmp(nt_type(nt, lefts[i]) ? nt_type(nt, lefts[i]) : "", "LocalVariableTargetNode")) continue;
+          const char *lnm = nt_str(nt, lefts[i], "name");
+          LocalVar *lv = lnm ? scope_local_intern(comp_scope_of(c, id), lnm) : NULL;
+          if (lv && lv->type != TY_IO) { lv->type = TY_IO; changed = 1; }
+        }
+        continue;
+      }
+    }
+    if (!vty || strcmp(vty, "ArrayNode")) {
+      /* scalar RHS (`a, b = 1`): the first target gets the scalar, the rest
+         their slot default. Type every target as the scalar's kind. Array /
+         hash RHS would splat and is handled elsewhere, so skip those. */
+      int multi_src = vty && (!strcmp(vty, "CallNode") || !strcmp(vty, "SuperNode") ||
+                              !strcmp(vty, "ForwardingSuperNode") || !strcmp(vty, "YieldNode"));
+      if (vty && value >= 0 && !multi_src) {
+        TyKind st = infer_type(c, value);
+        if (st != TY_UNKNOWN && st != TY_NIL && !ty_is_array(st) && !ty_is_hash(st)) {
+          for (int i = 0; i < ln; i++) {
+            if (strcmp(nt_type(nt, lefts[i]) ? nt_type(nt, lefts[i]) : "", "LocalVariableTargetNode")) continue;
+            const char *lnm = nt_str(nt, lefts[i], "name");
+            LocalVar *lv = lnm ? scope_local(comp_scope_of(c, id), lnm) : NULL;
+            if (!lv || lv->is_param || lv->is_block_param) continue;
+            lv->type = ty_unify(lv->type, st);
+          }
+        }
+      }
+      /* any expression returning a typed array: assign element types to targets */
+      if (value >= 0) {
+        TyKind st = infer_type(c, value);
+        /* poly RHS: destructure gives poly elements */
+        if (st == TY_POLY || st == TY_POLY_ARRAY) {
+          Scope *ms_poly = comp_scope_of(c, id);
+          for (int i = 0; i < ln; i++) {
+            const char *lty_p = nt_type(nt, lefts[i]) ? nt_type(nt, lefts[i]) : "";
+            if (!strcmp(lty_p, "LocalVariableTargetNode")) {
+              const char *lnm_p = nt_str(nt, lefts[i], "name");
+              LocalVar *lv_p = lnm_p ? scope_local(ms_poly, lnm_p) : NULL;
+              if (!lv_p || lv_p->is_param || lv_p->is_block_param) continue;
+              TyKind mg_p = ty_unify(lv_p->type, TY_POLY);
+              if (mg_p != lv_p->type) { lv_p->type = mg_p; changed = 1; }
+            }
+          }
+        }
+        if (ty_is_array(st)) {
+          TyKind elem = ty_array_elem(st);
+          int rn2 = 0;
+          const int *rights2 = nt_arr(nt, id, "rights", &rn2);
+          Scope *ms_arr = comp_scope_of(c, id);
+          for (int i = 0; i < ln; i++) {
+            const char *lty_ms = nt_type(nt, lefts[i]) ? nt_type(nt, lefts[i]) : "";
+            if (!strcmp(lty_ms, "LocalVariableTargetNode")) {
+              const char *lnm = nt_str(nt, lefts[i], "name");
+              LocalVar *lv = lnm ? scope_local(ms_arr, lnm) : NULL;
+              if (!lv || lv->is_param || lv->is_block_param) continue;
+              lv->type = ty_unify(lv->type, elem);
+            }
+            else if (!strcmp(lty_ms, "InstanceVariableTargetNode") &&
+                     ms_arr && ms_arr->class_id >= 0) {
+              const char *ivnm = nt_str(nt, lefts[i], "name");
+              int iv_ms = ivnm ? comp_ivar_index(&c->classes[ms_arr->class_id], ivnm) : -1;
+              if (iv_ms < 0) continue;
+              TyKind mg = ty_unify(c->classes[ms_arr->class_id].ivar_types[iv_ms], elem);
+              if (mg != c->classes[ms_arr->class_id].ivar_types[iv_ms]) {
+                c->classes[ms_arr->class_id].ivar_types[iv_ms] = mg; changed = 1;
+              }
+            }
+            else if (!strcmp(lty_ms, "ConstantTargetNode")) {
+              const char *cnm_ms = nt_str(nt, lefts[i], "name");
+              LocalVar *cv_ms = cnm_ms ? comp_const(c, cnm_ms) : NULL;
+              if (!cv_ms) continue;
+              TyKind mg_ms = ty_unify(cv_ms->type, elem);
+              if (mg_ms != cv_ms->type) { cv_ms->type = mg_ms; changed = 1; }
+            }
+          }
+          for (int j = 0; j < rn2; j++) {
+            const char *lty_ms = nt_type(nt, rights2[j]) ? nt_type(nt, rights2[j]) : "";
+            if (!strcmp(lty_ms, "LocalVariableTargetNode")) {
+              const char *rnm2 = nt_str(nt, rights2[j], "name");
+              LocalVar *lv = rnm2 ? scope_local(ms_arr, rnm2) : NULL;
+              if (!lv || lv->is_param || lv->is_block_param) continue;
+              lv->type = ty_unify(lv->type, elem);
+            }
+            else if (!strcmp(lty_ms, "InstanceVariableTargetNode") &&
+                     ms_arr && ms_arr->class_id >= 0) {
+              const char *ivnm2 = nt_str(nt, rights2[j], "name");
+              int iv_ms2 = ivnm2 ? comp_ivar_index(&c->classes[ms_arr->class_id], ivnm2) : -1;
+              if (iv_ms2 < 0) continue;
+              TyKind mg2 = ty_unify(c->classes[ms_arr->class_id].ivar_types[iv_ms2], elem);
+              if (mg2 != c->classes[ms_arr->class_id].ivar_types[iv_ms2]) {
+                c->classes[ms_arr->class_id].ivar_types[iv_ms2] = mg2; changed = 1;
+              }
+            }
+            else if (!strcmp(lty_ms, "ConstantTargetNode")) {
+              const char *cnm_ms2 = nt_str(nt, rights2[j], "name");
+              LocalVar *cv_ms2 = cnm_ms2 ? comp_const(c, cnm_ms2) : NULL;
+              if (!cv_ms2) continue;
+              TyKind mg_ms2 = ty_unify(cv_ms2->type, elem);
+              if (mg_ms2 != cv_ms2->type) { cv_ms2->type = mg_ms2; changed = 1; }
+            }
+          }
+          int rest_nid2 = nt_ref(nt, id, "rest");
+          if (rest_nid2 >= 0) {
+            const char *rsty2 = nt_type(nt, rest_nid2);
+            int inner2 = -1;
+            if (rsty2 && !strcmp(rsty2, "SplatNode"))
+              inner2 = nt_ref(nt, rest_nid2, "expression");
+            if (inner2 >= 0 && nt_type(nt, inner2) &&
+                !strcmp(nt_type(nt, inner2), "LocalVariableTargetNode")) {
+              const char *rnm3 = nt_str(nt, inner2, "name");
+              LocalVar *lv3 = rnm3 ? scope_local(comp_scope_of(c, id), rnm3) : NULL;
+              if (lv3 && !lv3->is_param && !lv3->is_block_param)
+                lv3->type = ty_unify(lv3->type, st);
+            }
+          }
+        }
+      }
+      continue;
+    }
+    int en = 0;
+    const int *els = nt_arr(nt, value, "elements", &en);
+    for (int i = 0; i < ln && i < en; i++) {
+      const char *lty = nt_type(nt, lefts[i]);
+      if (!lty) continue;
+      if (!strcmp(lty, "LocalVariableTargetNode")) {
+        const char *lnm = nt_str(nt, lefts[i], "name");
+        TyKind et = infer_type(c, els[i]);
+        if (et == TY_NIL) continue;
+        LocalVar *lv = lnm ? scope_local(comp_scope_of(c, id), lnm) : NULL;
+        if (!lv || lv->is_param || lv->is_block_param) continue;
+        lv->type = ty_unify(lv->type, et);
+      }
+      else if (!strcmp(lty, "ConstantTargetNode")) {
+        const char *cnm = nt_str(nt, lefts[i], "name");
+        LocalVar *cv = cnm ? comp_const(c, cnm) : NULL;
+        if (!cv) continue;
+        TyKind et = infer_type(c, els[i]);
+        if (et == TY_NIL) continue;
+        TyKind mg = ty_unify(cv->type, et);
+        if (mg != cv->type) { cv->type = mg; changed = 1; }
+      }
+      else if (!strcmp(lty, "InstanceVariableTargetNode")) {
+        Scope *iv_sc = comp_scope_of(c, id);
+        int iv_cid = iv_sc ? iv_sc->class_id : -1;
+        if (iv_cid < 0) continue;
+        const char *ivnm = nt_str(nt, lefts[i], "name");
+        int iv_idx = ivnm ? comp_ivar_index(&c->classes[iv_cid], ivnm) : -1;
+        if (iv_idx < 0) continue;
+        TyKind et = infer_type(c, els[i]);
+        if (et == TY_NIL) continue;
+        TyKind mg = ty_unify(c->classes[iv_cid].ivar_types[iv_idx], et);
+        if (mg != c->classes[iv_cid].ivar_types[iv_idx]) {
+          c->classes[iv_cid].ivar_types[iv_idx] = mg; changed = 1;
+        }
+      }
+      else if (!strcmp(lty, "MultiTargetNode")) {
+        /* (b, c) nested target: inner RHS must be an ArrayNode literal */
+        const char *ety = nt_type(nt, els[i]);
+        if (!ety || strcmp(ety, "ArrayNode")) continue;
+        int inn = 0;
+        const int *inner_els = nt_arr(nt, els[i], "elements", &inn);
+        int inn2 = 0;
+        const int *inner_lefts = nt_arr(nt, lefts[i], "lefts", &inn2);
+        for (int j = 0; j < inn2 && j < inn; j++) {
+          const char *ilty = nt_type(nt, inner_lefts[j]);
+          if (!ilty || strcmp(ilty, "LocalVariableTargetNode")) continue;
+          const char *lnm2 = nt_str(nt, inner_lefts[j], "name");
+          TyKind et2 = infer_type(c, inner_els[j]);
+          if (et2 == TY_NIL) continue;
+          LocalVar *lv2 = lnm2 ? scope_local(comp_scope_of(c, id), lnm2) : NULL;
+          if (!lv2 || lv2->is_param || lv2->is_block_param) continue;
+          lv2->type = ty_unify(lv2->type, et2);
+        }
+      }
+    }
+    /* rights targets (post-splat fixed targets) */
+    int rn = 0;
+    const int *rights = nt_arr(nt, id, "rights", &rn);
+    for (int j = 0; j < rn; j++) {
+      int ridx = en - rn + j;
+      if (ridx < 0 || ridx >= en) continue;
+      const char *rty3 = nt_type(nt, rights[j]);
+      if (!rty3) continue;
+      TyKind et = infer_type(c, els[ridx]);
+      if (et == TY_NIL) continue;
+      if (!strcmp(rty3, "LocalVariableTargetNode")) {
+        const char *rnm2 = nt_str(nt, rights[j], "name");
+        LocalVar *lv = rnm2 ? scope_local(comp_scope_of(c, id), rnm2) : NULL;
+        if (!lv || lv->is_param || lv->is_block_param) continue;
+        lv->type = ty_unify(lv->type, et);
+      }
+      else if (!strcmp(rty3, "ConstantTargetNode")) {
+        const char *cnm2 = nt_str(nt, rights[j], "name");
+        LocalVar *cv2 = cnm2 ? comp_const(c, cnm2) : NULL;
+        if (!cv2) continue;
+        TyKind mg3 = ty_unify(cv2->type, et);
+        if (mg3 != cv2->type) { cv2->type = mg3; changed = 1; }
+      }
+      else if (!strcmp(rty3, "InstanceVariableTargetNode")) {
+        Scope *iv_sc3 = comp_scope_of(c, id);
+        int iv_cid3 = iv_sc3 ? iv_sc3->class_id : -1;
+        if (iv_cid3 < 0) continue;
+        const char *ivnm3 = nt_str(nt, rights[j], "name");
+        int iv_idx3 = ivnm3 ? comp_ivar_index(&c->classes[iv_cid3], ivnm3) : -1;
+        if (iv_idx3 < 0) continue;
+        TyKind mg4 = ty_unify(c->classes[iv_cid3].ivar_types[iv_idx3], et);
+        if (mg4 != c->classes[iv_cid3].ivar_types[iv_idx3]) {
+          c->classes[iv_cid3].ivar_types[iv_idx3] = mg4; changed = 1;
+        }
+      }
+    }
+    /* rest (splat) target: elements [ln, en-rn) become a typed array */
+    int rest_nid = nt_ref(nt, id, "rest");
+    if (rest_nid >= 0) {
+      const char *rsty = nt_type(nt, rest_nid);
+      int inner = -1;
+      if (rsty && !strcmp(rsty, "SplatNode"))
+        inner = nt_ref(nt, rest_nid, "expression");
+      if (inner >= 0 && nt_type(nt, inner) &&
+          !strcmp(nt_type(nt, inner), "LocalVariableTargetNode")) {
+        const char *rnm = nt_str(nt, inner, "name");
+        int rstart = ln, rend = en - rn;
+        if (rend < rstart) rend = rstart;
+        TyKind rest_elem = TY_UNKNOWN;
+        for (int i = rstart; i < rend; i++)
+          rest_elem = ty_unify(rest_elem, infer_type(c, els[i]));
+        TyKind rest_arr = (rest_elem != TY_UNKNOWN) ? ty_array_of(rest_elem) : TY_INT_ARRAY;
+        LocalVar *lv = rnm ? scope_local(comp_scope_of(c, id), rnm) : NULL;
+        if (lv && !lv->is_param && !lv->is_block_param)
+          lv->type = ty_unify(lv->type, rest_arr);
+      }
+    }
+  }
+
+  /* MatchRequiredNode: `value => pattern` — infer locals from pattern shape. */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "MatchRequiredNode")) continue;
+    int value = nt_ref(nt, id, "value");
+    int pattern = nt_ref(nt, id, "pattern");
+    if (value < 0 || pattern < 0) continue;
+    const char *pty = nt_type(nt, pattern);
+    if (!pty) continue;
+    Scope *ms = comp_scope_of(c, id);
+    if (!strcmp(pty, "ArrayPatternNode")) {
+      int rn = 0;
+      const int *reqs = nt_arr(nt, pattern, "requireds", &rn);
+      /* Try to get types from a literal ArrayNode value. */
+      const char *vty = nt_type(nt, value);
+      int en = 0;
+      const int *els = (vty && !strcmp(vty, "ArrayNode")) ? nt_arr(nt, value, "elements", &en) : NULL;
+      TyKind arr_elem = TY_UNKNOWN;
+      if (ty_is_array(infer_type(c, value))) arr_elem = ty_array_elem(infer_type(c, value));
+      for (int i = 0; i < rn; i++) {
+        const char *lty2 = nt_type(nt, reqs[i]);
+        if (!lty2 || strcmp(lty2, "LocalVariableTargetNode")) continue;
+        const char *lnm = nt_str(nt, reqs[i], "name");
+        LocalVar *lv = lnm ? scope_local(ms, lnm) : NULL;
+        if (!lv || lv->is_param || lv->is_block_param) continue;
+        TyKind et = (els && i < en) ? infer_type(c, els[i]) : arr_elem;
+        if (et == TY_UNKNOWN || et == TY_NIL) continue;
+        TyKind mg = ty_unify(lv->type, et);
+        if (mg != lv->type) { lv->type = mg; changed = 1; }
+      }
+    }
+    else if (!strcmp(pty, "HashPatternNode")) {
+      int pn = 0;
+      const int *pelms = nt_arr(nt, pattern, "elements", &pn);
+      /* Try to match keys from a literal HashNode value. */
+      const char *vty = nt_type(nt, value);
+      int vn = 0;
+      const int *velms = (vty && !strcmp(vty, "HashNode")) ? nt_arr(nt, value, "elements", &vn) : NULL;
+      for (int i = 0; i < pn; i++) {
+        const char *ety = nt_type(nt, pelms[i]);
+        if (!ety || strcmp(ety, "AssocNode")) continue;
+        int pkey = nt_ref(nt, pelms[i], "key");
+        int ptgt = nt_ref(nt, pelms[i], "value");
+        if (ptgt < 0) continue;
+        const char *tty = nt_type(nt, ptgt);
+        if (!tty || strcmp(tty, "LocalVariableTargetNode")) continue;
+        const char *lnm = nt_str(nt, ptgt, "name");
+        LocalVar *lv = lnm ? scope_local(ms, lnm) : NULL;
+        if (!lv || lv->is_param || lv->is_block_param) continue;
+        /* find matching key in value hash */
+        const char *pkey_val = (pkey >= 0 && nt_type(nt, pkey) &&
+          !strcmp(nt_type(nt, pkey), "SymbolNode")) ? nt_str(nt, pkey, "value") : NULL;
+        TyKind et = TY_UNKNOWN;
+        if (pkey_val && velms) {
+          for (int j = 0; j < vn; j++) {
+            int vkey = nt_ref(nt, velms[j], "key");
+            const char *vkty = vkey >= 0 ? nt_type(nt, vkey) : NULL;
+            const char *vkval = (vkty && !strcmp(vkty, "SymbolNode")) ? nt_str(nt, vkey, "value") : NULL;
+            if (vkval && !strcmp(vkval, pkey_val)) { et = infer_type(c, nt_ref(nt, velms[j], "value")); break; }
+          }
+        }
+        if (et == TY_UNKNOWN || et == TY_NIL) continue;
+        TyKind mg = ty_unify(lv->type, et);
+        if (mg != lv->type) { lv->type = mg; changed = 1; }
+      }
+    }
+  }
+
+  /* CaseMatchNode: `case X; in PATTERN; ...` — infer locals bound by pattern.
+     Handles: bare LV (`in x`), guard (`in x if cond`), capture (`in P => x`),
+     and array patterns (`in [first, *rest]` / `in Array(head, *tail)`). */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CaseMatchNode")) continue;
+    int pred = nt_ref(nt, id, "predicate");
+    if (pred < 0) continue;
+    TyKind scrutinee_t = infer_type(c, pred);
+    int cn = 0;
+    const int *conds = nt_arr(nt, id, "conditions", &cn);
+    for (int ci = 0; ci < cn; ci++) {
+      const char *cty = nt_type(nt, conds[ci]);
+      if (!cty || strcmp(cty, "InNode")) continue;
+      int pat = nt_ref(nt, conds[ci], "pattern");
+      if (pat < 0) continue;
+      Scope *ms = comp_scope_of(c, conds[ci]);
+      const char *pty = nt_type(nt, pat);
+      if (!pty) continue;
+      int bind_lv_node = -1;
+      int array_pat = -1;
+      TyKind array_scrutinee = TY_UNKNOWN;
+      if (!strcmp(pty, "LocalVariableTargetNode")) {
+        /* in x */
+        bind_lv_node = pat;
+      }
+      else if (!strcmp(pty, "IfNode")) {
+        /* in x if guard — binding is in IfNode.statements body */
+        int stmts = nt_ref(nt, pat, "statements");
+        if (stmts >= 0 && nt_type(nt, stmts) &&
+            !strcmp(nt_type(nt, stmts), "StatementsNode")) {
+          int bn = 0;
+          const int *body = nt_arr(nt, stmts, "body", &bn);
+          for (int k = 0; k < bn; k++) {
+            const char *bty = nt_type(nt, body[k]);
+            if (bty && !strcmp(bty, "LocalVariableTargetNode")) {
+              bind_lv_node = body[k]; break;
+            }
+          }
+        }
+      }
+      else if (!strcmp(pty, "CapturePatternNode")) {
+        /* in PATTERN => var */
+        int tgt = nt_ref(nt, pat, "target");
+        if (tgt >= 0 && nt_type(nt, tgt) &&
+            !strcmp(nt_type(nt, tgt), "LocalVariableTargetNode"))
+          bind_lv_node = tgt;
+        /* inner ArrayPatternNode also gets element-level types */
+        int val = nt_ref(nt, pat, "value");
+        if (val >= 0 && nt_type(nt, val) &&
+            !strcmp(nt_type(nt, val), "ArrayPatternNode")) {
+          array_pat = val; array_scrutinee = scrutinee_t;
+        }
+      }
+      else if (!strcmp(pty, "ArrayPatternNode")) {
+        /* in [first, *rest] or in Array(head, *tail) */
+        array_pat = pat; array_scrutinee = scrutinee_t;
+      }
+      /* Bind simple LV target to scrutinee type */
+      if (bind_lv_node >= 0 && scrutinee_t != TY_UNKNOWN) {
+        const char *lnm = nt_str(nt, bind_lv_node, "name");
+        LocalVar *lv = lnm ? scope_local(ms, lnm) : NULL;
+        if (lv && !lv->is_param && !lv->is_block_param) {
+          TyKind mg = ty_unify(lv->type, scrutinee_t);
+          if (mg != lv->type) { lv->type = mg; changed = 1; }
+        }
+      }
+      /* Handle ArrayPatternNode requireds and rest splat */
+      if (array_pat >= 0) {
+        TyKind elem_t = ty_is_array(array_scrutinee) ? ty_array_elem(array_scrutinee) : TY_UNKNOWN;
+        int apn = 0;
+        const int *reqs = nt_arr(nt, array_pat, "requireds", &apn);
+        for (int k = 0; k < apn; k++) {
+          const char *lty2 = nt_type(nt, reqs[k]);
+          if (!lty2 || strcmp(lty2, "LocalVariableTargetNode")) continue;
+          const char *lnm = nt_str(nt, reqs[k], "name");
+          LocalVar *lv = lnm ? scope_local(ms, lnm) : NULL;
+          if (!lv || lv->is_param || lv->is_block_param) continue;
+          TyKind et = (elem_t != TY_UNKNOWN) ? elem_t : TY_INT;
+          TyKind mg = ty_unify(lv->type, et);
+          if (mg != lv->type) { lv->type = mg; changed = 1; }
+        }
+        /* rest splat: *name gets array type */
+        int rest_nid = nt_ref(nt, array_pat, "rest");
+        if (rest_nid >= 0) {
+          const char *rsty2 = nt_type(nt, rest_nid);
+          int inner = -1;
+          if (rsty2 && !strcmp(rsty2, "SplatNode"))
+            inner = nt_ref(nt, rest_nid, "expression");
+          if (inner >= 0 && nt_type(nt, inner) &&
+              !strcmp(nt_type(nt, inner), "LocalVariableTargetNode")) {
+            const char *rnm = nt_str(nt, inner, "name");
+            LocalVar *lv = rnm ? scope_local(ms, rnm) : NULL;
+            if (lv && !lv->is_param && !lv->is_block_param) {
+              TyKind rest_arr = ty_is_array(array_scrutinee) ? array_scrutinee : TY_INT_ARRAY;
+              TyKind mg = ty_unify(lv->type, rest_arr);
+              if (mg != lv->type) { lv->type = mg; changed = 1; }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /* Fold container usage into the local type so an empty `[]` / `{}` gets
+     its element / key+value type from how it is filled. `a << x` /
+     `a.push(x)` / `a[i] = x` (int key) -> array; `h[k] = v` / `h[k] op= v`
+     (string key) -> hash. Part of the recompute frame so it survives reset. */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty) continue;
+    int recv, kt = TY_UNKNOWN, vt = TY_UNKNOWN, is_push = 0, is_idx_write = 0;
+    if (!strcmp(ty, "CallNode")) {
+      recv = nt_ref(nt, id, "receiver");
+      const char *name = nt_str(nt, id, "name");
+      int args = nt_ref(nt, id, "arguments");
+      int an = 0;
+      const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+      if (name && (!strcmp(name, "push") || !strcmp(name, "<<")) && an == 1) {
+        is_push = 1; vt = infer_type(c, argv[0]);
+      }
+      else if (name && !strcmp(name, "[]=") && an == 2) {
+        is_idx_write = 1; kt = infer_type(c, argv[0]); vt = infer_type(c, argv[1]);
+      }
+      else if (name && (!strcmp(name, "fetch") || !strcmp(name, "[]")) && an >= 1) {
+        /* hash.fetch(key,..) / hash[key]: promote TY_UNKNOWN local to a typed hash.
+           Only fires when the slot is currently TY_UNKNOWN (empty hash). */
+        TyKind rslot = TY_UNKNOWN;
+        const char *rrty = nt_type(nt, recv);
+        const char *rnm2 = NULL;
+        if (rrty && !strcmp(rrty, "LocalVariableReadNode")) {
+          rnm2 = nt_str(nt, recv, "name");
+          LocalVar *lv2 = rnm2 ? scope_local(comp_scope_of(c, recv), rnm2) : NULL;
+          if (lv2) rslot = lv2->type;
+        }
+        else if (rrty && !strcmp(rrty, "InstanceVariableReadNode")) {
+          /* an already-typed ivar hash must not be re-promoted: unifying e.g.
+             a str_str_hash with the promotion's str_poly target would widen the
+             slot to poly. Only an untyped (empty-{}) ivar promotes here. */
+          rslot = infer_type(c, recv);
+        }
+        if (rslot != TY_UNKNOWN) continue;  /* already typed, skip */
+        /* Only promote via [] read if the receiver local has at least one
+           write site in its scope. Pure block params have no write site and
+           get their type from infer_block_params; promoting them here to
+           TY_STR_POLY_HASH before is_block_param is set creates a TY_POLY
+           that ty_unify can never narrow back to the yield arg type. */
+        if (rrty && !strcmp(rrty, "LocalVariableReadNode") && rnm2) {
+          Scope *recv_scope = comp_scope_of(c, recv);
+          int has_write = 0;
+          for (int _wi = 0; _wi < nt->count && !has_write; _wi++) {
+            const char *_wty = nt_type(nt, _wi);
+            if (!_wty) continue;
+            if ((!strcmp(_wty, "LocalVariableWriteNode") ||
+                 !strcmp(_wty, "LocalVariableOrWriteNode") ||
+                 !strcmp(_wty, "LocalVariableAndWriteNode") ||
+                 !strcmp(_wty, "LocalVariableOperatorWriteNode")) &&
+                comp_scope_of(c, _wi) == recv_scope) {
+              const char *_wnm = nt_str(nt, _wi, "name");
+              if (_wnm && !strcmp(_wnm, rnm2)) has_write = 1;
+            }
+          }
+          if (!has_write) continue;
+        }
+        kt = infer_type(c, argv[0]);
+        if (kt == TY_SYMBOL) { vt = TY_INT; /* dummy: sym hash val is always poly */ }
+        else if (kt == TY_STRING) { vt = TY_POLY; /* will map to STR_POLY */ }
+        else if (kt == TY_INT)    { vt = TY_POLY; /* will map to POLY_POLY */ }
+        else continue;
+      }
+      else continue;
+    }
+    else if (!strcmp(ty, "IndexOperatorWriteNode")) {
+      is_idx_write = 1;
+      recv = nt_ref(nt, id, "receiver");
+      int args = nt_ref(nt, id, "arguments");
+      int an = 0;
+      const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+      if (an != 1) continue;
+      kt = infer_type(c, argv[0]); vt = infer_type(c, nt_ref(nt, id, "value"));
+    }
+    else {
+      continue;
+    }
+    if (recv < 0) continue;
+    const char *rty = nt_type(nt, recv);
+    /* fold into a local's type or an ivar's type (an empty `@buf=[]` filled by
+       `@buf << x` infers its element type the same way a local does) */
+    TyKind *slot = NULL;
+    if (rty && !strcmp(rty, "LocalVariableReadNode")) {
+      const char *rnm = nt_str(nt, recv, "name");
+      LocalVar *lv = rnm ? scope_local(comp_scope_of(c, recv), rnm) : NULL;
+      if (!lv || lv->is_param || lv->is_block_param) continue;
+      slot = &lv->type;
+    }
+    else if (rty && !strcmp(rty, "InstanceVariableReadNode")) {
+      const char *inm = nt_str(nt, recv, "name");
+      Scope *s = comp_scope_of(c, recv);
+      int ivar_cls_id = s->class_id;
+      if (ivar_cls_id < 0) ivar_cls_id = comp_class_index(c, "Toplevel");
+      if (ivar_cls_id < 0) continue;
+      ClassInfo *ci = &c->classes[ivar_cls_id];
+      int iv = inm ? comp_ivar_index(ci, inm) : -1;
+      if (iv < 0) continue;
+      slot = &ci->ivar_types[iv];
+      /* If the slot is TY_UNKNOWN but has a direct InstanceVariableWriteNode
+         that assigns a typed value OR an empty array/hash literal (e.g.
+         @buf = [nil]*7 or @free = []), skip usage-driven hash promotion
+         (but allow push-driven array promotion through). Without this guard,
+         @free[0] read promotes @free to poly_poly_hash before @free = []
+         has been processed as an array. */
+      if (!is_push && !is_idx_write && *slot == TY_UNKNOWN && inm) {
+        int has_typed_write = 0;
+        for (int _wi = 0; _wi < nt->count && !has_typed_write; _wi++) {
+          if (!nt_type(nt, _wi) || strcmp(nt_type(nt, _wi), "InstanceVariableWriteNode")) continue;
+          const char *_wnm = nt_str(nt, _wi, "name");
+          if (!_wnm || strcmp(_wnm, inm)) continue;
+          Scope *_ws = comp_scope_of(c, _wi);
+          int _ws_cls = _ws ? _ws->class_id : -1;
+          if (_ws_cls < 0) _ws_cls = comp_class_index(c, "Toplevel");
+          if (_ws_cls != ivar_cls_id) continue;
+          int _wval = nt_ref(nt, _wi, "value");
+          if (_wval < 0) continue;
+          TyKind _wt = infer_type(c, _wval);
+          if (_wt != TY_UNKNOWN && _wt != TY_NIL) { has_typed_write = 1; break; }
+          /* @ivar = [] literal: this slot is an array, not subject to
+             hash-promotion from [] read or [0]= write. Empty {} does NOT
+             block promotion — the hash type is determined by key/value usage. */
+          const char *_wvty = nt_type(nt, _wval);
+          if (_wvty && !strcmp(_wvty, "ArrayNode"))
+            has_typed_write = 1;
+        }
+        if (has_typed_write) continue;
+      }
+    }
+    else if (is_push && rty && !strcmp(rty, "CallNode")) {
+      /* `getter_method << x` where getter returns @ivar: trace through
+         to that ivar so cross-class lazy-init getters get widened. */
+      int recv_args = nt_ref(nt, recv, "arguments");
+      int recv_argc = 0;
+      if (recv_args >= 0) nt_arr(nt, recv_args, "arguments", &recv_argc);
+      if (recv_argc != 0) continue;
+      const char *mname = nt_str(nt, recv, "name");
+      if (!mname) continue;
+      Scope *caller = comp_scope_of(c, recv);
+      if (!caller || caller->class_id < 0) continue;
+      int defcls2 = caller->class_id;
+      int getter_mi = comp_method_in_chain(c, caller->class_id, mname, &defcls2);
+      if (getter_mi < 0) continue;
+      int last2 = scope_body_last(c, getter_mi);
+      if (last2 < 0 || !nt_type(nt, last2) ||
+          strcmp(nt_type(nt, last2), "InstanceVariableReadNode")) continue;
+      const char *inm2 = nt_str(nt, last2, "name");
+      if (!inm2) continue;
+      ClassInfo *ci2 = &c->classes[defcls2];
+      int iv2 = comp_ivar_index(ci2, inm2);
+      if (iv2 < 0) continue;
+      slot = &ci2->ivar_types[iv2];
+    }
+    else continue;
+
+    TyKind before = *slot;
+    if (is_push) {
+      /* explicit push/append: definitely array.  A PolyArray stays PolyArray
+         regardless of the pushed value type; mixing typed arrays widens to
+         PolyArray (ty_unify would return TY_POLY scalar, so use array-aware
+         widening instead). */
+      if (vt == TY_UNKNOWN) continue;
+      /* If a [] read already promoted this slot to a hash type, the push
+         wins: a variable that is pushed to is an array, not a hash.
+         Reset the slot so the array promotion below can fire. */
+      if (ty_is_hash(*slot)) *slot = TY_UNKNOWN;
+      if (*slot != TY_UNKNOWN && !ty_is_array(*slot)) continue;
+      if (*slot == TY_POLY_ARRAY) continue;  /* already widest array type */
+      TyKind want = ty_array_of(vt);
+      if (*slot != TY_UNKNOWN && want != *slot) want = TY_POLY_ARRAY;
+      *slot = want;
+    }
+    else if (*slot == TY_POLY_POLY_HASH) {
+      /* already widest hash type; no further promotion needed */
+    }
+    else if (kt == TY_INT) {
+      /* int key []=: if slot already array, leave it; otherwise infer int-keyed hash */
+      if (vt == TY_UNKNOWN) continue;
+      if (*slot != TY_UNKNOWN && ty_is_array(*slot)) continue;
+      if (*slot != TY_UNKNOWN && !ty_is_hash(*slot)) continue;
+      TyKind hv = ty_hash_of(TY_INT, vt);
+      if (hv == TY_UNKNOWN) hv = TY_POLY_POLY_HASH;  /* int key + unknown val type */
+      if (*slot != TY_UNKNOWN && *slot != hv) {
+        /* widen to poly-poly if mismatch */
+        if (ty_is_hash(*slot)) { *slot = TY_POLY_POLY_HASH; }
+        continue;
+      }
+      *slot = hv;
+    }
+    else if (kt == TY_STRING) {
+      if (vt == TY_UNKNOWN) continue;
+      TyKind hv = ty_hash_of(TY_STRING, vt);
+      if (hv == TY_UNKNOWN) hv = TY_STR_POLY_HASH;  /* mixed values */
+      if (*slot != TY_UNKNOWN && !ty_is_hash(*slot)) continue;
+      /* a str-keyed hash that has seen >1 value type widens to StrPoly */
+      if (*slot != TY_UNKNOWN && *slot != hv &&
+          (*slot == TY_STR_INT_HASH || *slot == TY_STR_STR_HASH || *slot == TY_STR_POLY_HASH))
+        hv = TY_STR_POLY_HASH;
+      *slot = hv;
+    }
+    else if (kt == TY_SYMBOL) {
+      /* symbol key -> SymPolyHash (boxed values) */
+      if (vt == TY_UNKNOWN) continue;
+      if (*slot != TY_UNKNOWN && *slot != TY_SYM_POLY_HASH) continue;
+      *slot = TY_SYM_POLY_HASH;
+    }
+    else if (kt != TY_UNKNOWN) {
+      /* non-standard key type (array, object, etc.): heterogeneous hash */
+      if (vt == TY_UNKNOWN) continue;
+      if (*slot != TY_UNKNOWN && !ty_is_hash(*slot)) continue;
+      *slot = TY_POLY_POLY_HASH;
+    }
+    if (*slot != before) changed = 1;
+  }
+
+  /* Second pass: re-compute proc_ret for proc-typed locals after body-internal
+     locals have been typed. The first pass resets all locals to TY_UNKNOWN, so
+     computing proc_ret there would see stale TY_UNKNOWN for variables assigned
+     inside the proc body. Running after the first pass ensures those locals
+     have their correct types (e.g. `x = 10` -> TY_INT) before proc_node_ret
+     evaluates the body's return type. */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "LocalVariableWriteNode")) continue;
+    const char *nm = nt_str(nt, id, "name");
+    if (!nm) continue;
+    LocalVar *lv = scope_local(comp_scope_of(c, id), nm);
+    if (!lv || lv->type != TY_PROC) continue;
+    int vnode = nt_ref(nt, id, "value");
+    TyKind pr = vnode >= 0 ? proc_ret_of(c, vnode) : TY_UNKNOWN;
+    if (pr != TY_UNKNOWN && (TyKind)lv->proc_ret != pr) { lv->proc_ret = (int)pr; changed = 1; }
+  }
+
+  /* detect change vs the stashed old types */
+  for (int s = 0; s < c->nscopes; s++)
+    for (int i = 0; i < c->scopes[s].nlocals; i++) {
+      LocalVar *lv = &c->scopes[s].locals[i];
+      if (!lv->is_param && !lv->is_block_param && (TyKind)lv->gc_root != lv->type) changed = 1;
+    }
+  return changed;
+}
+
+/* Unify a call's argument types into method scope `mi`'s parameters. */
+int bind_call_params(Compiler *c, int call_id, int mi) {
+  if (mi < 0) return 0;
+  const NodeTable *nt = c->nt;
+  Scope *m = &c->scopes[mi];
+  int args = nt_ref(nt, call_id, "arguments");
+  int argc = 0;
+  const int *argv = NULL;
+  if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
+  int changed = 0;
+  /* Separate positional args from the trailing keyword-hash arg (if any). */
+  int kwh = -1;
+  int pos_argc = argc;
+  if (argc > 0 && nt_type(nt, argv[argc - 1]) &&
+      !strcmp(nt_type(nt, argv[argc - 1]), "KeywordHashNode")) {
+    kwh = argv[argc - 1];
+    pos_argc = argc - 1;
+  }
+  /* Don't bind individual args to the *rest slot; it stays TY_POLY_ARRAY. */
+  int max_bind = m->nparams;
+  if (m->rest_idx >= 0 && max_bind > m->rest_idx) max_bind = m->rest_idx;
+  int n = pos_argc < max_bind ? pos_argc : max_bind;
+  for (int k = 0; k < n; k++) {
+    /* When the call has a single SplatNode covering this fixed param,
+       infer the element type of the splatted array instead. */
+    TyKind at;
+    const char *apty = argv ? nt_type(nt, argv[k]) : NULL;
+    if (apty && !strcmp(apty, "SplatNode")) {
+      int inner = nt_ref(nt, argv[k], "expression");
+      TyKind arr = inner >= 0 ? infer_type(c, inner) : TY_UNKNOWN;
+      at = ty_is_array(arr) ? ty_array_elem(arr) : TY_POLY;
+    } else {
+      at = infer_type(c, argv[k]);
+      /* nil is not a first-class param type; a nil arg widens the param to poly */
+      if (at == TY_NIL) at = TY_POLY;
+    }
+    LocalVar *p = scope_local(m, m->pnames[k]);
+    if (!p) continue;
+    TyKind merged = ty_unify(p->type, at);
+    if (merged != p->type) { p->type = merged; changed = 1; }
+    if (merged == TY_PROC) {
+      TyKind pr = proc_ret_of(c, argv[k]);
+      if (pr != TY_UNKNOWN && p->proc_ret != (int)pr) { p->proc_ret = (int)pr; changed = 1; }
+    }
+  }
+  /* Post-splat required params: bind from the end of the positional args. */
+  if (m->rest_idx >= 0 && m->npost_rest > 0) {
+    for (int j = 0; j < m->npost_rest; j++) {
+      int pi = m->rest_idx + 1 + j;
+      int ai = pos_argc - m->npost_rest + j;
+      if (pi >= m->nparams || ai < 0 || ai >= pos_argc || !argv) continue;
+      TyKind at = infer_type(c, argv[ai]);
+      if (at == TY_NIL) at = TY_POLY;
+      LocalVar *p = scope_local(m, m->pnames[pi]);
+      if (!p) continue;
+      TyKind merged = ty_unify(p->type, at);
+      if (merged != p->type) { p->type = merged; changed = 1; }
+    }
+  }
+  /* Keyword arguments: match KeywordHashNode elements to named params. */
+  if (kwh >= 0) {
+    int en = 0;
+    const int *elems = nt_arr(nt, kwh, "elements", &en);
+    /* Check for a double-splat (**h) covering all keyword params. */
+    TyKind ds_val = TY_UNKNOWN;
+    for (int e = 0; e < en; e++) {
+      const char *ety = nt_type(nt, elems[e]);
+      if (ety && !strcmp(ety, "AssocSplatNode")) {
+        int inner = nt_ref(nt, elems[e], "value");
+        if (inner >= 0) {
+          TyKind ht = infer_type(c, inner);
+          if (ty_is_hash(ht)) ds_val = ty_hash_val(ht);
+        }
+        break;
+      }
+    }
+    if (ds_val != TY_UNKNOWN) {
+      /* Bind all keyword params of the callee from the splat hash value type. */
+      TyKind at = (ds_val == TY_POLY) ? TY_POLY : ds_val;
+      if (at == TY_NIL) at = TY_POLY;
+      for (int i = 0; i < m->nparams; i++) {
+        if (!m->pnames[i]) continue;
+        LocalVar *p = scope_local(m, m->pnames[i]);
+        if (!p) continue;
+        TyKind merged = ty_unify(p->type, at);
+        if (merged != p->type) { p->type = merged; changed = 1; }
+      }
+    } else {
+      int any_kw_bound = 0;
+      for (int e = 0; e < en; e++) {
+        int key = nt_ref(nt, elems[e], "key");
+        int val = nt_ref(nt, elems[e], "value");
+        if (key < 0 || val < 0) continue;
+        const char *kty = nt_type(nt, key);
+        const char *kname = (kty && !strcmp(kty, "SymbolNode")) ? nt_str(nt, key, "value") : NULL;
+        if (!kname) continue;
+        LocalVar *p = scope_local(m, kname);
+        if (!p) continue;
+        TyKind at = infer_type(c, val);
+        TyKind merged = ty_unify(p->type, at);
+        if (merged != p->type) { p->type = merged; changed = 1; }
+        any_kw_bound = 1;
+      }
+      /* Ruby collapses trailing kwargs into a positional hash parameter when
+         the callee has no named keyword params (e.g. `def f(opts = {})`
+         called as `f(key: val)`). Bind the next unbound positional param
+         to TY_SYM_POLY_HASH so the backstop doesn't kill the method. */
+      if (!any_kw_bound && pos_argc < max_bind && max_bind > 0) {
+        LocalVar *p = m->pnames[pos_argc] ? scope_local(m, m->pnames[pos_argc]) : NULL;
+        if (p) {
+          TyKind merged = ty_unify(p->type, TY_SYM_POLY_HASH);
+          if (merged != p->type) { p->type = merged; changed = 1; }
+        }
+      }
+    }
+  }
+  return changed;
+}
+
+/* Propagate param types from each prep-chain source scope (the transplanted
+   module method) to the shadow scope it calls via super. The shadow scope has
+   no AST call site, so bind_call_params never runs for it. */
+int propagate_prep_params(Compiler *c) {
+  int changed = 0;
+  for (int ci = 0; ci < c->nclasses; ci++) {
+    ClassInfo *cls = &c->classes[ci];
+    for (int k = 0; k < cls->nprep_chain; k++) {
+      const char *from_name = cls->prep_from[k];
+      const char *to_name   = cls->prep_to[k];
+      int from_mi = comp_method_in_class(c, ci, from_name);
+      int to_mi = -1;
+      for (int s = 0; s < c->nscopes; s++) {
+        if (c->scopes[s].class_id == ci && !c->scopes[s].is_cmethod &&
+            c->scopes[s].name && !strcmp(c->scopes[s].name, to_name)) {
+          to_mi = s; break;
+        }
+      }
+      if (from_mi < 0 || to_mi < 0) continue;
+      Scope *fs = &c->scopes[from_mi];
+      Scope *ts = &c->scopes[to_mi];
+      int n = fs->nparams < ts->nparams ? fs->nparams : ts->nparams;
+      for (int i = 0; i < n; i++) {
+        LocalVar *fp = scope_local(fs, fs->pnames[i]);
+        LocalVar *tp = scope_local(ts, ts->pnames[i]);
+        if (!fp || !tp || fp->type == TY_UNKNOWN) continue;
+        TyKind merged = ty_unify(tp->type, fp->type);
+        if (merged != tp->type) { tp->type = merged; changed = 1; }
+      }
+    }
+  }
+  return changed;
+}
+
+/* Optional parameters get a type from their default value too. */
+int infer_default_param_types(Compiler *c) {
+  int changed = 0;
+  for (int s = 0; s < c->nscopes; s++) {
+    Scope *sc = &c->scopes[s];
+    for (int i = 0; i < sc->nparams; i++) {
+      if (sc->pdefault[i] < 0) continue;
+      TyKind dt = infer_type(c, sc->pdefault[i]);
+      /* An empty hash `{}` default returns TY_UNKNOWN from infer_type; treat
+         it as TY_SYM_POLY_HASH since it is used as a kwargs receiver. */
+      if (dt == TY_UNKNOWN) {
+        const char *dty = nt_type(c->nt, sc->pdefault[i]);
+        if (dty && (!strcmp(dty, "HashNode") || !strcmp(dty, "KeywordHashNode"))) {
+          int dn = 0; nt_arr(c->nt, sc->pdefault[i], "elements", &dn);
+          if (dn == 0) dt = TY_SYM_POLY_HASH;
+        }
+      }
+      if (dt == TY_NIL || dt == TY_UNKNOWN) continue;
+      LocalVar *p = scope_local(sc, sc->pnames[i]);
+      if (!p) continue;
+      TyKind merged = ty_unify(p->type, dt);
+      if (merged != p->type) { p->type = merged; changed = 1; }
+    }
+  }
+  return changed;
+}
+
+/* Methods that only Strings respond to -- definitive evidence that a
+   receiver is a String. (length/size/etc are shared with containers and so
+   are deliberately excluded to keep the inference conservative.) */
+int is_string_only_method(const char *m) {
+  static const char *const set[] = {
+    "split", "strip", "lstrip", "rstrip", "chomp", "chop", "upcase",
+    "downcase", "capitalize", "swapcase", "gsub", "sub", "tr", "tr_s",
+    "squeeze", "scan", "start_with?", "end_with?", "each_char", "chars",
+    "center", "ljust", "rjust", "to_str", "encode", "unpack", "match?",
+    "partition", "rpartition", "succ", "hex", "oct", "codepoints", "scrub",
+    "crypt", "delete_prefix", "delete_suffix", "casecmp", "casecmp?",
+    "force_encoding", NULL };
+  for (int i = 0; set[i]; i++) if (!strcmp(m, set[i])) return 1;
+  return 0;
+}
+
+/* Infer still-unknown params from ivar hash operations in the method body.
+   For `def []=(key, val); @h[key] = val; end` where @h is a known hash type,
+   infer key/val from the hash's key/value types.  Also handles `[]` reads.
+   Runs post-fixpoint so ivar types are stable before this fires. */
+int infer_params_from_ivar_hash_ops(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *name = nt_str(nt, id, "name");
+    if (!name) continue;
+    int is_set = !strcmp(name, "[]=");
+    int is_get = !strcmp(name, "[]");
+    if (!is_set && !is_get) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0) continue;
+    const char *rty = nt_type(nt, recv);
+    if (!rty || strcmp(rty, "InstanceVariableReadNode")) continue;
+    const char *inm = nt_str(nt, recv, "name");
+    if (!inm) continue;
+    Scope *s = comp_scope_of(c, id);
+    if (!s || s->class_id < 0) continue;
+    ClassInfo *ci = &c->classes[s->class_id];
+    int iv = comp_ivar_index(ci, inm);
+    if (iv < 0) continue;
+    TyKind ht = ci->ivar_types[iv];
+    if (!ty_is_hash(ht) || ht == TY_POLY_POLY_HASH) continue;
+    TyKind hk = ty_hash_key(ht);
+    TyKind hv = ty_hash_val(ht);
+    int args = nt_ref(nt, id, "arguments");
+    int an = 0;
+    const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+    /* [](key) => key is hash key type; []=(key, val) => key + val */
+    if (an >= 1 && argv && hk != TY_UNKNOWN) {
+      const char *aty = nt_type(nt, argv[0]);
+      if (aty && !strcmp(aty, "LocalVariableReadNode")) {
+        const char *anm = nt_str(nt, argv[0], "name");
+        LocalVar *lv = anm ? scope_local(s, anm) : NULL;
+        if (lv && lv->is_param && lv->type == TY_UNKNOWN) {
+          lv->type = hk; changed = 1;
+        }
+      }
+    }
+    if (is_set && an >= 2 && argv && hv != TY_UNKNOWN) {
+      const char *aty = nt_type(nt, argv[1]);
+      if (aty && !strcmp(aty, "LocalVariableReadNode")) {
+        const char *anm = nt_str(nt, argv[1], "name");
+        LocalVar *lv = anm ? scope_local(s, anm) : NULL;
+        if (lv && lv->is_param && lv->type == TY_UNKNOWN) {
+          lv->type = hv; changed = 1;
+        }
+      }
+    }
+  }
+  return changed;
+}
+
+/* Infer a still-unknown parameter as a typed hash when the body indexes
+   it with a literal key: `param["key"]` → str_poly_hash,
+   `param[:sym]` → sym_poly_hash. Runs in the fixpoint alongside
+   infer_string_params so methods with no concrete-typed caller still
+   resolve their hash param type from body usage. */
+int infer_hash_params(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  static const char *const hash_only_meths[] = {
+    "keys","values","each_pair","merge","has_key?","key?","fetch","store",
+    "delete","transform_values","transform_keys","to_h","each_with_object",NULL
+  };
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *name = nt_str(nt, id, "name");
+    if (!name) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0) continue;
+    const char *rty = nt_type(nt, recv);
+    if (!rty || strcmp(rty, "LocalVariableReadNode")) continue;
+    Scope *s = comp_scope_of(c, id);
+    LocalVar *lv = scope_local(s, nt_str(nt, recv, "name"));
+    if (!lv || !lv->is_param || lv->type != TY_UNKNOWN) continue;
+    /* Literal-key [] / fetch: infer specific variant */
+    if (!strcmp(name, "[]") || !strcmp(name, "fetch")) {
+      int args = nt_ref(nt, id, "arguments");
+      int an = 0;
+      const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+      if (an < 1) continue;
+      const char *kty = argv ? nt_type(nt, argv[0]) : NULL;
+      if (!kty) continue;
+      TyKind want = TY_UNKNOWN;
+      if (!strcmp(kty, "StringNode") || !strcmp(kty, "InterpolatedStringNode"))
+        want = TY_STR_POLY_HASH;
+      else if (!strcmp(kty, "SymbolNode"))
+        want = TY_SYM_POLY_HASH;
+      if (want == TY_UNKNOWN) continue;
+      lv->type = want; changed = 1;
+      continue;
+    }
+    /* []=: infer hash variant from key + value types */
+    if (!strcmp(name, "[]=")) {
+      int args = nt_ref(nt, id, "arguments");
+      int an = 0;
+      const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+      if (an < 2) continue;
+      TyKind kt2 = infer_type(c, argv[0]);
+      TyKind vt2 = infer_type(c, argv[1]);
+      TyKind want = TY_UNKNOWN;
+      if (kt2 == TY_STRING) {
+        want = (vt2 == TY_STRING) ? TY_STR_STR_HASH : TY_STR_POLY_HASH;
+      }
+      else if (kt2 == TY_SYMBOL) want = TY_SYM_POLY_HASH;
+      else if (kt2 == TY_INT)    want = TY_POLY_POLY_HASH;
+      if (want == TY_UNKNOWN) continue;
+      lv->type = want; changed = 1;
+      continue;
+    }
+    /* Hash-only methods: widen to str_poly_hash (most common variant) */
+    for (int k = 0; hash_only_meths[k]; k++) {
+      if (!strcmp(name, hash_only_meths[k])) { lv->type = TY_STR_POLY_HASH; changed = 1; break; }
+    }
+  }
+  return changed;
+}
+
+/* Infer a still-unknown parameter as poly_array when the body calls an
+   array-only method on it: push/pop/shift/unshift/concat/length/size/empty?.
+   Does NOT fire on << (overlaps with Integer/String) or arithmetic ops.
+   Runs inside the fixpoint so array params without typed callers still resolve. */
+int infer_array_params(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  static const char *const arr_meths[] = {
+    "push","pop","shift","unshift","concat","flatten","compact","transpose",
+    "each_with_index","each_with_object","zip","combination","permutation",NULL
+  };
+  int changed = 0;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *name = nt_str(nt, id, "name");
+    if (!name) continue;
+    int is_arr = 0;
+    for (int k = 0; arr_meths[k]; k++) if (!strcmp(name, arr_meths[k])) { is_arr = 1; break; }
+    if (!is_arr) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0) continue;
+    const char *rty = nt_type(nt, recv);
+    if (!rty || strcmp(rty, "LocalVariableReadNode")) continue;
+    Scope *s = comp_scope_of(c, id);
+    LocalVar *lv = scope_local(s, nt_str(nt, recv, "name"));
+    /* If caller-side [] read already widened this param to a hash type,
+       push wins: a param that receives push() is an array, not a hash. */
+    if (lv && lv->is_param && (lv->type == TY_UNKNOWN || ty_is_hash(lv->type))) { lv->type = TY_POLY_ARRAY; changed = 1; }
+  }
+  return changed;
+}
+
+/* Infer a still-unknown parameter as String when the body calls a
+   String-only method on it (a param with no concrete-typed caller). */
+int infer_string_params(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *name = nt_str(nt, id, "name");
+    int recv = nt_ref(nt, id, "receiver");
+    if (!name || recv < 0 || !is_string_only_method(name)) continue;
+    const char *rty = nt_type(nt, recv);
+    if (!rty || strcmp(rty, "LocalVariableReadNode")) continue;
+    Scope *s = comp_scope_of(c, id);
+    LocalVar *lv = scope_local(s, nt_str(nt, recv, "name"));
+    if (lv && lv->is_param && lv->type == TY_UNKNOWN) { lv->type = TY_STRING; changed = 1; }
+  }
+  return changed;
+}
+
+int infer_param_types(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty) continue;
+    if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) {
+      Scope *s = comp_scope_of(c, id);
+      if (s->class_id < 0 || !s->name) continue;
+      int p = c->classes[s->class_id].parent;
+      if (p < 0) continue;
+      int pmi = comp_method_in_chain(c, p, s->name, NULL);
+      if (pmi < 0) continue;
+      if (!strcmp(ty, "ForwardingSuperNode")) {
+        /* bare `super` forwards all current params to parent */
+        Scope *pm = &c->scopes[pmi];
+        int n = s->nparams < pm->nparams ? s->nparams : pm->nparams;
+        if (pm->rest_idx >= 0 && n > pm->rest_idx) n = pm->rest_idx;
+        for (int k = 0; k < n; k++) {
+          LocalVar *src = scope_local(s, s->pnames[k]);
+          LocalVar *dst = scope_local(pm, pm->pnames[k]);
+          if (!src || !dst) continue;
+          TyKind at = src->type;
+          if (at == TY_UNKNOWN) continue;
+          TyKind mg = ty_unify(dst->type, at);
+          if (mg != dst->type) { dst->type = mg; changed = 1; }
+        }
+      }
+      else {
+        changed |= bind_call_params(c, id, pmi);
+      }
+      continue;
+    }
+    /* op-assign on an object slot: `lv OP= rhs` / `@iv OP= rhs` is an
+       implicit call to `lv.OP(rhs)` -- bind the RHS type to the method param. */
+    if (!strcmp(ty, "LocalVariableOperatorWriteNode") ||
+        !strcmp(ty, "InstanceVariableOperatorWriteNode")) {
+      const char *nm  = nt_str(nt, id, "name");
+      const char *op  = nt_str(nt, id, "binary_operator");
+      int val         = nt_ref(nt, id, "value");
+      if (!op || val < 0) continue;
+      TyKind slot_t = TY_UNKNOWN;
+      if (!strcmp(ty, "LocalVariableOperatorWriteNode")) {
+        Scope *s2 = comp_scope_of(c, id);
+        LocalVar *lv2 = nm ? scope_local(s2, nm) : NULL;
+        slot_t = lv2 ? lv2->type : TY_UNKNOWN;
+      }
+      else {
+        Scope *s2 = comp_scope_of(c, id);
+        if (s2->class_id < 0) continue;
+        int iidx = nm ? comp_ivar_index(&c->classes[s2->class_id], nm) : -1;
+        slot_t = iidx >= 0 ? c->classes[s2->class_id].ivar_types[iidx] : TY_UNKNOWN;
+      }
+      /* For TY_POLY slots, scan all user classes for a matching operator method. */
+      int cid2 = -1;
+      if (ty_is_object(slot_t)) cid2 = ty_object_class(slot_t);
+      else if (slot_t == TY_POLY) {
+        for (int _sc = 0; _sc < c->nclasses; _sc++) {
+          if (comp_method_in_chain(c, _sc, op, NULL) >= 0) { cid2 = _sc; break; }
+        }
+      }
+      if (cid2 < 0) continue;
+      int mi2 = comp_method_in_chain(c, cid2, op, NULL);
+      if (mi2 < 0) continue;
+      Scope *ms2 = &c->scopes[mi2];
+      if (ms2->nparams < 1) continue;
+      LocalVar *pp = scope_local(ms2, ms2->pnames[0]);
+      if (!pp) continue;
+      TyKind at2 = infer_type(c, val);
+      TyKind mg2 = ty_unify(pp->type, at2);
+      if (mg2 != pp->type) { pp->type = mg2; changed = 1; }
+      continue;
+    }
+    if (strcmp(ty, "CallNode")) continue;
+    const char *name = nt_str(nt, id, "name");
+    int recv = nt_ref(nt, id, "receiver");
+
+    /* <method>.call(args): bind the call-site arg types to the target
+       method's params (the Method ABI is the only call site for a method
+       reached solely via method(:sym)). */
+    if (recv >= 0 && name && (!strcmp(name, "call") || !strcmp(name, "[]") || !strcmp(name, "()")) &&
+        infer_type(c, recv) == TY_METHOD) {
+      int mn = method_recv_node(c, recv);
+      int tmi = mn >= 0 ? method_obj_target_mi(c, mn) : -1;
+      if (tmi >= 0) changed |= bind_call_params(c, id, tmi);
+      continue;
+    }
+
+    if (recv < 0) {
+      /* bare `new(args)` inside a class method constructs the enclosing
+         (possibly specialized) class -> bind args to that class's
+         initialize, so the subclass constructor's params get typed. */
+      if (name && !strcmp(name, "new")) {
+        Scope *s = comp_scope_of(c, id);
+        if (s && s->is_cmethod && s->class_id >= 0) {
+          int initmi = comp_method_in_chain(c, s->class_id, "initialize", NULL);
+          if (initmi >= 0) changed |= bind_call_params(c, id, initmi);
+        }
+        continue;
+      }
+      int mi = comp_method_index(c, name);
+      int caller_cid = -1;
+      /* bare call inside an instance_eval/exec block: dispatch on the
+         receiver's class so its params get the call-site arg types. */
+      int iec = ie_class_of(c, id);
+      if (mi < 0 && iec >= 0) {
+        int def_cid = -1;
+        mi = comp_method_in_chain(c, iec, name, &def_cid);
+        if (mi >= 0) caller_cid = def_cid >= 0 ? def_cid : iec;
+      }
+      if (mi < 0) {
+        Scope *self = comp_scope_of(c, id);
+        if (self->class_id >= 0) {
+          caller_cid = self->class_id;
+          int def_cid = -1;
+          mi = comp_method_in_chain(c, self->class_id, name, &def_cid);
+          if (mi >= 0 && def_cid >= 0) caller_cid = def_cid;
+          /* inside a class method: also check sibling class methods */
+          if (mi < 0 && self->is_cmethod)
+            mi = comp_cmethod_in_chain(c, self->class_id, name, NULL);
+        }
+      }
+      if (mi < 0) mi = comp_included_method_index(c, name);
+      changed |= bind_call_params(c, id, mi);
+      /* Propagate to descendant classes that directly override the same method.
+         When Base#foo calls bar(arg), and Sub overrides bar, Sub#bar must also
+         receive the same arg types so the cls_id-switch dispatch is type-safe.
+         Also handles the case where only descendants define the method (mi < 0
+         from base chain, e.g. Base.find calls adapter_find defined only in
+         Article and Comment descendants). */
+      if (caller_cid >= 0) {
+        Scope *caller_sc = comp_scope_of(c, id);
+        int is_cm = caller_sc ? caller_sc->is_cmethod : 0;
+        for (int k = 0; k < c->nclasses; k++) {
+          if (k == caller_cid) continue;
+          int is_desc = 0;
+          for (int p = c->classes[k].parent; p >= 0; p = c->classes[p].parent)
+            if (p == caller_cid) { is_desc = 1; break; }
+          if (!is_desc) continue;
+          int dmi = is_cm ? comp_cmethod_in_class(c, k, name) :
+                            comp_method_in_class(c, k, name);
+          if (dmi >= 0) changed |= bind_call_params(c, id, dmi);
+        }
+      }
+      continue;
+    }
+    /* `Module.accessor.cmethod(args)` folded to a constant: bind args to the
+       resolved class method's params (so it is not dropped as untyped). */
+    {
+      int fold_ci = comp_sg_reader_const(c, recv);
+      if (fold_ci >= 0) {
+        int fmi = comp_cmethod_in_chain(c, fold_ci, name, NULL);
+        if (fmi >= 0) { changed |= bind_call_params(c, id, fmi); continue; }
+      }
+      int cand[32];
+      int ncand = comp_sg_reader_candidates(c, recv, cand, 32);
+      if (ncand >= 2) {
+        int bound = 0;
+        for (int k = 0; k < ncand; k++) {
+          int cmi = comp_cmethod_in_chain(c, cand[k], name, NULL);
+          if (cmi >= 0) { changed |= bind_call_params(c, id, cmi); bound = 1; }
+        }
+        if (bound) continue;
+      }
+    }
+    /* Class.new -> initialize params; Class.cmethod -> cmethod params */
+    {
+      const char *rty = nt_type(nt, recv);
+      /* M::Sub.new(...) — resolve by the final path component */
+      if (rty && !strcmp(rty, "ConstantPathNode")) {
+        const char *cn = nt_str(nt, recv, "name");
+        int ci = cn ? comp_class_index(c, cn) : -1;
+        if (ci >= 0 && !strcmp(name, "new")) {
+          int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+          if (ucnew >= 0)
+            changed |= bind_call_params(c, id, ucnew);
+          else
+            changed |= bind_call_params(c, id, comp_method_in_chain(c, ci, "initialize", NULL));
+        }
+        else if (ci >= 0)
+          changed |= bind_call_params(c, id, comp_cmethod_in_chain(c, ci, name, NULL));
+      }
+      if (rty && !strcmp(rty, "ConstantReadNode")) {
+        int ci = comp_class_index(c, nt_str(nt, recv, "name"));
+        if (ci >= 0) {
+          if (!strcmp(name, "new") && c->classes[ci].is_struct) {
+            /* Struct construction: positional args set member ivars in order. */
+            ClassInfo *cls = &c->classes[ci];
+            int args = nt_ref(nt, id, "arguments");
+            int an = 0;
+            const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+            int kwh = (an == 1 && nt_type(nt, argv[0]) && !strcmp(nt_type(nt, argv[0]), "KeywordHashNode")) ? argv[0] : -1;
+            for (int a = 0; a < cls->nivars; a++) {
+              /* a member not supplied at this construction can be nil */
+              const char *mname = cls->ivars[a] + 1;
+              int kn = 0;
+              const int *ke = kwh >= 0 ? nt_arr(nt, kwh, "elements", &kn) : NULL;
+              int vnode = -1;
+              if (kwh >= 0) {
+                for (int e = 0; e < kn; e++) {
+                  int key = nt_ref(nt, ke[e], "key");
+                  if (key >= 0 && nt_type(nt, key) && !strcmp(nt_type(nt, key), "SymbolNode") &&
+                      nt_str(nt, key, "value") && !strcmp(nt_str(nt, key, "value"), mname)) { vnode = nt_ref(nt, ke[e], "value"); break; }
+                }
+              }
+              else if (a < an) vnode = argv[a];
+              TyKind at = vnode >= 0 ? infer_type(c, vnode) : TY_NIL;
+              TyKind m = ty_unify(cls->ivar_types[a], at);
+              if (m != cls->ivar_types[a]) { cls->ivar_types[a] = m; changed = 1; }
+            }
+            continue;
+          }
+          if (!strcmp(name, "new")) {
+            int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+            if (ucnew >= 0)
+              changed |= bind_call_params(c, id, ucnew);
+            else
+              changed |= bind_call_params(c, id, comp_method_in_chain(c, ci, "initialize", NULL));
+          }
+          else
+            changed |= bind_call_params(c, id, comp_cmethod_in_chain(c, ci, name, NULL));
+          continue;
+        }
+      }
+      if (!strcmp(name, "new")) continue;
+    }
+    /* obj.method -> instance method params */
+    TyKind rt = infer_type(c, recv);
+    if (ty_is_object(rt)) {
+      int cid3 = ty_object_class(rt);
+      int mi3 = comp_method_in_chain(c, cid3, name, NULL);
+      /* Comparable: `a < b` etc. on an object with `<=>` but no direct `<`
+         bind the argument to `<=>` param instead. */
+      if (mi3 < 0 && (!strcmp(name, "<") || !strcmp(name, ">") ||
+                      !strcmp(name, "<=") || !strcmp(name, ">=")))
+        mi3 = comp_method_in_chain(c, cid3, "<=>", NULL);
+      changed |= bind_call_params(c, id, mi3);
+      /* Also propagate to descendant overrides: codegen will emit a cls_id
+         switch that calls each override, so each must have the right param
+         types. */
+      for (int k = 0; k < c->nclasses; k++) {
+        int is_desc = 0;
+        for (int p = c->classes[k].parent; p >= 0; p = c->classes[p].parent)
+          if (p == cid3) { is_desc = 1; break; }
+        if (!is_desc) continue;
+        int dmi3 = comp_method_in_class(c, k, name);
+        if (dmi3 >= 0) changed |= bind_call_params(c, id, dmi3);
+      }
+    }
+    else if (rt == TY_POLY) {
+      /* poly receiver: the call may dispatch to any user method of this name,
+         so bind every candidate's params (they would otherwise stay UNKNOWN
+         and fail to compile). */
+      for (int k = 0; k < c->nclasses; k++)
+        changed |= bind_call_params(c, id, comp_method_in_chain(c, k, name, NULL));
+    }
+  }
+  return changed;
+}
+
+/* `for x in coll` binds x to the collection's element type (int for a
+   range, the array element type for an array). */
+int infer_for_index(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "ForNode")) continue;
+    int idx = nt_ref(nt, id, "index");
+    int coll = nt_ref(nt, id, "collection");
+    if (idx < 0 || coll < 0) continue;
+    const char *idx_ty = nt_type(nt, idx);
+    /* for a, b in coll: MultiTargetNode with LocalVariableTargetNode children */
+    if (idx_ty && !strcmp(idx_ty, "MultiTargetNode")) {
+      int ln = 0;
+      const int *lefts = nt_arr(nt, idx, "lefts", &ln);
+      TyKind ct2 = infer_type(c, coll);
+      /* Each destructured variable gets the element type of the inner array,
+         or TY_POLY if the collection element is not a concrete typed array. */
+      TyKind inner = TY_POLY;
+      if (ty_is_array(ct2)) {
+        TyKind et2 = ty_array_elem(ct2);
+        if (ty_is_array(et2)) inner = ty_array_elem(et2);
+      }
+      Scope *ms = comp_scope_of(c, idx);
+      for (int i = 0; i < ln; i++) {
+        const char *lnm = nt_str(nt, lefts[i], "name");
+        if (!lnm) continue;
+        LocalVar *lv = scope_local_intern(ms, lnm);
+        lv->is_block_param = 1;
+        if (lv->type != inner) { lv->type = inner; changed = 1; }
+      }
+      continue;
+    }
+    const char *vn = nt_str(nt, idx, "name");
+    if (!vn) continue;
+    TyKind ct = infer_type(c, coll);
+    TyKind et = ct == TY_RANGE ? TY_INT : ty_is_array(ct) ? ty_array_elem(ct) : TY_UNKNOWN;
+    if (et == TY_UNKNOWN) continue;
+    LocalVar *lv = scope_local_intern(comp_scope_of(c, idx), vn);
+    lv->is_block_param = 1;  /* iteration-bound: survives the write-types reset */
+    if (lv->type != et) { lv->type = et; changed = 1; }
+  }
+  return changed;
+}
+
+/* Name of a block's idx-th required parameter, or NULL. */
+const char *block_param_name(Compiler *c, int block, int idx) {
+  int bp = nt_ref(c->nt, block, "parameters");      /* BlockParametersNode */
+  if (bp < 0) return NULL;
+  /* numbered block params: `{ _1 }`, `{ it }` → NumberedParametersNode */
+  const char *bpty = nt_type(c->nt, bp);
+  if (bpty && !strcmp(bpty, "NumberedParametersNode")) {
+    int max = (int)nt_int(c->nt, bp, "maximum", 0);
+    if (idx >= max) return NULL;
+    static const char *names[] = {"_1","_2","_3","_4","_5","_6","_7","_8","_9"};
+    return (idx < 9) ? names[idx] : NULL;
+  }
+  int pn = nt_ref(c->nt, bp, "parameters");          /* ParametersNode */
+  if (pn < 0) return NULL;
+  int n = 0;
+  const int *reqs = nt_arr(c->nt, pn, "requireds", &n);
+  if (idx < n) return nt_str(c->nt, reqs[idx], "name");
+  return NULL;
+}
+
+int block_param_is_multi(Compiler *c, int block, int idx) {
+  int bp = nt_ref(c->nt, block, "parameters");
+  if (bp < 0) return 0;
+  int pn = nt_ref(c->nt, bp, "parameters");
+  if (pn < 0) return 0;
+  int n = 0;
+  const int *reqs = nt_arr(c->nt, pn, "requireds", &n);
+  if (idx >= n) return 0;
+  const char *ty = nt_type(c->nt, reqs[idx]);
+  return (ty && !strcmp(ty, "MultiTargetNode"));
+}
+
+int block_param_multi_count(Compiler *c, int block, int idx) {
+  int bp = nt_ref(c->nt, block, "parameters");
+  if (bp < 0) return 0;
+  int pn = nt_ref(c->nt, bp, "parameters");
+  if (pn < 0) return 0;
+  int n = 0;
+  const int *reqs = nt_arr(c->nt, pn, "requireds", &n);
+  if (idx >= n) return 0;
+  int lc = 0;
+  nt_arr(c->nt, reqs[idx], "lefts", &lc);
+  return lc;
+}
+
+const char *block_param_multi_leaf(Compiler *c, int block, int idx, int leaf_idx) {
+  int bp = nt_ref(c->nt, block, "parameters");
+  if (bp < 0) return NULL;
+  int pn = nt_ref(c->nt, bp, "parameters");
+  if (pn < 0) return NULL;
+  int n = 0;
+  const int *reqs = nt_arr(c->nt, pn, "requireds", &n);
+  if (idx >= n) return NULL;
+  int lc = 0;
+  const int *lefts = nt_arr(c->nt, reqs[idx], "lefts", &lc);
+  if (!lefts || leaf_idx >= lc) return NULL;
+  return nt_str(c->nt, lefts[leaf_idx], "name");
+}
+
+/* First YieldNode belonging to scope `si`, or -1. */
+int first_yield(Compiler *c, int si) {
+  for (int id = 0; id < c->nt->count; id++) {
+    const char *ty = nt_type(c->nt, id);
+    if (ty && !strcmp(ty, "YieldNode") && c->nscope[id] == si) return id;
+  }
+  return -1;
+}
+
+/* Arguments node of the first `<&block-param>.call(...)` in scope `si`, or
+   -1. Lets block-param inference treat block.call like a yield. */
+int first_block_call_args(Compiler *c, int si) {
+  Scope *m = &c->scopes[si];
+  if (!m->blk_param || !m->blk_param[0]) return -1;
+  for (int id = 0; id < c->nt->count; id++) {
+    const char *ty = nt_type(c->nt, id);
+    if (!ty || strcmp(ty, "CallNode") || c->nscope[id] != si) continue;
+    const char *nm = nt_str(c->nt, id, "name");
+    if (!nm || strcmp(nm, "call")) continue;
+    int recv = nt_ref(c->nt, id, "receiver");
+    if (recv < 0 || !nt_type(c->nt, recv) || strcmp(nt_type(c->nt, recv), "LocalVariableReadNode")) continue;
+    const char *rn = nt_str(c->nt, recv, "name");
+    if (rn && !strcmp(rn, m->blk_param)) return nt_ref(c->nt, id, "arguments");
+  }
+  return -1;
+}
+
+int a_proc_params_node(Compiler *c, int create); /* forward decl */
+
+/* Bind block parameter types for supported iteration methods. */
+int infer_block_params(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+
+  /* `->(x, ...) {}` (LambdaNode): its params live in the enclosing scope (no
+     separate scope), like block params. Register and type them; default to
+     int (the proc-literal slice default) until call-site arg inference lands. */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "LambdaNode")) continue;
+    int pn = nt_ref(nt, id, "parameters");      /* ParametersNode (1 level, unlike blocks) */
+    if (pn < 0) continue;
+    int rn = 0; const int *reqs = nt_arr(nt, pn, "requireds", &rn);
+    Scope *bs = comp_scope_of(c, id);
+    for (int k = 0; k < rn; k++) {
+      const char *p = nt_str(nt, reqs[k], "name");
+      if (!p) continue;
+      LocalVar *lv = scope_local_intern(bs, p); lv->is_block_param = 1;
+      if (lv->type == TY_UNKNOWN) { lv->type = TY_INT; changed = 1; }
+    }
+  }
+
+  /* Hash.new { |hash, key| } : hash is the StrPolyHash, key the string key. */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *cname = nt_str(nt, id, "name");
+    if (!cname || strcmp(cname, "new")) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0 || !nt_type(nt, recv) || strcmp(nt_type(nt, recv), "ConstantReadNode")) continue;
+    const char *rn = nt_str(nt, recv, "name");
+    if (!rn || strcmp(rn, "Hash")) continue;
+    int blk = nt_ref(nt, id, "block");
+    if (blk < 0) continue;
+    int pn = nt_ref(nt, blk, "parameters");
+    if (pn < 0) continue;
+    int inner = nt_ref(nt, pn, "parameters");
+    int pnode = inner >= 0 ? inner : pn;
+    int rnp = 0; const int *reqs = nt_arr(nt, pnode, "requireds", &rnp);
+    Scope *bs = comp_scope_of(c, blk);
+    for (int k = 0; k < rnp; k++) {
+      const char *p = nt_str(nt, reqs[k], "name");
+      if (!p) continue;
+      TyKind want = (k == 0) ? TY_STR_POLY_HASH : TY_STRING;
+      LocalVar *lv = scope_local_intern(bs, p); lv->is_block_param = 1;
+      if (lv->type != want) { lv->type = want; changed = 1; }
+    }
+  }
+
+  /* recv.instance_eval { |me| } : the block params all receive the receiver
+     (Ruby yields self), typed as the receiver's object type. */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *cname = nt_str(nt, id, "name");
+    if (!cname) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0) continue;
+    TyKind rt = infer_type(c, recv);
+    if (!ty_is_object(rt)) continue;
+    if (strcmp(cname, "instance_eval") &&
+        comp_trampoline_kind(c, ty_object_class(rt), cname, NULL) != 1) continue;
+    int blk = nt_ref(nt, id, "block");
+    if (blk < 0) continue;
+    int pn = nt_ref(nt, blk, "parameters");
+    if (pn < 0) continue;
+    Scope *bs = comp_scope_of(c, blk);
+    const char *pnty = nt_type(nt, pn);
+    if (pnty && !strcmp(pnty, "NumberedParametersNode")) {
+      /* `{ _1.method }` : _1.._N all receive self (the receiver). */
+      int maxn = (int)nt_int(nt, pn, "maximum", 0);
+      for (int k = 1; k <= maxn; k++) {
+        char nm[8]; snprintf(nm, sizeof nm, "_%d", k);
+        LocalVar *lv = scope_local_intern(bs, nm); lv->is_block_param = 1;
+        if (lv->type != rt) { lv->type = rt; changed = 1; }
+      }
+      continue;
+    }
+    int inner = nt_ref(nt, pn, "parameters");
+    int pnode = inner >= 0 ? inner : pn;
+    int rnp = 0; const int *reqs = nt_arr(nt, pnode, "requireds", &rnp);
+    for (int k = 0; k < rnp; k++) {
+      const char *p = nt_str(nt, reqs[k], "name");
+      if (!p) continue;
+      LocalVar *lv = scope_local_intern(bs, p); lv->is_block_param = 1;
+      if (lv->type != rt) { lv->type = rt; changed = 1; }
+    }
+  }
+
+  /* recv.instance_exec(args) { |params| } : block params take the call-site
+     arg types (strict arity). */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *cname = nt_str(nt, id, "name");
+    if (!cname) continue;
+    int xrecv = nt_ref(nt, id, "receiver");
+    if (xrecv < 0) continue;
+    if (strcmp(cname, "instance_exec")) {
+      TyKind xrt = infer_type(c, xrecv);
+      if (!ty_is_object(xrt) ||
+          comp_trampoline_kind(c, ty_object_class(xrt), cname, NULL) != 2) continue;
+    }
+    int blk = nt_ref(nt, id, "block");
+    if (blk < 0) continue;
+    int pn = nt_ref(nt, blk, "parameters");
+    if (pn < 0) continue;
+    int inner = nt_ref(nt, pn, "parameters");
+    int pnode = inner >= 0 ? inner : pn;
+    int rnp = 0; const int *reqs = nt_arr(nt, pnode, "requireds", &rnp);
+    int iargs = nt_ref(nt, id, "arguments");
+    int iac = 0; const int *iav = iargs >= 0 ? nt_arr(nt, iargs, "arguments", &iac) : NULL;
+    Scope *bs = comp_scope_of(c, blk);
+    for (int k = 0; k < rnp && k < iac; k++) {
+      const char *p = nt_str(nt, reqs[k], "name");
+      if (!p) continue;
+      TyKind at = infer_type(c, iav[k]);
+      LocalVar *lv = scope_local_intern(bs, p); lv->is_block_param = 1;
+      if (at != TY_UNKNOWN && lv->type != at) { lv->type = at; changed = 1; }
+    }
+  }
+
+  /* Fiber.new { |first| ... }: the block param receives the resume value,
+     which is always a poly (boxed) value at the runtime ABI boundary. */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *cname = nt_str(nt, id, "name");
+    if (!cname || strcmp(cname, "new")) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0 || !nt_type(nt, recv)) continue;
+    const char *rrty = nt_type(nt, recv);
+    int is_const = !strcmp(rrty, "ConstantReadNode") ||
+                   (!strcmp(rrty, "ConstantPathNode") && nt_ref(nt, recv, "parent") < 0);
+    if (!is_const) continue;
+    const char *rn = nt_str(nt, recv, "name");
+    if (!rn || strcmp(rn, "Fiber")) continue;
+    int blk = nt_ref(nt, id, "block");
+    if (blk < 0) continue;
+    int pn = nt_ref(nt, blk, "parameters");
+    if (pn < 0) continue;
+    int inner = nt_ref(nt, pn, "parameters");
+    int pnode = inner >= 0 ? inner : pn;
+    int rnp = 0; const int *reqs = nt_arr(nt, pnode, "requireds", &rnp);
+    Scope *bs = comp_scope_of(c, blk);
+    for (int k = 0; k < rnp; k++) {
+      const char *p = nt_str(nt, reqs[k], "name");
+      if (!p) continue;
+      LocalVar *lv = scope_local_intern(bs, p); lv->is_block_param = 1;
+      if (lv->type == TY_UNKNOWN) { lv->type = TY_POLY; changed = 1; }
+    }
+  }
+
+  /* Proc/lambda call-site param inference: `f.call(:a)` propagates arg types
+     to the proc's params (e.g. `t` gets TY_SYMBOL instead of the default TY_INT). */
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    const char *cname = nt_str(nt, id, "name");
+    if (!cname || (strcmp(cname, "call") && strcmp(cname, "()") && strcmp(cname, "[]"))) continue;
+    int recv = nt_ref(nt, id, "receiver");
+    if (recv < 0 || infer_type(c, recv) != TY_PROC) continue;
+    const char *rty = nt_type(nt, recv);
+    if (!rty || strcmp(rty, "LocalVariableReadNode")) continue;
+    const char *varname = nt_str(nt, recv, "name");
+    if (!varname) continue;
+    int call_args = nt_ref(nt, id, "arguments");
+    int argc = 0; const int *argv = NULL;
+    if (call_args >= 0) argv = nt_arr(nt, call_args, "arguments", &argc);
+    if (argc == 0) continue;
+    Scope *call_scope = comp_scope_of(c, id);
+    /* Find proc literal(s) assigned to varname in the same scope */
+    for (int w = 0; w < nt->count; w++) {
+      const char *wty = nt_type(nt, w);
+      if (!wty || strcmp(wty, "LocalVariableWriteNode")) continue;
+      const char *wname = nt_str(nt, w, "name");
+      if (!wname || strcmp(wname, varname)) continue;
+      if (comp_scope_of(c, w) != call_scope) continue;
+      int val = nt_ref(nt, w, "value");
+      if (val < 0 || !is_proc_create(c, val)) continue;
+      int pn = a_proc_params_node(c, val);
+      if (pn < 0) continue;
+      int rn = 0; const int *reqs = nt_arr(nt, pn, "requireds", &rn);
+      Scope *bs = comp_scope_of(c, val);
+      for (int k = 0; k < rn && k < argc; k++) {
+        const char *p = nt_str(nt, reqs[k], "name");
+        if (!p) continue;
+        LocalVar *lv = scope_local(bs, p);
+        if (!lv) continue;
+        TyKind at = infer_type(c, argv[k]);
+        if (at == TY_UNKNOWN || at == lv->type) continue;
+        TyKind merged = ty_unify(lv->type, at);
+        if (merged != lv->type) { lv->type = merged; changed = 1; }
+      }
+    }
+  }
+
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "CallNode")) continue;
+    int block = nt_ref(nt, id, "block");
+    if (block < 0) continue;
+    const char *name = nt_str(nt, id, "name");
+    int recv = nt_ref(nt, id, "receiver");
+    if (!name) continue;
+
+    /* proc {} / lambda {} / Proc.new {}: type the literal's block params.
+       Without call-site arg-type inference (a later slice) default required
+       params to int -- covers the common arithmetic proc and is overridden
+       by any stronger inference that runs first. */
+    if (is_proc_literal(c, id)) {
+      Scope *bs = comp_scope_of(c, block);
+      for (int k = 0; ; k++) {
+        const char *bp = block_param_name(c, block, k);
+        if (!bp) break;
+        LocalVar *lv = scope_local_intern(bs, bp); lv->is_block_param = 1;
+        if (lv->type == TY_UNKNOWN) { lv->type = TY_INT; changed = 1; }
+      }
+      continue;
+    }
+
+    /* Array.new(n) { |i| ... }: i is the integer index */
+    if (recv >= 0 && !strcmp(name, "new") && nt_type(nt, recv) &&
+        !strcmp(nt_type(nt, recv), "ConstantReadNode") && nt_str(nt, recv, "name") &&
+        !strcmp(nt_str(nt, recv, "name"), "Array")) {
+      const char *p0 = block_param_name(c, block, 0);
+      if (p0) { LocalVar *l = scope_local_intern(comp_scope_of(c, block), p0); l->is_block_param = 1;
+                if (l->type != TY_INT) { l->type = TY_INT; changed = 1; } }
+      continue;
+    }
+
+    /* File.open(args) { |f| ... }: f is a TY_POLY file handle */
+    if (recv >= 0 && !strcmp(name, "open") && nt_type(nt, recv) &&
+        !strcmp(nt_type(nt, recv), "ConstantReadNode") && nt_str(nt, recv, "name") &&
+        (!strcmp(nt_str(nt, recv, "name"), "File") ||
+         !strcmp(nt_str(nt, recv, "name"), "IO"))) {
+      const char *p0 = block_param_name(c, block, 0);
+      if (p0) { LocalVar *l = scope_local_intern(comp_scope_of(c, block), p0); l->is_block_param = 1;
+                if (l->type != TY_POLY) { l->type = TY_POLY; changed = 1; } }
+      continue;
+    }
+
+    /* StringIO.open(args) { |io| ... }: io is a StringIO */
+    if (recv >= 0 && !strcmp(name, "open") && nt_type(nt, recv) &&
+        !strcmp(nt_type(nt, recv), "ConstantReadNode") && nt_str(nt, recv, "name") &&
+        !strcmp(nt_str(nt, recv, "name"), "StringIO")) {
+      const char *p0 = block_param_name(c, block, 0);
+      if (p0) { LocalVar *l = scope_local_intern(comp_scope_of(c, block), p0); l->is_block_param = 1;
+                if (l->type != TY_STRINGIO) { l->type = TY_STRINGIO; changed = 1; } }
+      continue;
+    }
+
+    /* struct.to_h { |k, v| ... }: k is a member symbol, v its (poly) value */
+    if (recv >= 0 && !strcmp(name, "to_h")) {
+      TyKind rt0 = infer_type(c, recv);
+      if (ty_is_object(rt0) && c->classes[ty_object_class(rt0)].is_struct) {
+        const char *kp = block_param_name(c, block, 0);
+        const char *vp = block_param_name(c, block, 1);
+        Scope *bs = comp_scope_of(c, block);
+        if (kp) { LocalVar *l = scope_local_intern(bs, kp); l->is_block_param = 1; if (l->type != TY_SYMBOL) { l->type = TY_SYMBOL; changed = 1; } }
+        if (vp) { LocalVar *l = scope_local_intern(bs, vp); l->is_block_param = 1; if (l->type != TY_POLY) { l->type = TY_POLY; changed = 1; } }
+        continue;
+      }
+    }
+
+    /* call to a user yielding method: block params take the yield arg types */
+    {
+      int mi = -1;
+      if (recv < 0) {
+        mi = comp_method_index(c, name);
+        if (mi < 0) {
+          Scope *self = comp_scope_of(c, id);
+          if (self->class_id >= 0) mi = comp_method_in_chain(c, self->class_id, name, NULL);
+        }
+      }
+      else {
+        TyKind rt0 = infer_type(c, recv);
+        if (ty_is_object(rt0)) mi = comp_method_in_chain(c, ty_object_class(rt0), name, NULL);
+        /* Class.new { |...| }: the yielding method is Class#initialize */
+        if (mi < 0 && !strcmp(name, "new") &&
+            nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode")) {
+          const char *cname = nt_str(nt, recv, "name");
+          int cid = cname ? comp_class_index(c, cname) : -1;
+          if (cid >= 0) mi = comp_method_in_chain(c, cid, "initialize", NULL);
+        }
+        /* Class.method { ... }: look up the class method */
+        if (mi < 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode")) {
+          const char *cname = nt_str(nt, recv, "name");
+          int cid = cname ? comp_class_index(c, cname) : -1;
+          if (cid >= 0) mi = comp_cmethod_in_chain(c, cid, name, NULL);
+        }
+      }
+      if (mi >= 0 && c->scopes[mi].yields) {
+        int yn = first_yield(c, mi);
+        int ya = yn >= 0 ? nt_ref(nt, yn, "arguments") : first_block_call_args(c, mi);
+        int yc = 0;
+        const int *yargs = ya >= 0 ? nt_arr(nt, ya, "arguments", &yc) : NULL;
+        Scope *bs = comp_scope_of(c, block);
+        for (int k = 0; k < yc; k++) {
+          const char *bp = block_param_name(c, block, k);
+          if (!bp) continue;
+          LocalVar *lv = scope_local_intern(bs, bp); lv->is_block_param = 1;
+          TyKind m = ty_unify(lv->type, infer_type(c, yargs[k]));
+          if (m != lv->type) { lv->type = m; changed = 1; }
+        }
+        /* Params beyond the first yield's arity might still be nil if there
+           are other yields with fewer args. Find the min yield arity. */
+        int min_yc = yc;
+        for (int _yi = 0; _yi < nt->count; _yi++) {
+          if (!nt_type(nt, _yi) || strcmp(nt_type(nt, _yi), "YieldNode")) continue;
+          if (c->nscope[_yi] != mi) continue;
+          int _ya = nt_ref(nt, _yi, "arguments");
+          int _yc = 0;
+          if (_ya >= 0) nt_arr(nt, _ya, "arguments", &_yc);
+          if (_yc < min_yc) min_yc = _yc;
+        }
+        /* Block params at index >= min_yc can receive nil — widen to poly. */
+        for (int k = min_yc; ; k++) {
+          const char *bp = block_param_name(c, block, k);
+          if (!bp) break;
+          LocalVar *lv = scope_local_intern(bs, bp); lv->is_block_param = 1;
+          TyKind m = ty_unify(lv->type, TY_POLY);
+          if (m != lv->type) { lv->type = m; changed = 1; }
+        }
+        continue;
+      }
+      /* Method with a named &block param (not inlined): blk_param.call(args)
+         inside the method body determines the arg types for the call-site block. */
+      if (mi >= 0 && !c->scopes[mi].yields &&
+          c->scopes[mi].blk_param && c->scopes[mi].blk_param[0]) {
+        const char *bpname = c->scopes[mi].blk_param;
+        Scope *bs = comp_scope_of(c, block);
+        for (int bid = 0; bid < nt->count; bid++) {
+          const char *bty2 = nt_type(nt, bid);
+          if (!bty2 || strcmp(bty2, "CallNode")) continue;
+          const char *bcn = nt_str(nt, bid, "name");
+          if (!bcn || strcmp(bcn, "call")) continue;
+          int brecv = nt_ref(nt, bid, "receiver");
+          if (brecv < 0) continue;
+          const char *brecvty = nt_type(nt, brecv);
+          if (!brecvty || strcmp(brecvty, "LocalVariableReadNode")) continue;
+          const char *brecvnm = nt_str(nt, brecv, "name");
+          if (!brecvnm || strcmp(brecvnm, bpname)) continue;
+          if (comp_scope_of(c, bid) != &c->scopes[mi]) continue;
+          int ba = nt_ref(nt, bid, "arguments");
+          int barc = 0; const int *barg = NULL;
+          if (ba >= 0) barg = nt_arr(nt, ba, "arguments", &barc);
+          if (barc == 0) continue;
+          for (int k = 0; k < barc; k++) {
+            const char *bp = block_param_name(c, block, k);
+            if (!bp) continue;
+            LocalVar *lv = scope_local_intern(bs, bp); lv->is_block_param = 1;
+            TyKind at = infer_type(c, barg[k]);
+            if (at == TY_UNKNOWN || at == lv->type) continue;
+            TyKind merged = ty_unify(lv->type, at);
+            if (merged != lv->type) { lv->type = merged; changed = 1; }
+          }
+        }
+        continue;
+      }
+    }
+
+    if (recv < 0) continue;
+    TyKind rt = infer_type(c, recv);
+    const char *p0 = block_param_name(c, block, 0);
+    if (!p0 && !block_param_is_multi(c, block, 0)) continue;
+
+    /* then / yield_self: block param receives the receiver value */
+    if ((!strcmp(name, "then") || !strcmp(name, "yield_self")) && p0) {
+      Scope *bs = comp_scope_of(c, block);
+      LocalVar *lv = scope_local_intern(bs, p0); lv->is_block_param = 1;
+      TyKind m = ty_unify(lv->type, rt);
+      if (m != lv->type) { lv->type = m; changed = 1; }
+      continue;
+    }
+
+    TyKind pt = TY_UNKNOWN;
+    if (!strcmp(name, "step") && (rt == TY_INT || rt == TY_FLOAT)) {
+      /* a float receiver or float limit/step yields floats */
+      int args = nt_ref(nt, id, "arguments");
+      int sc = 0; const int *sv = args >= 0 ? nt_arr(nt, args, "arguments", &sc) : NULL;
+      int isf = (rt == TY_FLOAT) || (sc >= 1 && infer_type(c, sv[0]) == TY_FLOAT) ||
+                (sc >= 2 && infer_type(c, sv[1]) == TY_FLOAT);
+      pt = isf ? TY_FLOAT : TY_INT;
+    }
+    else if ((!strcmp(name, "times") || !strcmp(name, "upto") ||
+         !strcmp(name, "downto")) && rt == TY_INT)
+      pt = TY_INT;
+    else if (rt == TY_POLY && !strcmp(name, "each_line"))
+      pt = TY_STRING;  /* File/IO object yielding lines */
+    else if (rt == TY_POLY && !strcmp(name, "each_byte"))
+      pt = TY_INT;
+    else if (rt == TY_STRING && (!strcmp(name, "each_char") || !strcmp(name, "each_line") || !strcmp(name, "upto") ||
+                                 !strcmp(name, "chars") || !strcmp(name, "lines")))
+      pt = TY_STRING;
+    else if (rt == TY_STRING && (!strcmp(name, "gsub") || !strcmp(name, "sub")))
+      pt = TY_STRING;  /* block receives the matched substring */
+    else if (rt == TY_STRING && (!strcmp(name, "each_byte") || !strcmp(name, "bytes") || !strcmp(name, "codepoints")))
+      pt = TY_INT;
+    else if (rt == TY_STRING && !strcmp(name, "scan")) {
+      /* scan { |m| } yields each match; m is string (no captures) or str_array (captures) */
+      int scan_args_id = nt_ref(nt, id, "arguments");
+      int scan_argc = 0;
+      const int *scan_argv = scan_args_id >= 0 ? nt_arr(nt, scan_args_id, "arguments", &scan_argc) : NULL;
+      int has_cap = 0;
+      if (scan_argc == 1 && scan_argv) {
+        const char *apty = nt_type(nt, scan_argv[0]);
+        if (apty && !strcmp(apty, "RegularExpressionNode")) {
+          const char *src = nt_str(nt, scan_argv[0], "unescaped");
+          if (src && an_re_has_captures(src)) has_cap = 1;
+        }
+      }
+      pt = has_cap ? TY_STR_ARRAY : TY_STRING;
+    }
+    else if ((!strcmp(name, "each") || !strcmp(name, "map") || !strcmp(name, "collect") ||
+              !strcmp(name, "select") || !strcmp(name, "reject") || !strcmp(name, "filter") ||
+              !strcmp(name, "find") || !strcmp(name, "detect") || !strcmp(name, "each_with_index") ||
+              !strcmp(name, "sort_by") || !strcmp(name, "find_all") || !strcmp(name, "count") ||
+              !strcmp(name, "any?") || !strcmp(name, "all?") || !strcmp(name, "none?") ||
+              !strcmp(name, "one?") || !strcmp(name, "sum") || !strcmp(name, "min_by") ||
+              !strcmp(name, "max_by") || !strcmp(name, "bsearch")) && rt == TY_RANGE)
+      pt = TY_INT;
+    /* (range).lazy.select/reject/filter { |x| } : x is an integer range element */
+    else if ((!strcmp(name, "select") || !strcmp(name, "reject") || !strcmp(name, "filter")) &&
+             rt == TY_UNKNOWN && recv >= 0 &&
+             nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+             nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "lazy")) {
+      int lsrc = nt_ref(nt, recv, "receiver");
+      if (lsrc >= 0 && infer_type(c, lsrc) == TY_RANGE) pt = TY_INT;
+    }
+    else if ((!strcmp(name, "each") || !strcmp(name, "map") || !strcmp(name, "collect") ||
+              !strcmp(name, "select") || !strcmp(name, "reject") || !strcmp(name, "filter") ||
+              !strcmp(name, "find") || !strcmp(name, "detect") ||
+              !strcmp(name, "max_by") || !strcmp(name, "min_by") || !strcmp(name, "sort_by") ||
+              !strcmp(name, "take_while") || !strcmp(name, "drop_while") ||
+              !strcmp(name, "reverse_each") || !strcmp(name, "each_entry") ||
+              !strcmp(name, "sum") || !strcmp(name, "count") ||
+              !strcmp(name, "any?") || !strcmp(name, "all?") || !strcmp(name, "none?") ||
+              !strcmp(name, "one?") || !strcmp(name, "each_with_index") ||
+              !strcmp(name, "bsearch") || !strcmp(name, "find_index") ||
+              !strcmp(name, "map!") || !strcmp(name, "collect!") ||
+              !strcmp(name, "select!") || !strcmp(name, "filter!") || !strcmp(name, "reject!") ||
+              !strcmp(name, "keep_if") || !strcmp(name, "delete_if") || !strcmp(name, "each_index") ||
+              !strcmp(name, "flat_map") || !strcmp(name, "each_with_object") ||
+              !strcmp(name, "chunk") || !strcmp(name, "group_by") ||
+              !strcmp(name, "tally_by") || !strcmp(name, "min_by_all") ||
+              !strcmp(name, "filter_map") || !strcmp(name, "count_by") ||
+              !strcmp(name, "partition") || !strcmp(name, "each_slice") ||
+              !strcmp(name, "each_cons") || !strcmp(name, "cycle")) &&
+             ty_is_array(rt))
+      pt = ty_array_elem(rt);
+    /* TY_POLY receiver with iteration methods: element type is TY_POLY */
+    else if (rt == TY_POLY &&
+             (!strcmp(name, "each") || !strcmp(name, "map") || !strcmp(name, "collect") ||
+              !strcmp(name, "select") || !strcmp(name, "reject") || !strcmp(name, "find") ||
+              !strcmp(name, "detect") || !strcmp(name, "any?") || !strcmp(name, "all?")))
+      pt = TY_POLY;
+
+    /* array.each_cons(n) / each_slice(n) { |a, b, ...| } -- a single param
+       binds the n-element sub-array; multiple params destructure elements.
+       Also handles |(a, b)| destructuring: leaves bind to element type. */
+    if ((!strcmp(name, "each_cons") || !strcmp(name, "each_slice")) && ty_is_array(rt)) {
+      Scope *es = comp_scope_of(c, block);
+      int np = 0; while (block_param_name(c, block, np)) np++;
+      if (np == 0 && block_param_is_multi(c, block, 0)) {
+        TyKind elem = ty_array_elem(rt);
+        int lc = block_param_multi_count(c, block, 0);
+        for (int li = 0; li < lc; li++) {
+          const char *ln = block_param_multi_leaf(c, block, 0, li);
+          if (!ln) continue;
+          LocalVar *lp = scope_local_intern(es, ln); lp->is_block_param = 1;
+          TyKind m = ty_unify(lp->type, elem);
+          if (m != lp->type) { lp->type = m; changed = 1; }
+        }
+      }
+      else {
+        for (int pj = 0; pj < np; pj++) {
+          const char *pn = block_param_name(c, block, pj);
+          LocalVar *lp = scope_local_intern(es, pn); lp->is_block_param = 1;
+          TyKind want = (np == 1) ? rt : ty_array_elem(rt);
+          TyKind m = ty_unify(lp->type, want);
+          if (m != lp->type) { lp->type = m; changed = 1; }
+        }
+      }
+      continue;
+    }
+
+    /* array.each_slice(n).map/collect { |x, y, ...| } chain: each block param
+       gets the element type of the original array (slice elements).
+       array.each_cons(n).map { |pair| } chain: block param gets the array type.
+       Also handles |(a, b)| destructuring as the first param. */
+    if ((!strcmp(name, "map") || !strcmp(name, "collect")) && rt == TY_UNKNOWN &&
+        nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+        nt_str(nt, recv, "name") && (!strcmp(nt_str(nt, recv, "name"), "each_slice") ||
+                                     !strcmp(nt_str(nt, recv, "name"), "each_cons")) &&
+        nt_ref(nt, recv, "block") < 0) {
+      int es_recv2 = nt_ref(nt, recv, "receiver");
+      TyKind arr_t2 = es_recv2 >= 0 ? infer_type(c, es_recv2) : TY_UNKNOWN;
+      int is_cons2 = !strcmp(nt_str(nt, recv, "name"), "each_cons");
+      if (ty_is_array(arr_t2)) {
+        TyKind bp_t2 = is_cons2 ? arr_t2 : ty_array_elem(arr_t2);
+        if (bp_t2 != TY_UNKNOWN) {
+          Scope *es2 = comp_scope_of(c, block);
+          int np2 = 0; while (block_param_name(c, block, np2)) np2++;
+          if (np2 == 0 && is_cons2 && block_param_is_multi(c, block, 0)) {
+            /* |(a, b)| destructuring: each leaf gets element type */
+            TyKind elem2 = ty_array_elem(arr_t2);
+            if (elem2 != TY_UNKNOWN) {
+              int lc2 = block_param_multi_count(c, block, 0);
+              for (int li = 0; li < lc2; li++) {
+                const char *ln = block_param_multi_leaf(c, block, 0, li);
+                if (!ln) continue;
+                LocalVar *lp = scope_local_intern(es2, ln); lp->is_block_param = 1;
+                TyKind m2 = ty_unify(lp->type, elem2);
+                if (m2 != lp->type) { lp->type = m2; changed = 1; }
+              }
+            }
+          }
+          else {
+            for (int pj2 = 0; pj2 < np2; pj2++) {
+              const char *pn2 = block_param_name(c, block, pj2);
+              if (!pn2) break;
+              LocalVar *lp2 = scope_local_intern(es2, pn2); lp2->is_block_param = 1;
+              TyKind m2 = ty_unify(lp2->type, bp_t2);
+              if (m2 != lp2->type) { lp2->type = m2; changed = 1; }
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    /* array.each_cons(n).with_index(off).map { |pair, i| } or { |(a,b), i| } chain */
+    if ((!strcmp(name, "map") || !strcmp(name, "collect")) && rt == TY_UNKNOWN &&
+        nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "CallNode") &&
+        nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "with_index") &&
+        nt_ref(nt, recv, "block") < 0) {
+      int wi_recv = nt_ref(nt, recv, "receiver");
+      if (wi_recv >= 0 && nt_type(nt, wi_recv) && !strcmp(nt_type(nt, wi_recv), "CallNode") &&
+          nt_str(nt, wi_recv, "name") && !strcmp(nt_str(nt, wi_recv, "name"), "each_cons") &&
+          nt_ref(nt, wi_recv, "block") < 0) {
+        int ec_recv = nt_ref(nt, wi_recv, "receiver");
+        TyKind ec_arr_t = ec_recv >= 0 ? infer_type(c, ec_recv) : TY_UNKNOWN;
+        if (ty_is_array(ec_arr_t)) {
+          Scope *wi_es = comp_scope_of(c, block);
+          TyKind elem_t = ty_array_elem(ec_arr_t);
+          /* p0 is the pair (array) or |(a,b)| multi-target; p1 is the int index */
+          const char *idx_p = block_param_name(c, block, 1);
+          if (idx_p) {
+            LocalVar *ip = scope_local_intern(wi_es, idx_p); ip->is_block_param = 1;
+            TyKind im = ty_unify(ip->type, TY_INT);
+            if (im != ip->type) { ip->type = im; changed = 1; }
+          }
+          if (block_param_is_multi(c, block, 0)) {
+            /* |(a, b), i|: destructure first multi-target param */
+            int lc3 = block_param_multi_count(c, block, 0);
+            for (int li = 0; li < lc3; li++) {
+              const char *ln = block_param_multi_leaf(c, block, 0, li);
+              if (!ln) continue;
+              LocalVar *lp = scope_local_intern(wi_es, ln); lp->is_block_param = 1;
+              TyKind m3 = ty_unify(lp->type, elem_t);
+              if (m3 != lp->type) { lp->type = m3; changed = 1; }
+            }
+          }
+          else {
+            /* |pair, i|: pair gets the sub-array type */
+            const char *pair_p = block_param_name(c, block, 0);
+            if (pair_p) {
+              LocalVar *pp = scope_local_intern(wi_es, pair_p); pp->is_block_param = 1;
+              TyKind m3 = ty_unify(pp->type, ec_arr_t);
+              if (m3 != pp->type) { pp->type = m3; changed = 1; }
+            }
+          }
+          continue;
+        }
+      }
+    }
+
+    /* array.combination(k) { |c| } binds the k-element sub-array (same kind) */
+    if (!strcmp(name, "combination") && ty_is_array(rt)) {
+      LocalVar *lp = scope_local_intern(comp_scope_of(c, block), p0); lp->is_block_param = 1;
+      TyKind m = ty_unify(lp->type, rt);
+      if (m != lp->type) { lp->type = m; changed = 1; }
+      continue;
+    }
+
+    /* array.sort/min/max/minmax/slice_when { |a, b| cmp } -- a comparator block
+       binds both parameters to the element type */
+    if ((!strcmp(name, "sort") || !strcmp(name, "sort!") || !strcmp(name, "min") || !strcmp(name, "max") ||
+         !strcmp(name, "minmax") || !strcmp(name, "slice_when")) && ty_is_array(rt)) {
+      Scope *cs = comp_scope_of(c, block);
+      for (int pj = 0; pj < 2; pj++) {
+        const char *pn = block_param_name(c, block, pj);
+        if (!pn) continue;
+        LocalVar *lp = scope_local_intern(cs, pn); lp->is_block_param = 1;
+        TyKind m = ty_unify(lp->type, ty_array_elem(rt));
+        if (m != lp->type) { lp->type = m; changed = 1; }
+      }
+      continue;
+    }
+
+    /* array.reduce(init) { |acc, elem| } or inject: p0=acc type, p1=elem type */
+    if ((!strcmp(name, "reduce") || !strcmp(name, "inject")) && ty_is_array(rt)) {
+      if (!p0) continue;
+      Scope *rs = comp_scope_of(c, block);
+      TyKind et2 = ty_array_elem(rt);
+      /* `[[ints],...].inject { |a, b| a & b }`: the inner arrays are int arrays,
+         so type both fold params as int arrays rather than poly. */
+      if (rt == TY_POLY_ARRAY && comp_is_nested_int_array_literal(c, nt_ref(nt, id, "receiver")))
+        et2 = TY_INT_ARRAY;
+      /* Determine accumulator type from initial value argument (if any) */
+      int rargs = nt_ref(nt, id, "arguments");
+      int rargc = 0;
+      const int *rargv = rargs >= 0 ? nt_arr(nt, rargs, "arguments", &rargc) : NULL;
+      TyKind acc_t = (rargc > 0 && rargv) ? infer_type(c, rargv[0]) : et2;
+      if (acc_t == TY_UNKNOWN) acc_t = et2;
+      LocalVar *ap = scope_local_intern(rs, p0); ap->is_block_param = 1;
+      TyKind am = ty_unify(ap->type, acc_t);
+      if (am != ap->type) { ap->type = am; changed = 1; }
+      const char *rp1 = block_param_name(c, block, 1);
+      if (rp1) {
+        LocalVar *ep2 = scope_local_intern(rs, rp1); ep2->is_block_param = 1;
+        TyKind em2 = ty_unify(ep2->type, et2);
+        if (em2 != ep2->type) { ep2->type = em2; changed = 1; }
+      }
+      continue;
+    }
+
+    /* array.each_with_index { |x, i| } binds element + int index */
+    if (!strcmp(name, "each_with_index") && ty_is_array(rt)) {
+      Scope *es = comp_scope_of(c, block);
+      if (!p0) continue;
+      LocalVar *ep = scope_local_intern(es, p0); ep->is_block_param = 1;
+      TyKind em = ty_unify(ep->type, ty_array_elem(rt));
+      if (em != ep->type) { ep->type = em; changed = 1; }
+      const char *p1 = block_param_name(c, block, 1);
+      if (p1) {
+        LocalVar *ip = scope_local_intern(es, p1); ip->is_block_param = 1;
+        TyKind im = ty_unify(ip->type, TY_INT);
+        if (im != ip->type) { ip->type = im; changed = 1; }
+      }
+      continue;
+    }
+
+    /* array.zip(other) { |a, b| } binds element of recv + element of other */
+    if (!strcmp(name, "zip") && ty_is_array(rt)) {
+      Scope *zs = comp_scope_of(c, block);
+      LocalVar *ep0 = scope_local_intern(zs, p0); ep0->is_block_param = 1;
+      TyKind em0 = ty_unify(ep0->type, ty_array_elem(rt));
+      if (em0 != ep0->type) { ep0->type = em0; changed = 1; }
+      const char *zp1 = block_param_name(c, block, 1);
+      if (zp1) {
+        int zargs = nt_ref(nt, id, "arguments");
+        int zargc = 0; const int *zargv = zargs >= 0 ? nt_arr(nt, zargs, "arguments", &zargc) : NULL;
+        TyKind et2 = (zargc > 0 && zargv && ty_is_array(infer_type(c, zargv[0])))
+                     ? ty_array_elem(infer_type(c, zargv[0])) : ty_array_elem(rt);
+        LocalVar *ep1 = scope_local_intern(zs, zp1); ep1->is_block_param = 1;
+        TyKind em1 = ty_unify(ep1->type, et2);
+        if (em1 != ep1->type) { ep1->type = em1; changed = 1; }
+      }
+      continue;
+    }
+
+    /* array.each_with_object(init) { |x, acc| } binds element + accumulator */
+    if (!strcmp(name, "each_with_object") && ty_is_array(rt)) {
+      Scope *es = comp_scope_of(c, block);
+      if (p0) {
+        TyKind et = ty_array_elem(rt);
+        LocalVar *ep = scope_local_intern(es, p0); ep->is_block_param = 1;
+        if (!(ty_is_array(ep->type) && !ty_is_array(et))) {
+          TyKind em = ty_unify(ep->type, et);
+          if (em != ep->type) { ep->type = em; changed = 1; }
+        }
+      }
+      const char *p1_name = block_param_name(c, block, 1);
+      if (p1_name) {
+        int ewobj_args = nt_ref(nt, id, "arguments");
+        int ewobj_argc = 0;
+        const int *ewobj_argv = ewobj_args >= 0 ? nt_arr(nt, ewobj_args, "arguments", &ewobj_argc) : NULL;
+        if (ewobj_argc > 0 && ewobj_argv) {
+          TyKind at = infer_type(c, ewobj_argv[0]);
+          if (at == TY_UNKNOWN) {
+            const char *a0ty = nt_type(nt, ewobj_argv[0]);
+            int an0 = 0;
+            if (a0ty && !strcmp(a0ty, "ArrayNode")) nt_arr(nt, ewobj_argv[0], "elements", &an0);
+            if (a0ty && !strcmp(a0ty, "ArrayNode") && an0 == 0) at = TY_INT_ARRAY;
+          }
+          if (at != TY_UNKNOWN) {
+            LocalVar *ap = scope_local_intern(es, p1_name); ap->is_block_param = 1;
+            TyKind am = ty_unify(ap->type, at);
+            if (am != ap->type) { ap->type = am; changed = 1; }
+          }
+        }
+      }
+      continue;
+    }
+
+    /* hash.merge(other) { |k, v1, v2| } binds key + both conflicting values */
+    if (!strcmp(name, "merge") && ty_is_hash(rt)) {
+      Scope *ms = comp_scope_of(c, block);
+      LocalVar *kp = scope_local_intern(ms, p0); kp->is_block_param = 1;
+      TyKind km = ty_unify(kp->type, ty_hash_key(rt));
+      if (km != kp->type) { kp->type = km; changed = 1; }
+      const char *mp1 = block_param_name(c, block, 1);
+      const char *mp2 = block_param_name(c, block, 2);
+      const char *mps[2]; mps[0] = mp1; mps[1] = mp2;
+      for (int mi2 = 0; mi2 < 2; mi2++) {
+        if (!mps[mi2]) continue;
+        LocalVar *vp = scope_local_intern(ms, mps[mi2]); vp->is_block_param = 1;
+        TyKind vm = ty_unify(vp->type, ty_hash_val(rt));
+        if (vm != vp->type) { vp->type = vm; changed = 1; }
+      }
+      continue;
+    }
+
+    /* hash.fetch(key) { |k| } binds the looked-up key */
+    if (!strcmp(name, "fetch") && ty_is_hash(rt)) {
+      Scope *fs = comp_scope_of(c, block);
+      LocalVar *kp = scope_local_intern(fs, p0); kp->is_block_param = 1;
+      TyKind km = ty_unify(kp->type, ty_hash_key(rt));
+      if (km != kp->type) { kp->type = km; changed = 1; }
+      continue;
+    }
+
+    /* hash.transform_keys { |k| } binds key; transform_values { |v| } value */
+    if ((!strcmp(name, "transform_keys") || !strcmp(name, "transform_values")) && ty_is_hash(rt)) {
+      Scope *hs = comp_scope_of(c, block);
+      LocalVar *vp = scope_local_intern(hs, p0); vp->is_block_param = 1;
+      TyKind want = !strcmp(name, "transform_keys") ? ty_hash_key(rt) : ty_hash_val(rt);
+      TyKind vm = ty_unify(vp->type, want);
+      if (vm != vp->type) { vp->type = vm; changed = 1; }
+      continue;
+    }
+
+    /* hash.each_value { |v| } binds value; each_key { |k| } binds key */
+    if ((!strcmp(name, "each_value") || !strcmp(name, "each_key")) && ty_is_hash(rt)) {
+      Scope *hs = comp_scope_of(c, block);
+      LocalVar *vp = scope_local_intern(hs, p0); vp->is_block_param = 1;
+      TyKind want = !strcmp(name, "each_value") ? ty_hash_val(rt) : ty_hash_key(rt);
+      TyKind vm = ty_unify(vp->type, want);
+      if (vm != vp->type) { vp->type = vm; changed = 1; }
+      continue;
+    }
+
+    /* hash.each / each_pair { |k, v| } or { |(k,v)| } binds two params.
+       Also handles each_with_object { |(k,v), memo| } and mutating
+       iteration (delete_if / select! / reject! / keep_if). */
+    if ((!strcmp(name, "each") || !strcmp(name, "each_pair") || !strcmp(name, "map") ||
+         !strcmp(name, "collect") || !strcmp(name, "flat_map") || !strcmp(name, "select") ||
+         !strcmp(name, "filter") || !strcmp(name, "reject") || !strcmp(name, "find") ||
+         !strcmp(name, "detect") || !strcmp(name, "sort_by") || !strcmp(name, "min_by") ||
+         !strcmp(name, "max_by") || !strcmp(name, "count") || !strcmp(name, "sum") ||
+         !strcmp(name, "any?") || !strcmp(name, "all?") || !strcmp(name, "none?") ||
+         !strcmp(name, "delete_if") || !strcmp(name, "select!") || !strcmp(name, "reject!") ||
+         !strcmp(name, "filter!") || !strcmp(name, "keep_if") ||
+         !strcmp(name, "each_with_index") || !strcmp(name, "each_with_object")) && ty_is_hash(rt)) {
+      Scope *hs = comp_scope_of(c, block);
+      /* |(k,v)| or |(k,v), memo| destructuring (MultiTargetNode first param) */
+      if (block_param_is_multi(c, block, 0)) {
+        int lc = block_param_multi_count(c, block, 0);
+        if (lc >= 1) {
+          const char *kn = block_param_multi_leaf(c, block, 0, 0);
+          if (kn) {
+            LocalVar *kp2 = scope_local_intern(hs, kn); kp2->is_block_param = 1;
+            TyKind km2 = ty_unify(kp2->type, ty_hash_key(rt));
+            if (km2 != kp2->type) { kp2->type = km2; changed = 1; }
+          }
+        }
+        if (lc >= 2) {
+          const char *vn = block_param_multi_leaf(c, block, 0, 1);
+          if (vn) {
+            LocalVar *vp2 = scope_local_intern(hs, vn); vp2->is_block_param = 1;
+            TyKind vm2 = ty_unify(vp2->type, ty_hash_val(rt));
+            if (vm2 != vp2->type) { vp2->type = vm2; changed = 1; }
+          }
+        }
+        /* for each_with_object: bind the memo param (position 1) */
+        if (!strcmp(name, "each_with_object")) {
+          const char *mp = block_param_name(c, block, 1);
+          if (mp) {
+            int ewobj_args = nt_ref(nt, id, "arguments");
+            int ewobj_argc = 0;
+            const int *ewobj_argv = ewobj_args >= 0 ? nt_arr(nt, ewobj_args, "arguments", &ewobj_argc) : NULL;
+            if (ewobj_argc > 0 && ewobj_argv) {
+              TyKind at2 = infer_type(c, ewobj_argv[0]);
+              if (at2 != TY_UNKNOWN) {
+                LocalVar *mp_lv = scope_local_intern(hs, mp); mp_lv->is_block_param = 1;
+                TyKind mm = ty_unify(mp_lv->type, at2);
+                if (mm != mp_lv->type) { mp_lv->type = mm; changed = 1; }
+              }
+            }
+          }
+        }
+      }
+      else {
+        if (p0) {
+          LocalVar *kp = scope_local_intern(hs, p0); kp->is_block_param = 1;
+          TyKind km = ty_unify(kp->type, ty_hash_key(rt));
+          if (km != kp->type) { kp->type = km; changed = 1; }
+        }
+        const char *p1 = block_param_name(c, block, 1);
+        if (p1) {
+          LocalVar *vp = scope_local_intern(hs, p1); vp->is_block_param = 1;
+          TyKind vm = ty_unify(vp->type, ty_hash_val(rt));
+          if (vm != vp->type) { vp->type = vm; changed = 1; }
+        }
+      }
+      continue;
+    }
+
+    /* array.each/map with 2+ params: auto-destructure sub-array elements.
+       Handles `[[1,2],[3,4]].each { |a,b| }` and numbered `{ _1; _2 }`. */
+    if (pt != TY_UNKNOWN && ty_is_array(rt)) {
+      int np = 0;
+      while (block_param_name(c, block, np)) np++;
+      if (np >= 2) {
+        TyKind inner_elem = TY_UNKNOWN;
+        if (ty_is_array(pt)) {
+          inner_elem = ty_array_elem(pt);
+        }
+        else if (pt == TY_POLY && recv >= 0) {
+          const char *rty2 = nt_type(nt, recv);
+          if (rty2 && !strcmp(rty2, "ArrayNode")) {
+            int re_n2 = 0;
+            const int *re_els2 = nt_arr(nt, recv, "elements", &re_n2);
+            TyKind common_at = TY_UNKNOWN;
+            for (int ri = 0; ri < re_n2; ri++)
+              common_at = ty_unify(common_at, infer_type(c, re_els2[ri]));
+            if (ty_is_array(common_at)) inner_elem = ty_array_elem(common_at);
+            else inner_elem = TY_POLY;
+          }
+          else { inner_elem = TY_POLY; }
+        }
+        if (inner_elem != TY_UNKNOWN) {
+          Scope *ds = comp_scope_of(c, block);
+          for (int pj = 0; pj < np; pj++) {
+            const char *pname2 = block_param_name(c, block, pj);
+            if (!pname2) continue;
+            LocalVar *lp2 = scope_local_intern(ds, pname2); lp2->is_block_param = 1;
+            TyKind m2 = ty_unify(lp2->type, inner_elem);
+            if (m2 != lp2->type) { lp2->type = m2; changed = 1; }
+          }
+          continue;
+        }
+      }
+    }
+
+    if (pt == TY_UNKNOWN) continue;
+    Scope *s = comp_scope_of(c, block);
+    /* When iterating a poly receiver (TY_POLY) with 2+ block params, all params
+       are poly (auto-splat from the poly element). Assign TY_POLY to all. */
+    if (pt == TY_POLY) {
+      int npp2 = 0; while (block_param_name(c, block, npp2)) npp2++;
+      if (npp2 >= 2) {
+        for (int pj2 = 0; pj2 < npp2; pj2++) {
+          const char *pnj2 = block_param_name(c, block, pj2);
+          if (!pnj2) continue;
+          LocalVar *lp2 = scope_local_intern(s, pnj2); lp2->is_block_param = 1;
+          TyKind m2 = ty_unify(lp2->type, TY_POLY);
+          if (m2 != lp2->type) { lp2->type = m2; changed = 1; }
+        }
+        continue;
+      }
+    }
+    if (!p0) continue;
+    LocalVar *lv = scope_local_intern(s, p0); lv->is_block_param = 1;
+    /* Don't widen an array-typed variable to a scalar via block-param
+       inference.  When the variable already holds an array (set by a write
+       site in the same iteration, before infer_block_params runs), widening
+       it to the element scalar type collapses the outer array type to TY_POLY.
+       Codegen emits a scoped shadow for the block param instead. */
+    if (ty_is_array(lv->type) && !ty_is_array(pt))
+      continue;
+    TyKind merged = ty_unify(lv->type, pt);
+    if (merged != lv->type) { lv->type = merged; changed = 1; }
+  }
+  return changed;
+}
+
+/* Value type of an explicit `return expr` (or nil for bare return). */
+TyKind return_node_type(Compiler *c, int id) {
+  int args = nt_ref(c->nt, id, "arguments");
+  if (args < 0) return TY_NIL;
+  int n = 0;
+  const int *a = nt_arr(c->nt, args, "arguments", &n);
+  if (n > 1) return TY_POLY_ARRAY;
+  return n > 0 ? infer_type(c, a[0]) : TY_NIL;
+}
+
+int infer_return_types(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  /* implicit return: the body's value */
+  for (int s = 1; s < c->nscopes; s++) {
+    Scope *sc = &c->scopes[s];
+    /* Specialized inherited-cls-new copies keep their fixed subclass return
+       type (the shared body's bare `new` would otherwise infer the base). */
+    if (sc->ret_specialized) continue;
+    /* An empty method body returns nil; if its value is used at all it must
+       be poly (a void C function yields nothing to read). */
+    int empty_body = sc->body < 0;
+    if (sc->body >= 0 && nt_type(nt, sc->body) && !strcmp(nt_type(nt, sc->body), "StatementsNode")) {
+      int bn = 0; nt_arr(nt, sc->body, "body", &bn); if (bn == 0) empty_body = 1;
+    }
+    TyKind r = empty_body ? TY_POLY : infer_type(c, sc->body);
+    /* explicit returns within this scope */
+    for (int id = 0; id < nt->count; id++) {
+      const char *ty = nt_type(nt, id);
+      if (ty && !strcmp(ty, "ReturnNode") && comp_scope_of(c, id) == sc)
+        r = ty_unify(r, return_node_type(c, id));
+    }
+    if (r != sc->ret) { sc->ret = r; changed = 1; }
+    /* For a method with a &block param, record the value type its block yields
+       (unified across all call sites). Blocks passed to it are emitted returning
+       this common type so the sp_proc_call ABI is consistent. */
+    if (sc->blk_param && sc->blk_param[0] && !sc->yields && !sc->is_lowered_yield) {
+      TyKind bvt = yield_value_type(c, (int)(sc - c->scopes));
+      if (bvt != TY_UNKNOWN && sc->blk_ret != (int)bvt) { sc->blk_ret = (int)bvt; changed = 1; }
+    }
+    /* When the method returns a proc, record the proc's body return type so a
+       caller's `m.call(...)` resolves its result type (factory pattern). */
+    if (r == TY_PROC) {
+      TyKind pr = TY_UNKNOWN;
+      if (sc->body >= 0) {
+        int bn = 0; const int *bb = nt_arr(nt, sc->body, "body", &bn);
+        if (bn > 0) pr = proc_ret_of(c, bb[bn - 1]);
+      }
+      for (int id = 0; id < nt->count; id++) {
+        const char *ty = nt_type(nt, id);
+        if (ty && !strcmp(ty, "ReturnNode") && comp_scope_of(c, id) == sc) {
+          int a = nt_ref(nt, id, "arguments"); int an = 0;
+          const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+          if (an > 0) pr = ty_unify(pr == TY_UNKNOWN ? TY_UNKNOWN : pr, proc_ret_of(c, av[0]));
+        }
+      }
+      if (pr != TY_UNKNOWN && sc->ret_proc_ret != (int)pr) { sc->ret_proc_ret = (int)pr; changed = 1; }
+    }
+  }
+  return changed;
+}
+
+/* Collect CallNode names in the subtree rooted at `id`, stopping at nested
+   DefNodes (which are separate method scopes). `out` / `n` / `cap` are
+   the dynamic string array to append to. */
+void cr_collect_calls(const NodeTable *nt, int id,
+                              char ***out, int *n, int *cap) {
+  if (id < 0) return;
+  const char *ty = nt_type(nt, id);
+  if (!ty) return;
+  if (!strcmp(ty, "DefNode")) return;          /* don't enter nested methods */
+  /* Collect method name from CallNode, or operator name from op-assign nodes
+     (e.g. `a += 1` → InstanceVariableOperatorWriteNode with binary_operator "+"). */
+  const char *nm = NULL;
+  if (!strcmp(ty, "CallNode")) {
+    nm = nt_str(nt, id, "name");
+    /* `method(:foo)` takes a reference to foo without calling it; the target
+       must still be emitted, so treat the symbol arg as a called name. */
+    if (nm && !strcmp(nm, "method")) {
+      int margs = nt_ref(nt, id, "arguments");
+      int man = 0; const int *mav = margs >= 0 ? nt_arr(nt, margs, "arguments", &man) : NULL;
+      if (man >= 1) {
+        const char *aty = nt_type(nt, mav[0]);
+        const char *msym = NULL;
+        if (aty && !strcmp(aty, "SymbolNode")) msym = nt_str(nt, mav[0], "value");
+        else if (aty && !strcmp(aty, "StringNode")) { msym = nt_str(nt, mav[0], "content"); if (!msym) msym = nt_str(nt, mav[0], "unescaped"); }
+        if (msym) {
+          int found = 0;
+          for (int i = 0; i < *n; i++) if (!strcmp((*out)[i], msym)) { found = 1; break; }
+          if (!found) {
+            if (*n >= *cap) { *cap = *cap ? *cap * 2 : 8; *out = realloc(*out, sizeof(char *) * (size_t)*cap); }
+            (*out)[(*n)++] = strdup(msym);
+          }
+        }
+      }
+    }
+  }
+  else {
+    size_t tl = strlen(ty);
+    if (tl > 17 && (!strcmp(ty + tl - 17, "OperatorWriteNode")))
+      nm = nt_str(nt, id, "binary_operator");
+  }
+  if (nm) {
+    int found = 0;
+    for (int i = 0; i < *n; i++) if (!strcmp((*out)[i], nm)) { found = 1; break; }
+    if (!found) {
+      if (*n >= *cap) { *cap = *cap ? *cap * 2 : 8; *out = realloc(*out, sizeof(char *) * (size_t)*cap); }
+      (*out)[(*n)++] = strdup(nm);
+    }
+  }
+  int nr = nt_num_refs(nt, id);
+  for (int i = 0; i < nr; i++) { int ch = nt_ref_at(nt, id, i); if (ch >= 0) cr_collect_calls(nt, ch, out, n, cap); }
+  int na = nt_num_arrs(nt, id);
+  for (int i = 0; i < na; i++) { int nn = 0; const int *ids = nt_arr_at(nt, id, i, &nn); for (int k = 0; k < nn; k++) if (ids[k] >= 0) cr_collect_calls(nt, ids[k], out, n, cap); }
+}
+
+/* Mark each method scope reachable via transitive call-graph BFS.
+   Scope 0 (top level), every `initialize`, and implicitly-called methods
+   are roots. Any method reachable from a root (directly or transitively)
+   is marked live; others are dead-code-eliminated. */
