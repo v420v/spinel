@@ -5364,7 +5364,9 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         else { buf_puts(b, "sp_StringIO_new_sm("); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")"); }
         return;
       }
-      if (cn && !strcmp(cn, "Fiber") && nt_ref(nt, id, "block") >= 0) {
+      if (cn && (!strcmp(cn, "Fiber") || !strcmp(cn, "Thread")) && nt_ref(nt, id, "block") >= 0) {
+        /* Single-threaded: a Thread is modeled as a Fiber that runs to
+           completion on #value (no preemption, no Fiber.yield in the body). */
         emit_fiber_new(c, id, b);
         return;
       }

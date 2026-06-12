@@ -699,6 +699,8 @@ static TyKind infer_call(Compiler *c, int id) {
       if (cn && !strcmp(cn, "Regexp")) return TY_REGEX;
       /* Builtin object types */
       if (cn && !strcmp(cn, "Fiber")) return TY_FIBER;
+      /* Thread.new { block }: modeled as a Fiber run to completion on #value. */
+      if (cn && !strcmp(cn, "Thread") && nt_ref(nt, id, "block") >= 0) return TY_FIBER;
       if (cn && (!strcmp(cn, "Thread") || !strcmp(cn, "Mutex") || !strcmp(cn, "Monitor") ||
                  !strcmp(cn, "Random") || !strcmp(cn, "IO") || !strcmp(cn, "File") ||
                  !strcmp(cn, "GzipReader") || !strcmp(cn, "GzipWriter"))) return TY_POLY;
@@ -867,6 +869,11 @@ static TyKind infer_call(Compiler *c, int id) {
     if (rty && (!strcmp(rty, "ConstantReadNode") || !strcmp(rty, "ConstantPathNode"))) {
       const char *cn2 = nt_str(nt, recv, "name");
       if (cn2 && !strcmp(name, "new") && !strcmp(cn2, "Fiber")) return TY_FIBER;
+      /* Thread.new { block } modeled as a Fiber (single-threaded); #value
+         resumes it to completion. */
+      if (cn2 && !strcmp(name, "new") && !strcmp(cn2, "Thread") &&
+          nt_ref(nt, id, "block") >= 0)
+        return TY_FIBER;
       if (cn2 && !strcmp(name, "new") &&
           (!strcmp(cn2, "Thread") || !strcmp(cn2, "Mutex") || !strcmp(cn2, "Random")))
         return TY_POLY;
