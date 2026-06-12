@@ -4142,7 +4142,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     int self_bound = (recv < 0 && mi >= 0 && c->scopes[mi].class_id >= 0 &&
                       !c->scopes[mi].is_cmethod);
     buf_puts(b, "sp_bound_method_new(");
-    if (recv >= 0) { buf_puts(b, "(void *)("); emit_expr(c, recv, b); buf_puts(b, ")"); }
+    /* A Method bound to a class/module (Klass.method(:cmeth)) has no instance
+       self -- the class value is not a heap pointer, so pass NULL. */
+    if (recv >= 0 && comp_ntype(c, recv) == TY_CLASS) buf_puts(b, "NULL");
+    else if (recv >= 0) { buf_puts(b, "(void *)("); emit_expr(c, recv, b); buf_puts(b, ")"); }
     else if (self_bound) buf_printf(b, "(void *)%s", g_self);
     else buf_puts(b, "NULL");
     buf_puts(b, ", ");
@@ -7423,6 +7426,12 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
         return;
       }
+      /* a non-poly key (e.g. a Method): box it, then index polymorphically */
+      if (at != TY_UNKNOWN) {
+        buf_puts(b, "sp_poly_index_poly("); emit_expr(c, recv, b);
+        buf_puts(b, ", "); emit_boxed(c, argv[0], b); buf_puts(b, ")");
+        return;
+      }
     }
   }
   /* poly receiver: join */
@@ -8320,6 +8329,9 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, " case SP_BUILTIN_STR_ARRAY: _t%d = sp_StrArray_length((sp_StrArray *)_t%d.v.p); break;", tr, tv);
         buf_printf(b, " case SP_BUILTIN_FLT_ARRAY: _t%d = sp_FloatArray_length((sp_FloatArray *)_t%d.v.p); break;", tr, tv);
         buf_printf(b, " case SP_BUILTIN_POLY_ARRAY: _t%d = sp_PolyArray_length((sp_PolyArray *)_t%d.v.p); break;", tr, tv);
+        buf_printf(b, " case SP_BUILTIN_POLY_POLY_HASH: _t%d = ((sp_PolyPolyHash *)_t%d.v.p)->len; break;", tr, tv);
+        buf_printf(b, " case SP_BUILTIN_SYM_POLY_HASH: _t%d = ((sp_SymPolyHash *)_t%d.v.p)->len; break;", tr, tv);
+        buf_printf(b, " case SP_BUILTIN_STR_POLY_HASH: _t%d = ((sp_StrPolyHash *)_t%d.v.p)->len; break;", tr, tv);
       }
       buf_printf(b, " } _t%d; })", tr);
       return;
@@ -13406,9 +13418,9 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
         buf_printf(b, "; sp_poly_set_str(_t%d, _t%d, _t%d); } _t%d; })", ta2, tb2, tc2, tc2);
       }
       else {
-        /* poly key fallback: box the key and use sp_poly_set_poly */
+        /* poly key fallback: box the key, look up polymorphically, set via poly */
         buf_printf(b, "sp_RbVal _t%d = ", tb2); emit_boxed(c, iav[0], b); buf_puts(b, "; ");
-        buf_printf(b, "sp_RbVal _t%d = sp_poly_get_str(_t%d, _t%d.v.s);", tc2, ta2, tb2);
+        buf_printf(b, "sp_RbVal _t%d = sp_poly_index_poly(_t%d, _t%d);", tc2, ta2, tb2);
         buf_printf(b, " if (%ssp_poly_truthy(_t%d)) { _t%d = ", is_or2 ? "!" : "", tc2, tc2);
         emit_boxed(c, iv, b);
         buf_printf(b, "; sp_poly_set_poly(_t%d, _t%d, _t%d); } _t%d; })", ta2, tb2, tc2, tc2);

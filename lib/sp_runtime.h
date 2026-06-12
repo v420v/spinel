@@ -3864,6 +3864,7 @@ typedef mrb_int  (*sp_obj_hash_fn)(int cls_id, void *p);
 typedef mrb_bool (*sp_obj_eql_fn)(int cls_id, void *a, void *b);
 static sp_obj_hash_fn sp_obj_hash_hook = NULL;
 static sp_obj_eql_fn  sp_obj_eql_hook  = NULL;
+typedef struct sp_BoundMethod { void *self; mrb_int fn; const char *name; } sp_BoundMethod;
 static mrb_int sp_rbval_hash_key(sp_RbVal v) {
   switch (v.tag) {
     case SP_TAG_INT: case SP_TAG_BOOL: case SP_TAG_NIL: case SP_TAG_SYM:
@@ -3878,6 +3879,16 @@ static mrb_int sp_rbval_hash_key(sp_RbVal v) {
         sp_IntArray *ia = (sp_IntArray *)v.v.p;
         mrb_int h = 0; if (ia) for (mrb_int i = 0; i < ia->len; i++) h = h * 31 + ia->data[ia->start+i];
         return h;
+      }
+      if (v.cls_id == SP_BUILTIN_METHOD) {
+        /* Method keys hash/eql by (bound self, fn ptr, name), so two
+           `obj.method(:m)` instances collapse to one entry (optcarrot
+           @peeks/@pokes dedup). The name disambiguates class methods, whose
+           fn slot is 0 (no resolvable callable address). */
+        sp_BoundMethod *m = (sp_BoundMethod *)v.v.p;
+        if (!m) return 0;
+        return (mrb_int)((uintptr_t)m->self * 31 + m->fn) +
+               (m->name ? (mrb_int)sp_str_hash(m->name) : 0);
       }
       if (sp_obj_hash_hook) return sp_obj_hash_hook(v.cls_id, v.v.p);
       return (mrb_int)((uintptr_t)v.v.p);
@@ -3908,6 +3919,13 @@ static mrb_bool sp_rbval_eql_key(sp_RbVal a, sp_RbVal b) {
         if (ia->len != ib->len) return FALSE;
         for (mrb_int i = 0; i < ia->len; i++) if (ia->data[ia->start+i] != ib->data[ib->start+i]) return FALSE;
         return TRUE;
+      }
+      if (a.cls_id == SP_BUILTIN_METHOD) {
+        sp_BoundMethod *ma = (sp_BoundMethod *)a.v.p, *mb = (sp_BoundMethod *)b.v.p;
+        if (!ma || !mb) return ma == mb;
+        if (ma->self != mb->self || ma->fn != mb->fn) return FALSE;
+        if (ma->name == mb->name) return TRUE;
+        return ma->name && mb->name && strcmp(ma->name, mb->name) == 0;
       }
       if (sp_obj_eql_hook) return sp_obj_eql_hook(a.cls_id, a.v.p, b.v.p);
       return FALSE;
@@ -4010,7 +4028,6 @@ static sp_RbVal sp_poly_each_elem(sp_RbVal a, mrb_int i) {
   }
 }
 /* poly_arr_get/set for PolyPolyHash with integer index key. */
-typedef struct sp_BoundMethod { void *self; mrb_int fn; const char *name; } sp_BoundMethod;
 static sp_RbVal sp_poly_arr_get_hash(sp_RbVal a, mrb_int i) {
   if (a.tag == SP_TAG_INT) return sp_box_int((a.v.i >> i) & 1);
   if (a.tag == SP_TAG_OBJ && a.cls_id == SP_BUILTIN_POLY_POLY_HASH)
@@ -4028,6 +4045,9 @@ static sp_RbVal sp_poly_arr_get_hash(sp_RbVal a, mrb_int i) {
 }
 /* poly[poly_key]: dispatch on key tag at runtime. */
 static sp_RbVal sp_poly_index_poly(sp_RbVal recv, sp_RbVal idx) {
+  /* heterogeneous-key hash: any key kind (incl. Method) looks up directly. */
+  if (recv.tag == SP_TAG_OBJ && recv.cls_id == SP_BUILTIN_POLY_POLY_HASH)
+    return sp_PolyPolyHash_get((sp_PolyPolyHash *)recv.v.p, idx);
   if (idx.tag == SP_TAG_STR) return sp_poly_get_str(recv, idx.v.s);
   if (idx.tag == SP_TAG_SYM) return sp_poly_get_sym(recv, (sp_sym)idx.v.i);
   mrb_int i = (idx.tag == SP_TAG_INT) ? idx.v.i : 0;
