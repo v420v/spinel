@@ -353,6 +353,11 @@ static TyKind proc_ret_of(Compiler *c, int node) {
     /* a method call that returns a proc -> the callee's recorded proc return */
     int recv = nt_ref(nt, node, "receiver");
     const char *name = nt_str(nt, node, "name");
+    /* Hash#to_proc: the proc maps a key to the hash's value type. */
+    if (recv >= 0 && name && !strcmp(name, "to_proc")) {
+      TyKind rt = infer_type(c, recv);
+      if (ty_is_hash(rt)) return ty_hash_val(rt);
+    }
     /* proc << proc / proc >> proc: the composed call returns the OUTER proc's
        value (f<<g outer=f; f>>g outer=g). */
     if (recv >= 0 && name && infer_type(c, recv) == TY_PROC) {
@@ -1908,6 +1913,8 @@ static TyKind infer_call(Compiler *c, int id) {
     if (dt != TY_UNKNOWN) return dt;
   }
   if (recv >= 0 && ty_is_hash(rt)) {
+    if (!strcmp(name, "to_proc")) return TY_PROC;
+    if (!strcmp(name, "key") && argc == 1 && rt == TY_SYM_POLY_HASH) return TY_SYMBOL;
     if (!strcmp(name, "[]"))     return ty_hash_val(rt);
     if (!strcmp(name, "[]="))    return argc >= 2 ? ty_unify(infer_type(c, argv[1]), ty_hash_val(rt)) : ty_hash_val(rt);
     if (!strcmp(name, "fetch")) {

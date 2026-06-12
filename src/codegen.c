@@ -8522,14 +8522,9 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         return;
       }
       if (!strcmp(name, "to_a") && argc == 0) {
-        /* single-char ASCII range -> [lo, lo+1, ..., hi(-excl)] */
-        int tl = ++g_tmp, th = ++g_tmp, to = ++g_tmp, ci = ++g_tmp;
-        buf_printf(b, "({ const char *_t%d = ", tl); emit_expr(c, lo, b);
-        buf_printf(b, "; const char *_t%d = ", th); emit_expr(c, hi, b);
-        buf_printf(b, "; sp_StrArray *_t%d = sp_StrArray_new();"
-                      " for (int _t%d = (unsigned char)_t%d[0]; _t%d <= (unsigned char)_t%d[0] - %d; _t%d++)"
-                      " sp_StrArray_push(_t%d, sp_int_chr(_t%d)); _t%d; })",
-                   to, ci, tl, ci, th, excl, ci, to, ci, to);
+        /* succ-based string range (handles multi-char: "aa".."ac" etc.) */
+        buf_puts(b, "sp_StrArray_from_string_range("); emit_expr(c, lo, b);
+        buf_puts(b, ", "); emit_expr(c, hi, b); buf_printf(b, ", %d)", excl);
         return;
       }
     }
@@ -8655,6 +8650,35 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   if (recv >= 0 && ty_is_hash(rt)) {
     const char *hn = ty_hash_cname(rt);
     if (hn) {
+      /* Hash#to_proc: a Proc mapping a key to the hash value, closing over the
+         hash. Emit a per-variant lookup fn matching the sp_proc_call ABI. */
+      if (!strcmp(name, "to_proc") && argc == 0) {
+        TyKind kt = ty_hash_key(rt), vt = ty_hash_val(rt);
+        int pn = ++g_proc_counter;
+        const char *keyexpr = (kt == TY_SYMBOL) ? "(sp_sym)args[0]"
+                            : (kt == TY_STRING) ? "(const char *)(uintptr_t)args[0]"
+                            : "args[0]";
+        buf_printf(&g_proc_protos, "static mrb_int _hashproc_%d(void *cap, mrb_int *args);\n", pn);
+        buf_printf(&g_procs, "static mrb_int _hashproc_%d(void *cap, mrb_int *args) {\n", pn);
+        buf_printf(&g_procs, "  sp_%sHash *_h = (sp_%sHash *)cap;\n", hn, hn);
+        if (vt == TY_POLY) {
+          if (!g_needs_proc_poly_retslot) {
+            g_needs_proc_poly_retslot = 1;
+            buf_puts(&g_proc_protos, "static sp_RbVal _sp_proc_poly_ret;\n");
+          }
+          buf_printf(&g_procs, "  _sp_proc_poly_ret = sp_%sHash_get(_h, %s);\n  return 0;\n}\n", hn, keyexpr);
+        }
+        else if (vt == TY_STRING) {
+          buf_printf(&g_procs, "  return (mrb_int)(uintptr_t)sp_%sHash_get(_h, %s);\n}\n", hn, keyexpr);
+        }
+        else {
+          buf_printf(&g_procs, "  return (mrb_int)sp_%sHash_get(_h, %s);\n}\n", hn, keyexpr);
+        }
+        buf_printf(b, "sp_proc_new_meta((void *)_hashproc_%d, (void *)(", pn);
+        emit_expr(c, recv, b);
+        buf_puts(b, "), sp_hashproc_cap_scan, 1, FALSE, 1, NULL, NULL)");
+        return;
+      }
       if ((!strcmp(name, "dup") || !strcmp(name, "clone")) && argc == 0) {
         buf_printf(b, "sp_%sHash_dup(", hn); emit_expr(c, recv, b); buf_puts(b, ")");
         return;
@@ -8888,6 +8912,14 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "sp_%sHash_has_value(", hn);
         emit_expr(c, recv, b); buf_puts(b, ", ");
         if (poly) emit_boxed(c, argv[0], b); else emit_expr(c, argv[0], b);
+        buf_puts(b, ")");
+        return;
+      }
+      /* Hash#key(value): the first key mapping to value (sym-keyed hash). */
+      if (!strcmp(name, "key") && argc == 1 && rt == TY_SYM_POLY_HASH) {
+        buf_puts(b, "sp_SymPolyHash_key(");
+        emit_expr(c, recv, b); buf_puts(b, ", ");
+        emit_boxed(c, argv[0], b);
         buf_puts(b, ")");
         return;
       }
