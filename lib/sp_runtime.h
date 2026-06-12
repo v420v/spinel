@@ -2676,6 +2676,7 @@ static const char *sp_exc_message(volatile struct sp_Exception_s *ve);
 #define SP_BUILTIN_SYM_POLY_HASH (-19)
 #define SP_BUILTIN_POLY_POLY_HASH (-20)
 #define SP_BUILTIN_OBJECT        (-21) /* Object.new identity sentinel */
+#define SP_BUILTIN_FIBER         (-22) /* sp_Fiber * boxed into poly slot */
 /* sp_RbVal is defined in sp_gc.h (the mark helpers dispatch on its tag). */
 static sp_RbVal sp_box_int(mrb_int v) { sp_RbVal r; r.tag = SP_TAG_INT; r.cls_id = 0; r.v.i = v; return r; }
 static sp_RbVal sp_box_str(const char *v) { sp_RbVal r; r.tag = SP_TAG_STR; r.cls_id = 0; r.v.s = v; return r; }

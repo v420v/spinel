@@ -582,7 +582,8 @@ static TyKind infer_call(Compiler *c, int id) {
       if (cn && !strcmp(cn, "StringScanner")) return TY_STRINGSCANNER;
       if (cn && !strcmp(cn, "Hash")) return TY_UNKNOWN;
       if (cn && !strcmp(cn, "Regexp")) return TY_REGEX;
-      if (cn && (!strcmp(cn, "Fiber") || !strcmp(cn, "Thread") || !strcmp(cn, "Mutex") ||
+      if (cn && !strcmp(cn, "Fiber")) return TY_FIBER;
+      if (cn && (!strcmp(cn, "Thread") || !strcmp(cn, "Mutex") ||
                  !strcmp(cn, "Random") || !strcmp(cn, "IO") || !strcmp(cn, "File") ||
                  !strcmp(cn, "GzipReader") || !strcmp(cn, "GzipWriter"))) return TY_POLY;
     }
@@ -614,8 +615,9 @@ static TyKind infer_call(Compiler *c, int id) {
       if (cn && !strcmp(cn, "StringScanner")) return TY_STRINGSCANNER;
       if (cn && !strcmp(cn, "Hash")) return TY_UNKNOWN; /* hash type determined by key usage */
       if (cn && !strcmp(cn, "Regexp")) return TY_REGEX;
-      /* Builtin object types: return TY_POLY (they're boxed sp_RbVal at runtime) */
-      if (cn && (!strcmp(cn, "Fiber") || !strcmp(cn, "Thread") || !strcmp(cn, "Mutex") ||
+      /* Builtin object types */
+      if (cn && !strcmp(cn, "Fiber")) return TY_FIBER;
+      if (cn && (!strcmp(cn, "Thread") || !strcmp(cn, "Mutex") ||
                  !strcmp(cn, "Random") || !strcmp(cn, "IO") || !strcmp(cn, "File") ||
                  !strcmp(cn, "GzipReader") || !strcmp(cn, "GzipWriter"))) return TY_POLY;
     }
@@ -766,16 +768,24 @@ static TyKind infer_call(Compiler *c, int id) {
       /* IO.pipe -> [r, w] pair; each is TY_POLY; the pair is a str_array */
       if (!strcmp(name, "pipe")) return TY_STR_ARRAY;
     }
-    /* Fiber.new {} / Thread.new {} / Fiber.current etc. -> TY_POLY (builtin object).
+    /* Fiber.new {} / Thread.new {} / Fiber.current etc.
        Handles both bare Const and ::Const path forms. */
     if (rty && (!strcmp(rty, "ConstantReadNode") || !strcmp(rty, "ConstantPathNode"))) {
       const char *cn2 = nt_str(nt, recv, "name");
+      if (cn2 && !strcmp(name, "new") && !strcmp(cn2, "Fiber")) return TY_FIBER;
       if (cn2 && !strcmp(name, "new") &&
-          (!strcmp(cn2, "Fiber") || !strcmp(cn2, "Thread") || !strcmp(cn2, "Mutex") ||
-           !strcmp(cn2, "Random")))
+          (!strcmp(cn2, "Thread") || !strcmp(cn2, "Mutex") || !strcmp(cn2, "Random")))
         return TY_POLY;
-      if (cn2 && !strcmp(cn2, "Fiber") && !strcmp(name, "current")) return TY_POLY;
+      if (cn2 && !strcmp(cn2, "Fiber") && !strcmp(name, "current")) return TY_FIBER;
+      if (cn2 && !strcmp(cn2, "Fiber") && !strcmp(name, "yield")) return TY_POLY;
     }
+  }
+
+  /* TY_FIBER instance methods */
+  if (recv >= 0 && rt == TY_FIBER) {
+    if (!strcmp(name, "resume") || !strcmp(name, "transfer")) return TY_POLY;
+    if (!strcmp(name, "alive?")) return TY_BOOL;
+    if (!strcmp(name, "value")) return TY_POLY;
   }
 
   /* Time instance methods */

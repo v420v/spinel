@@ -117,6 +117,8 @@ static Buf g_procs;
 static Buf g_proc_protos;
 static int g_proc_counter = 0;
 static int g_needs_proc_poly_retslot = 0; /* any proc returns TY_POLY via _sp_proc_poly_ret */
+/* Fiber body functions accumulate here (similar to g_procs but void(*)(sp_Fiber*)). */
+static int g_fiber_counter = 0;
 
 /* Static regex-literal table: each distinct (source, flags) pair compiles once
    to an sp_re_pat_<i> global initialized in sp_re_init(). */
@@ -399,6 +401,7 @@ static const char *c_type_name(TyKind t) {
     case TY_POLY:         return "sp_RbVal";
     case TY_POLY_ARRAY:   return "sp_PolyArray *";
     case TY_PROC:         return "sp_Proc *";
+    case TY_FIBER:        return "sp_Fiber *";
     case TY_CLASS:        return "sp_Class";
     default:             return NULL;
   }
@@ -407,7 +410,7 @@ static int is_scalar_ret(TyKind t) {
   return t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_STRING ||
          t == TY_SYMBOL || t == TY_RANGE || t == TY_TIME || t == TY_STRINGIO || t == TY_STRINGSCANNER || t == TY_MATCHDATA || t == TY_REGEX || t == TY_EXCEPTION ||
          t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY ||
-         t == TY_POLY || t == TY_POLY_ARRAY || t == TY_PROC || t == TY_CLASS ||
+         t == TY_POLY || t == TY_POLY_ARRAY || t == TY_PROC || t == TY_FIBER || t == TY_CLASS ||
          ty_is_hash(t) || ty_is_object(t);
 }
 static const char *default_value(TyKind t) {
@@ -429,6 +432,7 @@ static const char *default_value(TyKind t) {
     case TY_STR_ARRAY:
     case TY_POLY_ARRAY: return "NULL";
     case TY_PROC:    return "NULL";
+    case TY_FIBER:   return "NULL";
     case TY_POLY:    return "sp_box_nil()";
     case TY_CLASS:   return "((sp_Class){-1})";
     default:        return (ty_is_hash(t) || ty_is_object(t)) ? "NULL" : "0";
@@ -460,6 +464,7 @@ static void emit_box_open(Compiler *c, TyKind t, Buf *b) {
   else if (t == TY_STR_ARRAY)   buf_puts(b, "sp_box_str_array(");
   else if (t == TY_POLY_ARRAY)  buf_puts(b, "sp_box_poly_array(");
   else if (t == TY_CLASS) buf_puts(b, "sp_box_class(");
+  else if (t == TY_FIBER) buf_puts(b, "sp_box_obj((void *)(");
   else if (ty_is_object(t)) {
     int cid = ty_object_class(t);
     buf_printf(b, "sp_box_obj((%s *)( ", c->classes[cid].name);
@@ -469,6 +474,7 @@ static void emit_box_open(Compiler *c, TyKind t, Buf *b) {
 static void emit_box_close(Compiler *c, TyKind t, Buf *b) {
   (void)c;
   if (t == TY_POLY || t == TY_UNKNOWN) return; /* no-op: already sp_RbVal */
+  if (t == TY_FIBER) { buf_puts(b, "), SP_BUILTIN_FIBER)"); return; }
   if (ty_is_object(t))        { buf_printf(b, "), %d)", ty_object_class(t)); return; }
   buf_puts(b, ")");
 }
@@ -542,6 +548,7 @@ static int  emit_iteration_stmt(Compiler *c, int id, Buf *b, int indent);
 static int  emit_inline_call(Compiler *c, int id, Buf *b, int indent);
 static int  emit_inline_expr(Compiler *c, int id, Buf *b);
 static void emit_cond(Compiler *c, int id, Buf *b);
+static void emit_fiber_new(Compiler *c, int id, Buf *b);
 static int  needs_root(TyKind t);
 static int  method_is_void(Scope *s);
 static void emit_index_op_write(Compiler *c, int id, Buf *b, int indent);
@@ -3920,6 +3927,32 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     buf_puts(b, "sp_proc_parameters("); emit_expr(c, recv, b); buf_puts(b, ")"); return;
   }
 
+  /* Fiber instance methods */
+  if (recv >= 0 && comp_ntype(c, recv) == TY_FIBER) {
+    if (!strcmp(name, "resume")) {
+      buf_puts(b, "sp_Fiber_resume("); emit_expr(c, recv, b);
+      for (int k = 0; k < argc; k++) { buf_puts(b, ", "); emit_expr(c, argv[k], b); }
+      if (argc == 0) buf_puts(b, ", sp_box_nil()");
+      buf_puts(b, ")");
+      return;
+    }
+    if (!strcmp(name, "alive?")) {
+      buf_puts(b, "sp_Fiber_alive("); emit_expr(c, recv, b); buf_puts(b, ")"); return;
+    }
+    if (!strcmp(name, "transfer")) {
+      buf_puts(b, "sp_Fiber_transfer("); emit_expr(c, recv, b);
+      for (int k = 0; k < argc; k++) { buf_puts(b, ", "); emit_expr(c, argv[k], b); }
+      if (argc == 0) buf_puts(b, ", sp_box_nil()");
+      buf_puts(b, ")");
+      return;
+    }
+    if (!strcmp(name, "value")) {
+      /* Fiber#value: resume until fiber finishes and return last yielded value. */
+      buf_puts(b, "sp_Fiber_resume("); emit_expr(c, recv, b); buf_puts(b, ", sp_box_nil())");
+      return;
+    }
+  }
+
   /* `poly_val << x`: runtime dispatch via sp_poly_shl (handles IntArray,
      StrArray, PolyArray, etc. boxed in sp_RbVal). Returns the receiver. */
   if (recv >= 0 && !strcmp(name, "<<") && argc == 1 &&
@@ -5131,6 +5164,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
         else { buf_puts(b, "sp_StringIO_new_sm("); emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")"); }
         return;
       }
+      if (cn && !strcmp(cn, "Fiber") && nt_ref(nt, id, "block") >= 0) {
+        emit_fiber_new(c, id, b);
+        return;
+      }
       if (cn && !strcmp(cn, "StringScanner") && argc == 1) {
         buf_puts(b, "sp_StringScanner_new("); emit_expr(c, argv[0], b); buf_puts(b, ")");
         return;
@@ -5296,6 +5333,20 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (!strcmp(name, "start") && argc == 0) { buf_puts(b, "0LL"); return; }
     if (!strcmp(name, "compact") && argc == 0) { buf_puts(b, "0LL"); return; }
     if (!strcmp(name, "stat") && argc == 0) { buf_puts(b, "sp_gc_stat()"); return; }
+  }
+
+  /* Fiber class methods: Fiber.yield(val) and Fiber.current */
+  if (recv >= 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode") &&
+      nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "Fiber")) {
+    if (!strcmp(name, "yield")) {
+      if (argc == 0) buf_puts(b, "sp_Fiber_yield(sp_box_nil())");
+      else { buf_puts(b, "sp_Fiber_yield("); emit_boxed(c, argv[0], b); buf_puts(b, ")"); }
+      return;
+    }
+    if (!strcmp(name, "current") && argc == 0) {
+      buf_puts(b, "sp_fiber_current");
+      return;
+    }
   }
 
   /* Process module methods */
@@ -16019,6 +16070,126 @@ static int proc_body_has_yield(Compiler *c, int id) {
   int na = nt_num_arrs(c->nt, id);
   for (int i = 0; i < na; i++) { int n = 0; const int *ids = nt_arr_at(c->nt, id, i, &n); for (int k = 0; k < n; k++) if (proc_body_has_yield(c, ids[k])) return 1; }
   return 0;
+}
+
+/* Lower `Fiber.new { |param| body }` into a static void fn and sp_Fiber_new.
+   No-capture case: all locals in the body are fiber-function locals; any
+   reference to an outer-scope variable that is NOT heap-celled will compile
+   fine only when it's a parameter of the enclosing method (passed by value).
+   Captured outer locals (is_cell) are not yet supported — those fibers will
+   produce a C compile error rather than silently miscompiling. */
+static void emit_fiber_new(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int blk = nt_ref(nt, id, "block");
+  if (blk < 0) { buf_puts(b, "sp_Fiber_new(NULL)"); return; }
+
+  int fid = ++g_fiber_counter;
+  char fname[48];
+  snprintf(fname, sizeof fname, "_fiber_body_%d", fid);
+
+  /* Block parameter name (first required, if any) */
+  const char *bp0 = NULL;
+  int bp_node = nt_ref(nt, blk, "parameters");
+  if (bp_node >= 0) {
+    int inner = nt_ref(nt, bp_node, "parameters");
+    int pn = inner >= 0 ? inner : bp_node;
+    int rn = 0; const int *reqs = nt_arr(nt, pn, "requireds", &rn);
+    if (rn > 0) bp0 = nt_str(nt, reqs[0], "name");
+  }
+  int body = nt_ref(nt, blk, "body");
+  Scope *encl = comp_scope_of(c, id);
+
+  /* Collect locals written inside this fiber body (not in nested blocks). */
+  NameSet fib_locals = {0};
+  if (body >= 0) proc_collect_locals(c, body, &fib_locals);
+
+  /* Emit fiber body function prototype before main bodies */
+  buf_printf(&g_proc_protos, "static void %s(sp_Fiber *_fb);\n", fname);
+
+  /* Emit fiber body function into g_procs buffer */
+  Buf *pb = &g_procs;
+  buf_printf(pb, "static void %s(sp_Fiber *_fb) {\n", fname);
+  buf_puts(pb, "    SP_GC_SAVE();\n");
+
+  /* Save global emission state */
+  Buf *sv_pre = g_pre; int sv_indent = g_indent, sv_nren = g_nren, sv_block = g_block_id;
+  const char *sv_bpn = g_block_param_name, *sv_self = g_self, *sv_rv = g_result_var;
+  TyKind sv_rt = g_ret_type; int sv_rp = g_result_poly;
+  g_pre = NULL; g_indent = 1; g_nren = 0; g_block_id = blk;
+  g_block_param_name = bp0; g_self = sv_self;
+  g_ret_type = TY_POLY; g_result_poly = 0; g_result_var = NULL;
+
+  /* Block param: first resume value (or nil on initial resume) */
+  if (bp0) {
+    const char *bpn = rename_local(bp0);
+    buf_printf(pb, "    sp_RbVal lv_%s = _fb->resumed_value;\n", bpn);
+    buf_printf(pb, "    SP_GC_ROOT_RBVAL(lv_%s);\n", bpn);
+  }
+
+  /* Declare fiber-body locals (those written in the body, not captured) */
+  if (encl) {
+    for (int i = 0; i < encl->nlocals; i++) {
+      LocalVar *lv = &encl->locals[i];
+      if (lv->is_param || lv->is_cell) continue;
+      if (!lv->name) continue;
+      if (bp0 && !strcmp(lv->name, bp0)) continue;
+      if (!nameset_has(&fib_locals, lv->name)) continue;
+      if (lv->type == TY_UNKNOWN) continue;
+      declare_local(c, pb, lv, 0);
+    }
+  }
+  free(fib_locals.v);
+
+  /* Emit body: all-but-last as side-effect statements, last sets yielded_value.
+     For void/nil last statements emit as stmt first then set yielded=nil. */
+  if (body >= 0) {
+    int bn = 0; const int *bb = nt_arr(nt, body, "body", &bn);
+    for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], pb, 1);
+    if (bn > 0) {
+      int last = bb[bn - 1];
+      TyKind lty = comp_ntype(c, last);
+      if (lty == TY_VOID || lty == TY_UNKNOWN) {
+        emit_stmt(c, last, pb, 1);
+        buf_puts(pb, "    _fb->yielded_value = sp_box_nil();\n");
+      }
+      else if (lty == TY_NIL) {
+        emit_stmt(c, last, pb, 1);
+        buf_puts(pb, "    _fb->yielded_value = sp_box_nil();\n");
+      }
+      else {
+        Buf pre2 = {0}, vb = {0};
+        Buf *sv2 = g_pre; int sv2i = g_indent;
+        g_pre = &pre2; g_indent = 1;
+        emit_expr(c, last, &vb);
+        g_pre = sv2; g_indent = sv2i;
+        if (pre2.p) buf_puts(pb, pre2.p);
+        buf_printf(pb, "    _fb->yielded_value = ");
+        if (lty == TY_POLY) {
+          buf_puts(pb, vb.p ? vb.p : "sp_box_nil()");
+        }
+        else {
+          emit_box_open(c, lty, pb); buf_puts(pb, vb.p ? vb.p : ""); emit_box_close(c, lty, pb);
+        }
+        buf_puts(pb, ";\n");
+        free(pre2.p); free(vb.p);
+      }
+    }
+    else {
+      buf_puts(pb, "    _fb->yielded_value = sp_box_nil();\n");
+    }
+  }
+  else {
+    buf_puts(pb, "    _fb->yielded_value = sp_box_nil();\n");
+  }
+
+  buf_puts(pb, "}\n");
+
+  /* Restore emission state */
+  g_pre = sv_pre; g_indent = sv_indent; g_nren = sv_nren; g_block_id = sv_block;
+  g_block_param_name = sv_bpn; g_self = sv_self; g_ret_type = sv_rt;
+  g_result_poly = sv_rp; g_result_var = sv_rv;
+
+  buf_printf(b, "sp_Fiber_new(%s)", fname);
 }
 
 /* Lower a `proc {}` / `lambda {}` / `Proc.new {}` / `->(){}` literal: emit a
