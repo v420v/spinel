@@ -397,6 +397,8 @@ static const char *c_type_name(TyKind t) {
     case TY_SYMBOL:      return "sp_sym";
     case TY_RANGE:       return "sp_Range";
     case TY_TIME:        return "sp_Time";
+    case TY_COMPLEX:     return "sp_Complex";
+    case TY_RATIONAL:    return "sp_Rational";
     case TY_STRINGIO:    return "sp_StringIO *";
     case TY_STRINGSCANNER: return "sp_StringScanner *";
     case TY_MATCHDATA:   return "sp_MatchData *";
@@ -425,7 +427,7 @@ static const char *c_type_name(TyKind t) {
 }
 static int is_scalar_ret(TyKind t) {
   return t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_STRING ||
-         t == TY_SYMBOL || t == TY_RANGE || t == TY_TIME || t == TY_STRINGIO || t == TY_STRINGSCANNER || t == TY_MATCHDATA || t == TY_REGEX || t == TY_EXCEPTION ||
+         t == TY_SYMBOL || t == TY_RANGE || t == TY_TIME || t == TY_COMPLEX || t == TY_RATIONAL || t == TY_STRINGIO || t == TY_STRINGSCANNER || t == TY_MATCHDATA || t == TY_REGEX || t == TY_EXCEPTION ||
          t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY ||
          t == TY_POLY || t == TY_POLY_ARRAY || t == TY_PROC || t == TY_FIBER || t == TY_RANDOM || t == TY_METHOD || t == TY_IO || t == TY_CLASS ||
          ty_is_hash(t) || ty_is_object(t);
@@ -464,6 +466,8 @@ static const char *default_value(TyKind t) {
     case TY_SYMBOL: return "((sp_sym)-1)";
     case TY_RANGE:  return "(sp_Range){0}";
     case TY_TIME:   return "(sp_Time){0}";
+    case TY_COMPLEX: return "(sp_Complex){0}";
+    case TY_RATIONAL: return "(sp_Rational){0}";
     case TY_STRINGIO: return "NULL";
     case TY_STRINGSCANNER: return "NULL";
     case TY_MATCHDATA:  return "NULL";
@@ -3747,6 +3751,55 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   const int *argv = NULL;
   if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
   if (!name) unsupported(c, id, "call (no name)");
+
+  /* ---- Complex / Rational value types ---- */
+  /* Kernel#Complex(re[, im]) */
+  if (recv < 0 && !strcmp(name, "Complex") && argc >= 1) {
+    buf_puts(b, "((sp_Complex){(mrb_float)(");
+    emit_expr(c, argv[0], b);
+    buf_puts(b, "), (mrb_float)(");
+    if (argc >= 2) emit_expr(c, argv[1], b);
+    else buf_puts(b, "0");
+    buf_puts(b, ")})");
+    return;
+  }
+  if (recv >= 0) {
+    const char *rrty = nt_type(nt, recv);
+    /* Complex.polar(magnitude, angle) */
+    if (rrty && !strcmp(rrty, "ConstantReadNode") && nt_str(nt, recv, "name") &&
+        !strcmp(nt_str(nt, recv, "name"), "Complex") && !strcmp(name, "polar") && argc >= 1) {
+      buf_puts(b, "sp_complex_polar((mrb_float)(");
+      emit_expr(c, argv[0], b);
+      buf_puts(b, "), (mrb_float)(");
+      if (argc >= 2) emit_expr(c, argv[1], b);
+      else buf_puts(b, "0");
+      buf_puts(b, "))");
+      return;
+    }
+    TyKind crt = comp_ntype(c, recv);
+    if (crt == TY_COMPLEX) {
+      if (!strcmp(name, "real"))      { buf_puts(b, "("); emit_expr(c, recv, b); buf_puts(b, ").re"); return; }
+      if (!strcmp(name, "imaginary") || !strcmp(name, "imag")) { buf_puts(b, "("); emit_expr(c, recv, b); buf_puts(b, ").im"); return; }
+      if (!strcmp(name, "conjugate") || !strcmp(name, "conj")) { buf_puts(b, "sp_complex_conjugate("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
+      if ((!strcmp(name, "+") || !strcmp(name, "*")) && argc == 1 && comp_ntype(c, argv[0]) == TY_COMPLEX) {
+        buf_printf(b, "sp_complex_%s(", name[0] == '+' ? "add" : "mul");
+        emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        return;
+      }
+      if (!strcmp(name, "to_s") || !strcmp(name, "inspect")) { buf_puts(b, "sp_complex_inspect("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
+    }
+    if (crt == TY_INT && !strcmp(name, "quo") && argc == 1) {
+      buf_puts(b, "sp_rational_new((mrb_int)(");
+      emit_expr(c, recv, b); buf_puts(b, "), (mrb_int)(");
+      emit_expr(c, argv[0], b); buf_puts(b, "))");
+      return;
+    }
+    if (crt == TY_RATIONAL) {
+      if (!strcmp(name, "numerator"))   { buf_puts(b, "("); emit_expr(c, recv, b); buf_puts(b, ").num"); return; }
+      if (!strcmp(name, "denominator")) { buf_puts(b, "("); emit_expr(c, recv, b); buf_puts(b, ").den"); return; }
+      if (!strcmp(name, "to_s") || !strcmp(name, "inspect")) { buf_puts(b, "sp_rational_inspect("); emit_expr(c, recv, b); buf_puts(b, ")"); return; }
+    }
+  }
 
   /* loop { break val } as expression: emit pre-statement for-loop, result via break var */
   if (recv < 0 && !strcmp(name, "loop") && argc == 0) {
@@ -12948,6 +13001,20 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
 
   if (!strcmp(ty, "IntegerNode")) { buf_printf(b, "%lldLL", nt_int(nt, id, "value", 0)); return; }
   if (!strcmp(ty, "FloatNode")) { const char *v = nt_content(nt, id); buf_puts(b, v ? v : "0.0"); return; }
+  if (!strcmp(ty, "ImaginaryNode")) {
+    int num = nt_ref(nt, id, "numeric");
+    buf_puts(b, "((sp_Complex){0.0, (mrb_float)(");
+    if (num >= 0) emit_expr(c, num, b);
+    else buf_puts(b, "0");
+    buf_puts(b, ")})");
+    return;
+  }
+  if (!strcmp(ty, "RationalNode")) {
+    const char *rn = nt_str(nt, id, "rat_num");
+    const char *rd = nt_str(nt, id, "rat_den");
+    buf_printf(b, "((sp_Rational){%sLL, %sLL})", rn ? rn : "0", rd ? rd : "1");
+    return;
+  }
   if (!strcmp(ty, "StringNode")) {
     const char *sc = nt_str(nt, id, "content");
     emit_str_literal_n(b, sc ? sc : "", sc ? nt_str_len(nt, id, "content") : 0);
@@ -14268,6 +14335,14 @@ static void emit_p_one(Compiler *c, int arg, Buf *b, int indent) {
   }
   else if (t == TY_POLY) {
     buf_puts(b, "fputs(sp_poly_inspect("); emit_expr(c, arg, b);
+    buf_puts(b, "), stdout); putchar('\\n');\n");
+  }
+  else if (t == TY_COMPLEX) {
+    buf_puts(b, "fputs(sp_complex_inspect("); emit_expr(c, arg, b);
+    buf_puts(b, "), stdout); putchar('\\n');\n");
+  }
+  else if (t == TY_RATIONAL) {
+    buf_puts(b, "fputs(sp_rational_inspect("); emit_expr(c, arg, b);
     buf_puts(b, "), stdout); putchar('\\n');\n");
   }
   else if (t == TY_TIME) {
@@ -17178,6 +17253,8 @@ static void declare_local(Compiler *c, Buf *b, LocalVar *lv, int vol) {
     case TY_SYMBOL: buf_puts(&cty, "sp_sym"); init = "((sp_sym)-1)"; break;
     case TY_RANGE:  buf_puts(&cty, "sp_Range"); init = "{0}"; break;
     case TY_TIME:   buf_puts(&cty, "sp_Time"); init = "{0}"; break;
+    case TY_COMPLEX:  buf_puts(&cty, "sp_Complex"); init = "{0}"; break;
+    case TY_RATIONAL: buf_puts(&cty, "sp_Rational"); init = "{0}"; break;
     case TY_STRING: buf_puts(&cty, "const char *"); init = "(&(\"\\xff\")[1])"; ptr = 1; break;
     case TY_POLY:   buf_puts(&cty, "sp_RbVal"); init = "sp_box_nil()"; break;
     case TY_CLASS:  buf_puts(&cty, "sp_Class"); init = "((sp_Class){-1})"; break;

@@ -14,6 +14,8 @@ const char *ty_name(TyKind t) {
     case TY_BOOL:    return "bool";
     case TY_RANGE:   return "range";
     case TY_TIME:    return "time";
+    case TY_COMPLEX: return "complex";
+    case TY_RATIONAL: return "rational";
     case TY_STRINGIO: return "stringio";
     case TY_STRINGSCANNER: return "stringscanner";
     case TY_MATCHDATA: return "matchdata";

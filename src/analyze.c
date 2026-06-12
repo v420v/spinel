@@ -458,6 +458,29 @@ static TyKind infer_call(Compiler *c, int id) {
   TyKind rt = recv >= 0 ? infer_type(c, recv) : TY_UNKNOWN;
   TyKind a0 = argc >= 1 ? infer_type(c, argv[0]) : TY_UNKNOWN;
 
+  /* Complex / Rational value types. */
+  if (recv < 0 && !strcmp(name, "Complex")) return TY_COMPLEX;
+  if (recv >= 0) {
+    const char *rrty = nt_type(nt, recv);
+    if (rrty && !strcmp(rrty, "ConstantReadNode") && nt_str(nt, recv, "name") &&
+        !strcmp(nt_str(nt, recv, "name"), "Complex") && !strcmp(name, "polar"))
+      return TY_COMPLEX;
+  }
+  if (rt == TY_COMPLEX) {
+    if (!strcmp(name, "real") || !strcmp(name, "imaginary") || !strcmp(name, "imag") ||
+        !strcmp(name, "abs") || !strcmp(name, "magnitude")) return TY_FLOAT;
+    if (!strcmp(name, "conjugate") || !strcmp(name, "conj") ||
+        !strcmp(name, "+") || !strcmp(name, "-") || !strcmp(name, "*")) return TY_COMPLEX;
+    if (!strcmp(name, "to_s") || !strcmp(name, "inspect")) return TY_STRING;
+  }
+  if (rt == TY_INT && !strcmp(name, "quo")) return TY_RATIONAL;
+  if (rt == TY_RATIONAL) {
+    if (!strcmp(name, "numerator") || !strcmp(name, "denominator")) return TY_INT;
+    if (!strcmp(name, "to_f")) return TY_FLOAT;
+    if (!strcmp(name, "to_i")) return TY_INT;
+    if (!strcmp(name, "to_s") || !strcmp(name, "inspect")) return TY_STRING;
+  }
+
   /* Safe navigation &. : nil receiver always short-circuits to nil */
   {
     const char *call_op = nt_str(nt, id, "call_operator");
@@ -2286,6 +2309,8 @@ static TyKind infer_uncached(Compiler *c, int id) {
 
   if (!strcmp(ty, "IntegerNode"))             return TY_INT;
   if (!strcmp(ty, "FloatNode"))               return TY_FLOAT;
+  if (!strcmp(ty, "ImaginaryNode"))           return TY_COMPLEX;
+  if (!strcmp(ty, "RationalNode"))            return TY_RATIONAL;
   if (!strcmp(ty, "StringNode"))              return TY_STRING;
   if (!strcmp(ty, "SourceFileNode"))          return TY_STRING;
   if (!strcmp(ty, "SourceLineNode"))          return TY_INT;
