@@ -2543,6 +2543,139 @@ static void collect_def_params(Compiler *c, int def_id, Scope *s) {
   }
 }
 
+static void walk_scope(Compiler *c, int id, int scope_idx, int class_id);
+
+/* String form of an int/string/symbol literal node, for compile-time
+   `define_method` name interpolation. Returns malloc'd, or NULL. */
+static char *dm_lit_str(Compiler *c, int lit) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, lit);
+  if (!ty) return NULL;
+  if (!strcmp(ty, "IntegerNode")) {
+    char buf[32]; snprintf(buf, sizeof buf, "%lld", (long long)nt_int(nt, lit, "value", 0));
+    return strdup(buf);
+  }
+  if (!strcmp(ty, "StringNode")) {
+    const char *s = nt_str(nt, lit, "content");
+    if (!s) s = nt_str(nt, lit, "unescaped");
+    return s ? strdup(s) : NULL;
+  }
+  if (!strcmp(ty, "SymbolNode")) { const char *s = nt_str(nt, lit, "value"); return s ? strdup(s) : NULL; }
+  return NULL;
+}
+
+/* Evaluate a `define_method(<name-expr>)` name with the each-loop variable
+   `bv` bound to literal `lit`. Handles string/symbol literals, a bare loop
+   variable, and (interpolated) string/symbol nodes. Returns malloc'd name
+   or NULL when not statically resolvable. */
+static char *dm_eval_name(Compiler *c, int node, const char *bv, int lit) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, node);
+  if (!ty) return NULL;
+  if (!strcmp(ty, "StringNode")) {
+    const char *s = nt_str(nt, node, "content");
+    if (!s) s = nt_str(nt, node, "unescaped");
+    return s ? strdup(s) : NULL;
+  }
+  if (!strcmp(ty, "SymbolNode")) { const char *s = nt_str(nt, node, "value"); return s ? strdup(s) : NULL; }
+  if (!strcmp(ty, "LocalVariableReadNode")) {
+    const char *nm = nt_str(nt, node, "name");
+    if (nm && bv && !strcmp(nm, bv)) return dm_lit_str(c, lit);
+    return NULL;
+  }
+  if (!strcmp(ty, "EmbeddedStatementsNode")) {
+    int body = nt_ref(nt, node, "statements");
+    int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+    if (bn != 1) return NULL;
+    return dm_eval_name(c, bb[0], bv, lit);
+  }
+  if (!strcmp(ty, "InterpolatedStringNode") || !strcmp(ty, "InterpolatedSymbolNode")) {
+    int pn = 0; const int *parts = nt_arr(nt, node, "parts", &pn);
+    char *out = strdup("");
+    for (int k = 0; k < pn; k++) {
+      char *p = dm_eval_name(c, parts[k], bv, lit);
+      if (!p) { free(out); return NULL; }
+      size_t no = strlen(out) + strlen(p) + 1;
+      char *merged = malloc(no); snprintf(merged, no, "%s%s", out, p);
+      free(out); free(p); out = merged;
+    }
+    return out;
+  }
+  return NULL;
+}
+
+/* TyKind of an int/string/symbol literal node (for the unrolled method's
+   subst-var type and return type). */
+static TyKind dm_lit_type(Compiler *c, int lit) {
+  const char *ty = nt_type(c->nt, lit);
+  if (!ty) return TY_UNKNOWN;
+  if (!strcmp(ty, "IntegerNode")) return TY_INT;
+  if (!strcmp(ty, "StringNode"))  return TY_STRING;
+  if (!strcmp(ty, "SymbolNode"))  return TY_SYMBOL;
+  return TY_UNKNOWN;
+}
+
+/* Detect `[lit, ...].each { |v| define_method("m_#{v}") { body } }` in a
+   class body and synthesize one method scope per literal element, each with
+   a compile-time substitution of `v`. Returns 1 if handled. */
+static int collect_dm_each_unroll(Compiler *c, int id, int class_id) {
+  const NodeTable *nt = c->nt;
+  if (class_id < 0) return 0;
+  const char *nm = nt_str(nt, id, "name");
+  if (!nm || strcmp(nm, "each")) return 0;
+  int recv = nt_ref(nt, id, "receiver");
+  if (recv < 0 || !nt_type(nt, recv) || strcmp(nt_type(nt, recv), "ArrayNode")) return 0;
+  int blk = nt_ref(nt, id, "block");
+  if (blk < 0) return 0;
+  /* block parameter name */
+  int pn = nt_ref(nt, blk, "parameters");
+  int inner = pn >= 0 ? nt_ref(nt, pn, "parameters") : -1;
+  int pnode = inner >= 0 ? inner : pn;
+  int rnp = 0; const int *reqs = pnode >= 0 ? nt_arr(nt, pnode, "requireds", &rnp) : NULL;
+  if (rnp < 1) return 0;
+  const char *bv = nt_str(nt, reqs[0], "name");
+  if (!bv) return 0;
+  /* block body must be a single define_method call */
+  int body = nt_ref(nt, blk, "body");
+  int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+  if (bn != 1) return 0;
+  int dc = bb[0];
+  if (!nt_type(nt, dc) || strcmp(nt_type(nt, dc), "CallNode")) return 0;
+  const char *dcn = nt_str(nt, dc, "name");
+  if (!dcn || strcmp(dcn, "define_method") || nt_ref(nt, dc, "receiver") >= 0) return 0;
+  int dargs = nt_ref(nt, dc, "arguments");
+  int dan = 0; const int *dav = dargs >= 0 ? nt_arr(nt, dargs, "arguments", &dan) : NULL;
+  if (dan < 1) return 0;
+  int dblk = nt_ref(nt, dc, "block");
+  if (dblk < 0) return 0;
+  int dbody = nt_ref(nt, dblk, "body");
+  /* iterate the array literal's elements */
+  int en = 0; const int *elems = nt_arr(nt, recv, "elements", &en);
+  if (en == 0) return 0;
+  for (int k = 0; k < en; k++) {
+    TyKind lt = dm_lit_type(c, elems[k]);
+    if (lt == TY_UNKNOWN) return 0;  /* non-literal element: bail (unhandled) */
+    char *mname = dm_eval_name(c, dav[0], bv, elems[k]);
+    if (!mname) return 0;
+    Scope *ms = comp_scope_new(c, mname, dc);
+    free(mname);
+    ms->body = dbody;
+    ms->class_id = class_id;
+    ms->dm_subst_name = strdup(bv);
+    ms->dm_subst_node = elems[k];
+    /* the loop var reads inside the body resolve to the literal type */
+    LocalVar *lv = scope_local_intern(ms, bv);
+    lv->type = lt;
+    lv->is_param = 1;  /* not a real C param, but keeps it out of decls */
+    /* Walk the (shared) define_method body in this synthetic scope so its
+       nodes get nscope attribution. The last element wins for the shared
+       body nodes; that is fine since all elements share the value type. */
+    int ms_idx = c->nscopes - 1;
+    if (dbody >= 0) walk_scope(c, dbody, ms_idx, class_id);
+  }
+  return 1;
+}
+
 static void walk_scope(Compiler *c, int id, int scope_idx, int class_id) {
   if (id < 0 || id >= c->nt->count) return;
   c->nscope[id] = scope_idx;
@@ -2607,6 +2740,10 @@ static void walk_scope(Compiler *c, int id, int scope_idx, int class_id) {
     child = new_idx;
   }
   else if (ty && !strcmp(ty, "CallNode") && class_id >= 0) {
+    /* [lits].each { |v| define_method("m_#{v}") { body } } -- unroll into one
+       method per element. Handled wholesale; skip the generic recursion so
+       the inner define_method isn't also processed as a normal call. */
+    if (collect_dm_each_unroll(c, id, class_id)) return;
     /* define_method(:literal_name) { ... } at class scope: register as method scope */
     const char *dm_cn = nt_str(c->nt, id, "name");
     int dm_recv = nt_ref(c->nt, id, "receiver");

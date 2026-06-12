@@ -39,6 +39,13 @@ typedef struct {
   int is_lowered_yield; /* self-recursive yield method lowered to &block (sp_Proc) form */
   char *blk_param;  /* name of the `&block` parameter, or NULL (anon -> "") */
 
+  /* Compile-time `define_method` unrolling: a method synthesized from
+     `[lits].each { |v| define_method("m_#{v}") { body } }`. Within this
+     method's body a read of `dm_subst_name` is the literal at node
+     `dm_subst_node` (the loop value for this unrolled instance). */
+  char *dm_subst_name;
+  int dm_subst_node;
+
   char **pnames;    /* parameter names, in order (requireds then optionals) */
   int *pdefault;    /* per-param default-value node id, or -1 if required */
   int nparams;

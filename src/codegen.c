@@ -74,6 +74,10 @@ static int g_class_body_id = -1;
 /* Class id of the scope currently being emitted (-1 if none). Used to resolve
    implicit self calls in included-module methods to the including class. */
 static int g_emitting_class_id = -1;
+/* While emitting a compile-time-unrolled define_method body: the loop-var
+   name to substitute and the literal node to emit in its place (-1 = none). */
+static const char *g_dm_subst_name = NULL;
+static int g_dm_subst_node = -1;
 /* When inside an instance_eval block, the class id of the receiver (-1 outside).
    Used so InstanceVariableReadNode/WriteNode use g_self->iv_X instead of civ_Toplevel_X. */
 static int g_ie_class_id = -1;
@@ -12694,7 +12698,14 @@ static void emit_expr(Compiler *c, int id, Buf *b) {
     buf_printf(b, ", %d)", excl);
     return;
   }
-  if (!strcmp(ty, "LocalVariableReadNode")) { emit_local_ref(c, id, nt_str(nt, id, "name"), b); return; }
+  if (!strcmp(ty, "LocalVariableReadNode")) {
+    const char *lrn = nt_str(nt, id, "name");
+    /* compile-time define_method substitution: the loop var IS the literal */
+    if (g_dm_subst_name && lrn && !strcmp(lrn, g_dm_subst_name) && g_dm_subst_node >= 0) {
+      emit_expr(c, g_dm_subst_node, b); return;
+    }
+    emit_local_ref(c, id, lrn, b); return;
+  }
   if (!strcmp(ty, "LocalVariableWriteNode")) {
     /* assignment used as expression: ({ lv = rhs; lv; }) */
     const char *nm = nt_str(nt, id, "name");
@@ -15254,6 +15265,24 @@ static void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent) {
   const char *ty = nt_type(nt, id);
   if (!ty) unsupported(c, id, "statement (no type)");
 
+  /* `define_method` and the `[lits].each { define_method ... }` unroll are
+     resolved at analyze time into real method scopes; emit nothing here. */
+  if (!strcmp(ty, "CallNode")) {
+    const char *cnm = nt_str(nt, id, "name");
+    if (cnm && !strcmp(cnm, "define_method") && nt_ref(nt, id, "receiver") < 0) return;
+    if (cnm && !strcmp(cnm, "each") && nt_ref(nt, id, "block") >= 0) {
+      int rcv = nt_ref(nt, id, "receiver");
+      if (rcv >= 0 && nt_type(nt, rcv) && !strcmp(nt_type(nt, rcv), "ArrayNode")) {
+        int eblk = nt_ref(nt, id, "block");
+        int ebody = nt_ref(nt, eblk, "body");
+        int ebn = 0; const int *ebb = ebody >= 0 ? nt_arr(nt, ebody, "body", &ebn) : NULL;
+        if (ebn == 1 && nt_type(nt, ebb[0]) && !strcmp(nt_type(nt, ebb[0]), "CallNode") &&
+            nt_str(nt, ebb[0], "name") && !strcmp(nt_str(nt, ebb[0], "name"), "define_method"))
+          return;
+      }
+    }
+  }
+
   if (!strcmp(ty, "YieldNode")) {
     if (g_current_scope_is_lowered) {
       int yargs = nt_ref(nt, id, "arguments");
@@ -16838,6 +16867,9 @@ static void emit_scope_decls(Compiler *c, Scope *s, Buf *b) {
   int vol = scope_has_begin(c, (int)(s - c->scopes));
   for (int i = 0; i < s->nlocals; i++) {
     LocalVar *lv = &s->locals[i];
+    /* define_method subst var: replaced inline by the literal, never a C
+       local, so neither declare nor root it. */
+    if (s->dm_subst_name && lv->name && !strcmp(lv->name, s->dm_subst_name)) continue;
     /* Virtual &block slot: skip declaration UNLESS it's a lowered __yblk__ that
        needs a cell (so forwarding procs can capture it). */
     if (s->blk_param && lv->name && !strcmp(lv->name, s->blk_param) && !lv->is_cell) continue;
@@ -16935,6 +16967,8 @@ static void emit_method(Compiler *c, Scope *s, Buf *b) {
   TyKind saved_rt = g_ret_type;
   int saved_ed = g_ensure_depth; g_ensure_depth = 0;
   int saved_emcls = g_emitting_class_id; g_emitting_class_id = s->class_id;
+  const char *saved_dmn = g_dm_subst_name; int saved_dmnode = g_dm_subst_node;
+  g_dm_subst_name = s->dm_subst_name; g_dm_subst_node = s->dm_subst_node;
   int saved_lowered = g_current_scope_is_lowered; g_current_scope_is_lowered = s->is_lowered_yield;
   g_ret_type = method_is_void(s) ? TY_VOID : s->ret;
   if (method_is_void(s)) {
@@ -16948,6 +16982,7 @@ static void emit_method(Compiler *c, Scope *s, Buf *b) {
   }
   g_ret_type = saved_rt; g_ensure_depth = saved_ed;
   g_emitting_class_id = saved_emcls;
+  g_dm_subst_name = saved_dmn; g_dm_subst_node = saved_dmnode;
   g_current_scope_is_lowered = saved_lowered;
   buf_puts(b, "}\n");
 }
