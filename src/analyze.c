@@ -241,6 +241,16 @@ static TyKind method_call_ret(Compiler *c, int mi, int call_id) {
 
 /* 1 if `id` is a proc/lambda literal: `proc {}` / `lambda {}` (CallNode with
    no receiver and a block) or `Proc.new {}`. */
+static int is_proc_constant(const NodeTable *nt, int n) {
+  if (n < 0) return 0;
+  const char *ty = nt_type(nt, n);
+  if (!ty) return 0;
+  if (!strcmp(ty, "ConstantReadNode") || !strcmp(ty, "ConstantPathNode")) {
+    const char *nm = nt_str(nt, n, "name");
+    return nm && !strcmp(nm, "Proc");
+  }
+  return 0;
+}
 static int is_proc_literal(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   const char *ty = nt_type(nt, id);
@@ -249,9 +259,7 @@ static int is_proc_literal(Compiler *c, int id) {
   const char *name = nt_str(nt, id, "name");
   int recv = nt_ref(nt, id, "receiver");
   if (recv < 0 && name && (!strcmp(name, "proc") || !strcmp(name, "lambda"))) return 1;
-  if (recv >= 0 && name && !strcmp(name, "new") && nt_type(nt, recv) &&
-      !strcmp(nt_type(nt, recv), "ConstantReadNode") && nt_str(nt, recv, "name") &&
-      !strcmp(nt_str(nt, recv, "name"), "Proc")) return 1;
+  if (recv >= 0 && name && !strcmp(name, "new") && is_proc_constant(nt, recv)) return 1;
   return 0;
 }
 
@@ -554,7 +562,7 @@ static TyKind infer_call(Compiler *c, int id) {
   /* Class.new(...) -> an instance of that class; built-in .new constructors */
   if (recv >= 0 && !strcmp(name, "new")) {
     const char *rty = nt_type(nt, recv);
-    /* a namespaced class (M::Sub) -> resolve by the final path component */
+    /* a namespaced class (M::Sub) or root-qualified builtin (::Array etc) */
     if (rty && !strcmp(rty, "ConstantPathNode")) {
       const char *cn = nt_str(nt, recv, "name");
       int ci = cn ? comp_class_index(c, cn) : -1;
@@ -565,6 +573,18 @@ static TyKind infer_call(Compiler *c, int id) {
         return ty_object(ci);
       }
       if (cn && is_builtin_exception_name(cn)) return TY_EXCEPTION;
+      /* ::Array.new / ::String.new / ::StringIO.new etc. */
+      if (cn && !strcmp(cn, "Array") && argc == 2) return ty_array_of(infer_type(c, argv[1]));
+      if (cn && !strcmp(cn, "Array")) return TY_POLY_ARRAY;
+      if (cn && !strcmp(cn, "Object")) return TY_POLY;
+      if (cn && !strcmp(cn, "String")) return TY_STRING;
+      if (cn && !strcmp(cn, "StringIO")) return TY_STRINGIO;
+      if (cn && !strcmp(cn, "StringScanner")) return TY_STRINGSCANNER;
+      if (cn && !strcmp(cn, "Hash")) return TY_UNKNOWN;
+      if (cn && !strcmp(cn, "Regexp")) return TY_REGEX;
+      if (cn && (!strcmp(cn, "Fiber") || !strcmp(cn, "Thread") || !strcmp(cn, "Mutex") ||
+                 !strcmp(cn, "Random") || !strcmp(cn, "IO") || !strcmp(cn, "File") ||
+                 !strcmp(cn, "GzipReader") || !strcmp(cn, "GzipWriter"))) return TY_POLY;
     }
     if (rty && !strcmp(rty, "ConstantReadNode")) {
       const char *cn = nt_str(nt, recv, "name");
@@ -627,6 +647,7 @@ static TyKind infer_call(Compiler *c, int id) {
     if ((!strcmp(name, "escape") || !strcmp(name, "quote")) && argc >= 1) return TY_STRING;
     if (!strcmp(name, "union") && argc >= 1) return TY_REGEX;
     if (!strcmp(name, "last_match") && argc == 0) return TY_POLY;
+    if (!strcmp(name, "last_match") && argc == 1) return TY_STRING;
   }
 
   /* Regexp instance methods */
@@ -745,13 +766,15 @@ static TyKind infer_call(Compiler *c, int id) {
       /* IO.pipe -> [r, w] pair; each is TY_POLY; the pair is a str_array */
       if (!strcmp(name, "pipe")) return TY_STR_ARRAY;
     }
-    /* Fiber.new { } / Thread.new { } -> TY_POLY (builtin object) */
-    if (rty && !strcmp(rty, "ConstantReadNode")) {
+    /* Fiber.new {} / Thread.new {} / Fiber.current etc. -> TY_POLY (builtin object).
+       Handles both bare Const and ::Const path forms. */
+    if (rty && (!strcmp(rty, "ConstantReadNode") || !strcmp(rty, "ConstantPathNode"))) {
       const char *cn2 = nt_str(nt, recv, "name");
       if (cn2 && !strcmp(name, "new") &&
           (!strcmp(cn2, "Fiber") || !strcmp(cn2, "Thread") || !strcmp(cn2, "Mutex") ||
            !strcmp(cn2, "Random")))
         return TY_POLY;
+      if (cn2 && !strcmp(cn2, "Fiber") && !strcmp(name, "current")) return TY_POLY;
     }
   }
 
@@ -2395,6 +2418,32 @@ static void walk_scope(Compiler *c, int id, int scope_idx, int class_id) {
     if (nt_ref(c->nt, id, "receiver") >= 0) s->is_cmethod = 1;
     collect_def_params(c, id, s);
     child = new_idx;
+  }
+  else if (ty && !strcmp(ty, "CallNode") && class_id >= 0) {
+    /* define_method(:literal_name) { ... } at class scope: register as method scope */
+    const char *dm_cn = nt_str(c->nt, id, "name");
+    int dm_recv = nt_ref(c->nt, id, "receiver");
+    if (dm_cn && !strcmp(dm_cn, "define_method") && dm_recv < 0) {
+      int dm_args = nt_ref(c->nt, id, "arguments");
+      int dm_na = 0;
+      const int *dm_argv = dm_args >= 0 ? nt_arr(c->nt, dm_args, "arguments", &dm_na) : NULL;
+      if (dm_na >= 1) {
+        const char *dm_aty = nt_type(c->nt, dm_argv[0]);
+        const char *dm_mname = NULL;
+        if (dm_aty && !strcmp(dm_aty, "SymbolNode"))
+          dm_mname = nt_str(c->nt, dm_argv[0], "value");
+        else if (dm_aty && !strcmp(dm_aty, "StringNode"))
+          dm_mname = nt_str(c->nt, dm_argv[0], "content");
+        int dm_blk = nt_ref(c->nt, id, "block");
+        if (dm_mname && dm_blk >= 0) {
+          Scope *dm_s = comp_scope_new(c, dm_mname, id);
+          int dm_new_idx = c->nscopes - 1;
+          dm_s->body = nt_ref(c->nt, dm_blk, "body");
+          dm_s->class_id = class_id;
+          child = dm_new_idx;
+        }
+      }
+    }
   }
 
   int saved_cbody = g_cbody_class_id;

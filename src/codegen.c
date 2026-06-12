@@ -3618,6 +3618,25 @@ static int emit_each_with_object_expr(Compiler *c, int id, Buf *b) {
   return 1;
 }
 
+static int sp_is_fiber_storage_recv(const NodeTable *nt, int recv) {
+  if (recv < 0) return 0;
+  const char *rty = nt_type(nt, recv);
+  if (!rty) return 0;
+  if (!strcmp(rty, "ConstantReadNode")) {
+    const char *rn = nt_str(nt, recv, "name");
+    return rn && !strcmp(rn, "Fiber");
+  }
+  if (!strcmp(rty, "CallNode")) {
+    const char *rn = nt_str(nt, recv, "name");
+    int rr = nt_ref(nt, recv, "receiver");
+    if (!rn || strcmp(rn, "current") || rr < 0) return 0;
+    const char *rrty = nt_type(nt, rr);
+    const char *rrn = nt_str(nt, rr, "name");
+    return rrty && !strcmp(rrty, "ConstantReadNode") && rrn && !strcmp(rrn, "Fiber");
+  }
+  return 0;
+}
+
 static void emit_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   if (emit_partition_expr(c, id, b)) return;
@@ -3756,7 +3775,8 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       is_literal = 1;
     if (!is_literal && _pr_recv >= 0 && _pr_nm && !strcmp(_pr_nm, "new")) {
       const char *_rty = nt_type(nt, _pr_recv);
-      const char *_rnm = _rty && !strcmp(_rty, "ConstantReadNode") ? nt_str(nt, _pr_recv, "name") : NULL;
+      const char *_rnm = (_rty && (!strcmp(_rty, "ConstantReadNode") || !strcmp(_rty, "ConstantPathNode")))
+                         ? nt_str(nt, _pr_recv, "name") : NULL;
       if (_rnm && !strcmp(_rnm, "Proc")) is_literal = 1;
     }
     if (is_literal) { emit_proc_literal(c, id, b); return; }
@@ -4104,6 +4124,19 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   }
 
   /* exit / abort as expressions (noreturn, emit as C statement-expression) */
+  /* sleep(seconds) / Kernel.sleep(seconds) */
+  if (!strcmp(name, "sleep") && argc <= 1 &&
+      (recv < 0 ||
+       (nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode") &&
+        nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "Kernel")))) {
+    if (argc == 0) { buf_puts(b, "((void)sp_sleep(0.0), (mrb_int)0)"); return; }
+    TyKind st = comp_ntype(c, argv[0]);
+    buf_puts(b, "((void)sp_sleep(");
+    if (st == TY_INT) { buf_puts(b, "(double)"); emit_expr(c, argv[0], b); }
+    else emit_expr(c, argv[0], b);
+    buf_puts(b, "), (mrb_int)0)");
+    return;
+  }
   if (recv < 0 && (!strcmp(name, "exit") || !strcmp(name, "exit!"))) {
     if (argc == 0) { buf_puts(b, "({ exit(0); (mrb_int)0; })"); return; }
     buf_puts(b, "({ exit((int)("); emit_expr(c, argv[0], b); buf_puts(b, ")); (mrb_int)0; })");
@@ -4420,6 +4453,25 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_printf(b, "SPL(\"%s\")", c->classes[encl->class_id].name);
       return;
     }
+  }
+  /* Regexp.last_match(n) -> nth capture group string, or whole match for n=0 */
+  if (recv >= 0 && argc == 1 && !strcmp(name, "last_match") &&
+      nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode") &&
+      nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "Regexp")) {
+    const char *aty = nt_type(nt, argv[0]);
+    if (aty && !strcmp(aty, "IntegerNode")) {
+      long long idx = nt_int(nt, argv[0], "value", 0);
+      if (idx == 0) { buf_puts(b, "sp_re_match_str"); return; }
+      if (idx >= 1 && idx <= 9) { buf_printf(b, "sp_re_captures[%d]", (int)idx); return; }
+      buf_puts(b, "NULL");
+      return;
+    }
+    int tv = ++g_tmp;
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "mrb_int _t%d = ", tv); emit_expr(c, argv[0], g_pre); buf_puts(g_pre, ";\n");
+    buf_printf(b, "(_t%d == 0 ? sp_re_match_str : (_t%d >= 1 && _t%d <= 9 ? sp_re_captures[_t%d] : NULL))",
+               tv, tv, tv, tv);
+    return;
   }
   /* Regexp.escape / Regexp.quote -> escape special regex characters */
   if (recv >= 0 && argc == 1 &&
@@ -4996,7 +5048,7 @@ static void emit_call(Compiler *c, int id, Buf *b) {
   /* Class.new(args) -> sp_<Class>_new(args) */
   if (recv >= 0 && !strcmp(name, "new")) {
     const char *rty = nt_type(nt, recv);
-    if (rty && !strcmp(rty, "ConstantReadNode")) {
+    if (rty && (!strcmp(rty, "ConstantReadNode") || !strcmp(rty, "ConstantPathNode"))) {
       int ci = comp_class_index(c, nt_str(nt, recv, "name"));
       if (ci >= 0 && c->classes[ci].is_struct) {
         /* Struct.new members: positional args, or keyword args mapping each
@@ -6347,8 +6399,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if (!strcmp(name, "chr"))        { buf_puts(b, "sp_box_str(sp_str_chr(sp_poly_to_s("); emit_expr(c, recv, b); buf_puts(b, ")))"); return; }
     if (!strcmp(name, "freeze"))     { emit_expr(c, recv, b); return; }
   }
-  /* poly receiver: arr[start, len] = src -- 3-arg splice assign */
-  if (recv >= 0 && rt == TY_POLY && !strcmp(name, "[]=") && argc == 3) {
+  /* poly receiver: arr[start, len] = src -- 3-arg splice assign
+     Skip Fiber/Fiber.current storage receivers (handled later). */
+  if (recv >= 0 && rt == TY_POLY && !strcmp(name, "[]=") && argc == 3 &&
+      !sp_is_fiber_storage_recv(nt, recv)) {
     int tv = ++g_tmp;
     buf_puts(b, "({ sp_RbVal _t"); buf_printf(b, "%d = ", tv); emit_boxed(c, argv[2], b);
     buf_puts(b, "; sp_poly_splice("); emit_expr(c, recv, b); buf_puts(b, ", ");
@@ -6356,8 +6410,10 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     buf_printf(b, ", _t%d); _t%d; })", tv, tv);
     return;
   }
-  /* poly receiver: []= with symbol, string, int, or poly key -> runtime dispatch */
-  if (recv >= 0 && rt == TY_POLY && !strcmp(name, "[]=") && argc == 2) {
+  /* poly receiver: []= with symbol, string, int, or poly key -> runtime dispatch
+     Skip Fiber/Fiber.current storage receivers (handled later). */
+  if (recv >= 0 && rt == TY_POLY && !strcmp(name, "[]=") && argc == 2 &&
+      !sp_is_fiber_storage_recv(nt, recv)) {
     TyKind at = comp_ntype(c, argv[0]);
     TyKind vt = comp_ntype(c, argv[1]);
     int tv = ++g_tmp;
@@ -13041,7 +13097,7 @@ static void emit_assign(Compiler *c, int id, Buf *b, int indent) {
   if (vty && !strcmp(vty, "CallNode") && !strcmp(nt_str(c->nt, v, "name") ? nt_str(c->nt, v, "name") : "", "new")) {
     int hr = nt_ref(c->nt, v, "receiver");
     const char *hrt = hr >= 0 ? nt_type(c->nt, hr) : NULL;
-    if (hrt && !strcmp(hrt, "ConstantReadNode") &&
+    if (hrt && (!strcmp(hrt, "ConstantReadNode") || !strcmp(hrt, "ConstantPathNode")) &&
         !strcmp(nt_str(c->nt, hr, "name") ? nt_str(c->nt, hr, "name") : "", "Hash")) {
       is_hash_new = 1;
       int ha = nt_ref(c->nt, v, "arguments");
