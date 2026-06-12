@@ -749,7 +749,8 @@ static TyKind infer_call(Compiler *c, int id) {
     if (rty && !strcmp(rty, "ConstantReadNode") &&
         nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "File")) {
       if (!strcmp(name, "basename") || !strcmp(name, "dirname") || !strcmp(name, "extname") ||
-          !strcmp(name, "read") || !strcmp(name, "binread") || !strcmp(name, "expand_path"))
+          !strcmp(name, "read") || !strcmp(name, "binread") || !strcmp(name, "expand_path") ||
+          !strcmp(name, "join"))
         return TY_STRING;
       if (!strcmp(name, "exist?") || !strcmp(name, "exists?"))
         return TY_BOOL;
@@ -760,8 +761,18 @@ static TyKind infer_call(Compiler *c, int id) {
         return TY_BOOL;
       if (!strcmp(name, "mtime"))
         return TY_TIME;
-      /* File.open / File.new without a block -> a File object (TY_POLY) */
-      if (!strcmp(name, "open") || !strcmp(name, "new")) return TY_POLY;
+      if (!strcmp(name, "readlines")) return TY_STR_ARRAY;
+      /* File.open / File.new without a block -> a typed IO handle */
+      if (!strcmp(name, "open") || !strcmp(name, "new")) {
+        int blk = nt_ref(nt, id, "block");
+        if (blk < 0) return TY_IO;
+        /* Pin block param to TY_IO so body dispatch works (f.write, f.puts, etc.) */
+        const char *bp0 = block_param_name(c, blk, 0);
+        Scope *bs = bp0 ? comp_scope_of(c, blk) : NULL;
+        LocalVar *blv = (bs && bp0) ? scope_local(bs, bp0) : NULL;
+        if (blv) blv->type = TY_IO;
+        return TY_POLY;
+      }
     }
     if (rty && !strcmp(rty, "ConstantReadNode") &&
         nt_str(nt, recv, "name") && !strcmp(nt_str(nt, recv, "name"), "IO")) {
@@ -786,6 +797,30 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "resume") || !strcmp(name, "transfer")) return TY_POLY;
     if (!strcmp(name, "alive?")) return TY_BOOL;
     if (!strcmp(name, "value")) return TY_POLY;
+  }
+
+  /* TY_IO (File/IO handle) instance methods */
+  if (recv >= 0 && rt == TY_IO) {
+    if (!strcmp(name, "read") || !strcmp(name, "gets") || !strcmp(name, "readline") ||
+        !strcmp(name, "path") || !strcmp(name, "to_path")) return TY_STRING;
+    if (!strcmp(name, "read") && nt_ref(nt, id, "arguments") >= 0) return TY_STRING;
+    if (!strcmp(name, "readlines")) return TY_STR_ARRAY;
+    if (!strcmp(name, "write") || !strcmp(name, "syswrite") || !strcmp(name, "pos") ||
+        !strcmp(name, "tell") || !strcmp(name, "seek") || !strcmp(name, "rewind") ||
+        !strcmp(name, "close")) return TY_INT;
+    if (!strcmp(name, "print") || !strcmp(name, "puts") || !strcmp(name, "flush")) return TY_NIL;
+    if (!strcmp(name, "closed?") || !strcmp(name, "eof?") || !strcmp(name, "eof")) return TY_BOOL;
+    if (!strcmp(name, "each_line") || !strcmp(name, "each")) {
+      int blk = nt_ref(nt, id, "block");
+      if (blk >= 0) {
+        const char *bp0 = block_param_name(c, blk, 0);
+        Scope *bs = bp0 ? comp_scope_of(c, blk) : NULL;
+        LocalVar *blv = (bs && bp0) ? scope_local(bs, bp0) : NULL;
+        if (blv) blv->type = TY_STRING;
+      }
+      return TY_IO;
+    }
+    return TY_POLY;
   }
 
   /* Time instance methods */

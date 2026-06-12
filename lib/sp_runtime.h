@@ -2043,6 +2043,57 @@ static inline const char *sp_File_read_n(sp_File *f, mrb_int n) {
   return s;
 }
 static inline const char *sp_File_path(sp_File *f) { return f && f->path ? f->path : sp_str_empty; }
+static const char *sp_file_join(const char **parts, int n) {
+  size_t total = 0;
+  for (int i = 0; i < n; i++) {
+    if (parts[i]) total += strlen(parts[i]);
+    if (i < n - 1) total++;
+  }
+  char *r = sp_str_alloc((mrb_int)total);
+  size_t off = 0;
+  for (int i = 0; i < n; i++) {
+    if (parts[i]) { size_t l = strlen(parts[i]); memcpy(r + off, parts[i], l); off += l; }
+    if (i < n - 1) r[off++] = '/';
+  }
+  r[off] = 0;
+  return r;
+}
+static inline sp_StrArray *sp_File_readlines(sp_File *f) {
+  sp_StrArray *a = sp_StrArray_new();
+  const char *line;
+  while ((line = sp_File_gets(f)) != NULL) sp_StrArray_push(a, line);
+  return a;
+}
+static sp_StrArray *sp_file_readlines(const char *path) {
+  sp_StrArray *a = sp_StrArray_new();
+  FILE *_fp = fopen(path ? path : "", "r");
+  if (!_fp) return a;
+  char _buf[4096];
+  while (fgets(_buf, (int)sizeof(_buf), _fp)) {
+    size_t _l = strlen(_buf);
+    char *_r = sp_str_alloc_raw(_l + 1);
+    memcpy(_r, _buf, _l + 1);
+    sp_StrArray_push(a, _r);
+  }
+  fclose(_fp);
+  return a;
+}
+static sp_StrArray *sp_file_readlines_chomp(const char *path) {
+  sp_StrArray *a = sp_StrArray_new();
+  FILE *_fp = fopen(path ? path : "", "r");
+  if (!_fp) return a;
+  char _buf[4096];
+  while (fgets(_buf, (int)sizeof(_buf), _fp)) {
+    size_t _l = strlen(_buf);
+    if (_l > 0 && _buf[_l-1] == '\n') { _buf[--_l] = '\0'; }
+    if (_l > 0 && _buf[_l-1] == '\r') { _buf[--_l] = '\0'; }
+    char *_r = sp_str_alloc_raw(_l + 1);
+    memcpy(_r, _buf, _l + 1);
+    sp_StrArray_push(a, _r);
+  }
+  fclose(_fp);
+  return a;
+}
 
 /* Array#inspect for each typed array: `[elem1, elem2, ...]` with each
    element rendered via its own primitive inspect. Matches CRuby's
@@ -2677,6 +2728,7 @@ static const char *sp_exc_message(volatile struct sp_Exception_s *ve);
 #define SP_BUILTIN_POLY_POLY_HASH (-20)
 #define SP_BUILTIN_OBJECT        (-21) /* Object.new identity sentinel */
 #define SP_BUILTIN_FIBER         (-22) /* sp_Fiber * boxed into poly slot */
+#define SP_BUILTIN_IO            (-23) /* sp_File * (File/IO handle) boxed into poly slot */
 /* sp_RbVal is defined in sp_gc.h (the mark helpers dispatch on its tag). */
 static sp_RbVal sp_box_int(mrb_int v) { sp_RbVal r; r.tag = SP_TAG_INT; r.cls_id = 0; r.v.i = v; return r; }
 static sp_RbVal sp_box_str(const char *v) { sp_RbVal r; r.tag = SP_TAG_STR; r.cls_id = 0; r.v.s = v; return r; }

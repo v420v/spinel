@@ -402,6 +402,7 @@ static const char *c_type_name(TyKind t) {
     case TY_POLY_ARRAY:   return "sp_PolyArray *";
     case TY_PROC:         return "sp_Proc *";
     case TY_FIBER:        return "sp_Fiber *";
+    case TY_IO:           return "sp_File *";
     case TY_CLASS:        return "sp_Class";
     default:             return NULL;
   }
@@ -410,7 +411,7 @@ static int is_scalar_ret(TyKind t) {
   return t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_STRING ||
          t == TY_SYMBOL || t == TY_RANGE || t == TY_TIME || t == TY_STRINGIO || t == TY_STRINGSCANNER || t == TY_MATCHDATA || t == TY_REGEX || t == TY_EXCEPTION ||
          t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY ||
-         t == TY_POLY || t == TY_POLY_ARRAY || t == TY_PROC || t == TY_FIBER || t == TY_CLASS ||
+         t == TY_POLY || t == TY_POLY_ARRAY || t == TY_PROC || t == TY_FIBER || t == TY_IO || t == TY_CLASS ||
          ty_is_hash(t) || ty_is_object(t);
 }
 static const char *default_value(TyKind t) {
@@ -433,6 +434,7 @@ static const char *default_value(TyKind t) {
     case TY_POLY_ARRAY: return "NULL";
     case TY_PROC:    return "NULL";
     case TY_FIBER:   return "NULL";
+    case TY_IO:      return "NULL";
     case TY_POLY:    return "sp_box_nil()";
     case TY_CLASS:   return "((sp_Class){-1})";
     default:        return (ty_is_hash(t) || ty_is_object(t)) ? "NULL" : "0";
@@ -465,6 +467,7 @@ static void emit_box_open(Compiler *c, TyKind t, Buf *b) {
   else if (t == TY_POLY_ARRAY)  buf_puts(b, "sp_box_poly_array(");
   else if (t == TY_CLASS) buf_puts(b, "sp_box_class(");
   else if (t == TY_FIBER) buf_puts(b, "sp_box_obj((void *)(");
+  else if (t == TY_IO)    buf_puts(b, "sp_box_obj((void *)(");
   else if (ty_is_object(t)) {
     int cid = ty_object_class(t);
     buf_printf(b, "sp_box_obj((%s *)( ", c->classes[cid].name);
@@ -475,6 +478,7 @@ static void emit_box_close(Compiler *c, TyKind t, Buf *b) {
   (void)c;
   if (t == TY_POLY || t == TY_UNKNOWN) return; /* no-op: already sp_RbVal */
   if (t == TY_FIBER) { buf_puts(b, "), SP_BUILTIN_FIBER)"); return; }
+  if (t == TY_IO)    { buf_puts(b, "), SP_BUILTIN_IO)"); return; }
   if (ty_is_object(t))        { buf_printf(b, "), %d)", ty_object_class(t)); return; }
   buf_puts(b, ")");
 }
@@ -3953,6 +3957,79 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     }
   }
 
+  /* TY_IO (File/IO handle) instance methods */
+  if (recv >= 0 && comp_ntype(c, recv) == TY_IO) {
+    const char *r = NULL;
+    Buf rb = {0};
+    emit_expr(c, recv, &rb);
+    r = rb.p ? rb.p : "NULL";
+    if (!strcmp(name, "read")) {
+      if (argc == 0) buf_printf(b, "sp_File_read(%s)", r);
+      else { buf_puts(b, "sp_File_read_n("); buf_puts(b, r); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      free(rb.p); return;
+    }
+    if (!strcmp(name, "gets") || !strcmp(name, "readline")) {
+      buf_printf(b, "sp_File_gets(%s)", r); free(rb.p); return;
+    }
+    if (!strcmp(name, "readlines")) {
+      buf_printf(b, "sp_File_readlines(%s)", r); free(rb.p); return;
+    }
+    if (!strcmp(name, "write") || !strcmp(name, "syswrite")) {
+      if (argc >= 1) { buf_printf(b, "sp_File_write(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else buf_puts(b, "0");
+      free(rb.p); return;
+    }
+    if (!strcmp(name, "print") || !strcmp(name, "puts")) {
+      /* emit as a statement-like expression: print each arg, return nil */
+      int t = ++g_tmp;
+      emit_indent(g_pre, g_indent);
+      buf_puts(g_pre, "({ ");
+      for (int k = 0; k < argc; k++) {
+        buf_printf(g_pre, "sp_File_write(%s, ", r); emit_expr(c, argv[k], g_pre); buf_puts(g_pre, "); ");
+      }
+      if (!strcmp(name, "puts")) buf_printf(g_pre, "sp_File_write(%s, \"\\n\"); ", r);
+      buf_puts(g_pre, "});\n");
+      (void)t;
+      buf_puts(b, "((mrb_int)0)");
+      free(rb.p); return;
+    }
+    if (!strcmp(name, "close")) {
+      buf_printf(b, "sp_File_close(%s)", r); free(rb.p); return;
+    }
+    if (!strcmp(name, "closed?")) {
+      buf_printf(b, "sp_File_closed_p(%s)", r); free(rb.p); return;
+    }
+    if (!strcmp(name, "eof?") || !strcmp(name, "eof")) {
+      buf_printf(b, "sp_File_eof_p(%s)", r); free(rb.p); return;
+    }
+    if (!strcmp(name, "path") || !strcmp(name, "to_path")) {
+      buf_printf(b, "sp_File_path(%s)", r); free(rb.p); return;
+    }
+    if (!strcmp(name, "flush") || !strcmp(name, "sync=") || !strcmp(name, "sync")) {
+      if (!strcmp(name, "sync")) { buf_printf(b, "((mrb_bool)1)"); } /* always synced */
+      else { emit_expr(c, recv, b); }
+      free(rb.p); return;
+    }
+    if ((!strcmp(name, "each_line") || !strcmp(name, "each")) &&
+        nt_ref(nt, id, "block") >= 0) {
+      int blk = nt_ref(nt, id, "block");
+      const char *bp = block_param_name(c, blk, 0);
+      const char *bpn = bp ? rename_local(bp) : NULL;
+      int bdy = nt_ref(nt, blk, "body");
+      int bbn = 0; const int *bbb = bdy >= 0 ? nt_arr(nt, bdy, "body", &bbn) : NULL;
+      int lt = ++g_tmp, rf = ++g_tmp;
+      buf_puts(b, "({ ");
+      buf_printf(b, "sp_File *_t%d = %s; ", rf, r);
+      free(rb.p); r = NULL;
+      buf_printf(b, "const char *_t%d; while ((_t%d = sp_File_gets(_t%d)) != NULL) {", lt, lt, rf);
+      if (bpn) buf_printf(b, " const char *lv_%s = _t%d;", bpn, lt);
+      for (int k = 0; k < bbn; k++) emit_stmt(c, bbb[k], b, 0);
+      buf_printf(b, " } (sp_File *)_t%d; })", rf);
+      return;
+    }
+    free(rb.p);
+  }
+
   /* `poly_val << x`: runtime dispatch via sp_poly_shl (handles IntArray,
      StrArray, PolyArray, etc. boxed in sp_RbVal). Returns the receiver. */
   if (recv >= 0 && !strcmp(name, "<<") && argc == 1 &&
@@ -5532,6 +5609,83 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       buf_puts(b, "sp_file_expand_path("); emit_expr(c, argv[0], b); buf_puts(b, ", ");
       if (argc == 2) emit_expr(c, argv[1], b); else buf_puts(b, "(const char *)0");
       buf_puts(b, ")"); return;
+    }
+    if (!strcmp(name, "join")) {
+      buf_printf(b, "sp_file_join((const char*[]){");
+      for (int k = 0; k < argc; k++) { if (k) buf_puts(b, ", "); emit_expr(c, argv[k], b); }
+      if (argc == 0) buf_puts(b, "(const char*)0");
+      buf_printf(b, "}, %d)", argc); return;
+    }
+    if (!strcmp(name, "readlines") && argc >= 1) {
+      /* File.readlines(path) or File.readlines(path, chomp: true) */
+      int chomp = 0;
+      for (int ki = 1; ki < argc; ki++) {
+        const char *kty = nt_type(nt, argv[ki]);
+        if (kty && !strcmp(kty, "KeywordHashNode")) {
+          int cv = struct_kwarg_value(c, argv[ki], "chomp");
+          if (cv >= 0 && nt_type(nt, cv) && !strcmp(nt_type(nt, cv), "TrueNode"))
+            chomp = 1;
+        }
+      }
+      if (chomp) buf_puts(b, "sp_file_readlines_chomp(");
+      else buf_puts(b, "sp_file_readlines(");
+      emit_expr(c, argv[0], b); buf_puts(b, ")"); return;
+    }
+    /* File.open(path, mode) / File.new(path, mode) without block -> TY_IO handle */
+    if (!strcmp(name, "open") || !strcmp(name, "new")) {
+      int block = nt_ref(nt, id, "block");
+      if (block < 0) {
+        buf_puts(b, "sp_File_open("); emit_expr(c, argv[0], b); buf_puts(b, ", ");
+        if (argc >= 2) emit_expr(c, argv[1], b); else buf_puts(b, "\"r\"");
+        buf_puts(b, ")");
+        return;
+      }
+      /* File.open(path, mode) { |f| body } -> open, run body, close, return body value */
+      const char *fp = block_param_name(c, block, 0);
+      const char *frn = fp ? rename_local(fp) : NULL;
+      int bbody = nt_ref(nt, block, "body");
+      int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
+      TyKind res = comp_ntype(c, id);
+      int rv = ++g_tmp, tf = ++g_tmp;
+      int scalar = is_scalar_ret(res) && res != TY_VOID && res != TY_NIL && res != TY_UNKNOWN;
+      buf_puts(b, "({ ");
+      buf_printf(b, "sp_File *_t%d = sp_File_open(", tf); emit_expr(c, argv[0], b); buf_puts(b, ", ");
+      if (argc >= 2) emit_expr(c, argv[1], b); else buf_puts(b, "\"r\"");
+      buf_puts(b, "); ");
+      if (frn) {
+        /* Declare the file param as a local: look it up in the enclosing scope.
+           Since it's the block param, just use the sp_File * type directly. */
+        buf_printf(b, "sp_File *lv_%s = _t%d; ", frn, tf);
+      }
+      for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], b, 0);
+      if (bn > 0) {
+        TyKind lty = comp_ntype(c, bb[bn-1]);
+        /* Emit last stmt as expression when it has a usable non-void value.
+           For void/nil/unknown side-effecting calls (e.g. f.print), emit_stmt
+           handles g_pre correctly; then synthesize a return value. */
+        int can_expr = (lty != TY_VOID && lty != TY_UNKNOWN &&
+                        (lty != TY_NIL ||
+                         (nt_type(nt, bb[bn-1]) && !strcmp(nt_type(nt, bb[bn-1]), "NilNode"))));
+        if (scalar && can_expr) {
+          emit_ctype(c, res, b); buf_printf(b, " _t%d = ", rv);
+          if (res == TY_POLY && lty != TY_POLY) emit_boxed(c, bb[bn-1], b);
+          else emit_expr(c, bb[bn-1], b);
+          buf_puts(b, "; ");
+        }
+        else {
+          emit_stmt(c, bb[bn-1], b, 0);
+          if (scalar) {
+            emit_ctype(c, res, b); buf_printf(b, " _t%d = ", rv);
+            if (res == TY_POLY) buf_puts(b, "sp_box_nil()");
+            else buf_puts(b, default_value(res));
+            buf_puts(b, "; ");
+          }
+        }
+      }
+      buf_printf(b, "sp_File_close(_t%d); ", tf);
+      buf_printf(b, "%s; })",
+        scalar && bn > 0 ? ({ static char _tb[16]; snprintf(_tb, sizeof _tb, "_t%d", rv); _tb; }) : "0");
+      return;
     }
   }
   if (recv >= 0 && nt_type(nt, recv) && !strcmp(nt_type(nt, recv), "ConstantReadNode") &&
@@ -15734,6 +15888,14 @@ static void emit_unbox_text(Compiler *c, TyKind t, const char *expr, Buf *b) {
 static void emit_boxed(Compiler *c, int node, Buf *b) {
   TyKind t = comp_ntype(c, node);
   if (t == TY_POLY) { emit_expr(c, node, b); return; }
+  if (t == TY_FIBER) {
+    buf_puts(b, "sp_box_obj((void *)("); emit_expr(c, node, b); buf_puts(b, "), SP_BUILTIN_FIBER)");
+    return;
+  }
+  if (t == TY_IO) {
+    buf_puts(b, "sp_box_obj((void *)("); emit_expr(c, node, b); buf_puts(b, "), SP_BUILTIN_IO)");
+    return;
+  }
   if (t == TY_EXCEPTION) {
     buf_printf(b, "sp_box_obj("); emit_expr(c, node, b); buf_puts(b, ", SP_BUILTIN_EXCEPTION)");
     return;
