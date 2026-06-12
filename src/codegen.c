@@ -6108,7 +6108,11 @@ static void emit_call(Compiler *c, int id, Buf *b) {
     if ((!strcmp(name, "write") || !strcmp(name, "binwrite")) && argc == 2) {
       /* runtime write is void; Ruby returns the byte count */
       buf_puts(b, "({ const char *_wp = "); emit_expr(c, argv[0], b);
-      buf_puts(b, "; const char *_wd = "); emit_expr(c, argv[1], b);
+      buf_puts(b, "; const char *_wd = ");
+      if (comp_ntype(c, argv[1]) == TY_POLY) {
+        buf_puts(b, "sp_poly_to_s("); emit_expr(c, argv[1], b); buf_puts(b, ")");
+      }
+      else emit_expr(c, argv[1], b);
       buf_puts(b, "; sp_file_write(_wp, _wd); (mrb_int)sp_str_byte_len(_wd); })"); return;
     }
     if ((!strcmp(name, "exist?") || !strcmp(name, "exists?") || !strcmp(name, "readable?")) && argc == 1) {
