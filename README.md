@@ -474,10 +474,11 @@ by inlining the referenced file.
 
 ```bash
 make deps         # fetch libprism into vendor/prism (one-time)
-make              # build parser + regexp library + bootstrap analyze + codegen
-make test         # run 384 feature tests (requires bootstrap)
-make bench        # run 52 benchmarks (requires bootstrap)
-make bootstrap    # rebuild analyze + codegen from source (4-way fixpoint check)
+make              # build the C compiler (parser + regexp library + spinelc)
+make test         # run the feature tests (always a fresh run)
+make bench        # run benchmarks vs CRuby
+make legacy       # build the legacy Ruby compiler (analyze + codegen)
+make bootstrap    # legacy self-host fixpoint check (4-way), in legacy/
 sudo make install # install to /usr/local (spinel in PATH)
 make clean        # remove build artifacts
 ```
