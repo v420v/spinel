@@ -1670,6 +1670,7 @@ static TyKind infer_call(Compiler *c, int id) {
     if (!strcmp(name, "group_by") && block >= 0 && ty_is_array(rt))
       return TY_POLY_POLY_HASH;
     if ((!strcmp(name, "first") || !strcmp(name, "last")) && argc == 1) return rt;  /* first(n)/last(n) -> subarray */
+    if ((!strcmp(name, "drop") || !strcmp(name, "take")) && argc == 1) return rt;  /* subarray */
     if (!strcmp(name, "first") || !strcmp(name, "last") ||
         !strcmp(name, "min") || !strcmp(name, "max") ||
         !strcmp(name, "sample") ||

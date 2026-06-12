@@ -9405,6 +9405,27 @@ static void emit_call(Compiler *c, int id, Buf *b) {
       }
     }
     const char *k = array_kind(rt);
+    /* drop(n) / take(n): subarrays via slice (all kinds incl. poly). */
+    if ((!strcmp(name, "drop") || !strcmp(name, "take")) && argc == 1) {
+      const char *dk = (rt == TY_POLY_ARRAY) ? "Poly" : k;
+      if (dk) {
+        int t = ++g_tmp, tn = ++g_tmp;
+        buf_printf(b, "({ sp_%sArray *_t%d = ", dk, t); emit_expr(c, recv, b);
+        buf_printf(b, "; mrb_int _t%d = ", tn); emit_expr(c, argv[0], b);
+        if (!strcmp(name, "take"))
+          buf_printf(b, "; sp_%sArray_slice(_t%d, 0, _t%d); })", dk, t, tn);
+        else
+          buf_printf(b, "; sp_%sArray_slice(_t%d, _t%d, _t%d->len - _t%d); })", dk, t, tn, t, tn);
+        return;
+      }
+    }
+    /* poly-array max/min: boxed elements compared at runtime (numerics,
+       strings, int-array tuples lexicographically). */
+    if ((!strcmp(name, "max") || !strcmp(name, "min")) && argc == 0 &&
+        rt == TY_POLY_ARRAY && nt_ref(nt, id, "block") < 0) {
+      buf_printf(b, "sp_PolyArray_%s(", name); emit_expr(c, recv, b); buf_puts(b, ")");
+      return;
+    }
     /* fill(val[, start[, len]]): fill a range with val, evaluate to self. */
     if (!strcmp(name, "fill") && argc >= 1 && argc <= 3) {
       const char *fk = (rt == TY_POLY_ARRAY) ? "Poly" : k;

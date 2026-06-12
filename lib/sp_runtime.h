@@ -3052,6 +3052,21 @@ static mrb_bool sp_poly_numeric_p(sp_RbVal v) { return v.tag == SP_TAG_INT || v.
 static mrb_bool sp_poly_eq(sp_RbVal a, sp_RbVal b) { if (sp_poly_numeric_p(a) && sp_poly_numeric_p(b)) return sp_poly_to_f(a) == sp_poly_to_f(b); if (a.tag != b.tag) return FALSE; switch (a.tag) { case SP_TAG_INT: return a.v.i == b.v.i; case SP_TAG_STR: return (a.v.s == NULL || b.v.s == NULL) ? (a.v.s == b.v.s) : (strcmp(a.v.s, b.v.s) == 0); case SP_TAG_FLT: return a.v.f == b.v.f; case SP_TAG_BOOL: return a.v.b == b.v.b; case SP_TAG_NIL: return TRUE; case SP_TAG_SYM: return a.v.i == b.v.i; case SP_TAG_ENCODING: return (a.v.s == NULL || b.v.s == NULL) ? (a.v.s == b.v.s) : (strcmp(a.v.s, b.v.s) == 0); case SP_TAG_OBJ: if (a.cls_id != b.cls_id) return FALSE; if (a.v.p == b.v.p) return TRUE; switch (a.cls_id) { case SP_BUILTIN_INT_ARRAY: return sp_IntArray_eq((sp_IntArray*)a.v.p,(sp_IntArray*)b.v.p); case SP_BUILTIN_STR_ARRAY: return sp_StrArray_eq((sp_StrArray*)a.v.p,(sp_StrArray*)b.v.p); case SP_BUILTIN_FLT_ARRAY: return sp_FloatArray_eq((sp_FloatArray*)a.v.p,(sp_FloatArray*)b.v.p); case SP_BUILTIN_POLY_ARRAY: return sp_PolyArray_eq((sp_PolyArray*)a.v.p,(sp_PolyArray*)b.v.p); default: return FALSE; } case SP_TAG_CLASS: return a.v.i == b.v.i; default: return FALSE; } }
 static const char *(*sp_sym_name_fn)(sp_sym) = NULL;
 static mrb_int sp_poly_cmp(sp_RbVal a, sp_RbVal b, mrb_bool *comparable) { if (sp_poly_numeric_p(a) && sp_poly_numeric_p(b)) { mrb_float af = sp_poly_to_f(a), bf = sp_poly_to_f(b); *comparable = TRUE; return (af > bf) - (af < bf); } if (a.tag == SP_TAG_STR && b.tag == SP_TAG_STR) { if (a.v.s == NULL || b.v.s == NULL) { *comparable = (a.v.s == b.v.s); return 0; } *comparable = TRUE; return strcmp(a.v.s, b.v.s); } if (a.tag == SP_TAG_SYM && b.tag == SP_TAG_SYM) { *comparable = TRUE; if (sp_sym_name_fn) { int _r = strcmp(sp_sym_name_fn((sp_sym)a.v.i), sp_sym_name_fn((sp_sym)b.v.i)); return _r; } return (a.v.i > b.v.i) - (a.v.i < b.v.i); } *comparable = FALSE; return 0; }
+/* Lexicographic <=> between two boxed int arrays (Array#<=> over int elems),
+   so Array#max/min/sort work on an array of int pairs ([delta, idx] tuples). */
+static mrb_int sp_poly_cmp_int_arrays(sp_RbVal a, sp_RbVal b, mrb_bool *comparable) {
+  if (a.tag != SP_TAG_OBJ || b.tag != SP_TAG_OBJ ||
+      a.cls_id != SP_BUILTIN_INT_ARRAY || b.cls_id != SP_BUILTIN_INT_ARRAY) { *comparable = FALSE; return 0; }
+  sp_IntArray *x = (sp_IntArray *)a.v.p, *y = (sp_IntArray *)b.v.p;
+  if (!x || !y) { *comparable = FALSE; return 0; }
+  mrb_int n = x->len < y->len ? x->len : y->len;
+  for (mrb_int i = 0; i < n; i++) {
+    mrb_int xe = x->data[x->start + i], ye = y->data[y->start + i];
+    if (xe != ye) { *comparable = TRUE; return xe < ye ? -1 : 1; }
+  }
+  *comparable = TRUE;
+  return (x->len > y->len) - (x->len < y->len);
+}
 static mrb_bool sp_poly_lt(sp_RbVal a, sp_RbVal b) { mrb_bool comparable; mrb_int cmp = sp_poly_cmp(a, b, &comparable); return comparable ? (cmp < 0) : FALSE; }
 static mrb_bool sp_poly_le(sp_RbVal a, sp_RbVal b) { mrb_bool comparable; mrb_int cmp = sp_poly_cmp(a, b, &comparable); return comparable ? (cmp <= 0) : FALSE; }
 static mrb_bool sp_poly_gt(sp_RbVal a, sp_RbVal b) { mrb_bool comparable; mrb_int cmp = sp_poly_cmp(a, b, &comparable); return comparable ? (cmp > 0) : FALSE; }
@@ -3641,6 +3656,30 @@ static void sp_PolyArray_shuffle_bang(sp_PolyArray *a) { if (!a || a->frozen) { 
 static void sp_PolyArray_rotate_bang(sp_PolyArray*a,mrb_int n){if(!a)return;if(a->frozen){sp_raise_frozen_array();return;}if(a->len<=0)return;n=((n%a->len)+a->len)%a->len;if(n==0)return;sp_RbVal*d=a->data;mrb_int lo=0,hi=n-1;while(lo<hi){sp_RbVal t=d[lo];d[lo]=d[hi];d[hi]=t;lo++;hi--;}lo=n;hi=a->len-1;while(lo<hi){sp_RbVal t=d[lo];d[lo]=d[hi];d[hi]=t;lo++;hi--;}lo=0;hi=a->len-1;while(lo<hi){sp_RbVal t=d[lo];d[lo]=d[hi];d[hi]=t;lo++;hi--;}}
 static sp_PolyArray *sp_PolyArray_shuffle(sp_PolyArray *a) { sp_PolyArray *b = sp_PolyArray_dup(a); sp_PolyArray_shuffle_bang(b); return b; }
 static int _sp_poly_cmp_qsort(const void *pa, const void *pb) { mrb_bool ok = FALSE; mrb_int r = sp_poly_cmp(*(const sp_RbVal *)pa, *(const sp_RbVal *)pb, &ok); return ok ? (int)r : 0; }
+/* max/min over boxed elements: numerics/strings via sp_poly_cmp, int arrays
+   lexicographically. Returns nil for an empty array. */
+static sp_RbVal sp_PolyArray_max(sp_PolyArray *a) {
+  if (!a || a->len == 0) return sp_box_nil();
+  sp_RbVal best = a->data[0];
+  for (mrb_int i = 1; i < a->len; i++) {
+    mrb_bool ok = FALSE;
+    mrb_int r = sp_poly_cmp(a->data[i], best, &ok);
+    if (!ok) r = sp_poly_cmp_int_arrays(a->data[i], best, &ok);
+    if (ok && r > 0) best = a->data[i];
+  }
+  return best;
+}
+static sp_RbVal sp_PolyArray_min(sp_PolyArray *a) {
+  if (!a || a->len == 0) return sp_box_nil();
+  sp_RbVal best = a->data[0];
+  for (mrb_int i = 1; i < a->len; i++) {
+    mrb_bool ok = FALSE;
+    mrb_int r = sp_poly_cmp(a->data[i], best, &ok);
+    if (!ok) r = sp_poly_cmp_int_arrays(a->data[i], best, &ok);
+    if (ok && r < 0) best = a->data[i];
+  }
+  return best;
+}
 static void sp_PolyArray_sort_bang(sp_PolyArray *a) { if (!a || a->frozen) { if (a && a->frozen) sp_raise_frozen_array(); return; } if (a->len > 1) qsort(a->data, (size_t)a->len, sizeof(sp_RbVal), _sp_poly_cmp_qsort); }
 static sp_PolyArray *sp_PolyArray_sort(sp_PolyArray *a) { sp_PolyArray *b = sp_PolyArray_dup(a); sp_PolyArray_sort_bang(b); return b; }
 static void sp_PolyArray_uniq_bang(sp_PolyArray*a){if(!a||a->frozen){if(a&&a->frozen)sp_raise_frozen_array();return;}for(mrb_int i=0;i<a->len;){int dup=0;for(mrb_int j=0;j<i;j++){if(sp_poly_eq(a->data[j],a->data[i])){dup=1;break;}}if(dup){for(mrb_int k2=i;k2<a->len-1;k2++)a->data[k2]=a->data[k2+1];a->len--;}else i++;}}
