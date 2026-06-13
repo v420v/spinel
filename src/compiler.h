@@ -125,6 +125,7 @@ typedef struct {
   const NodeTable *nt;
   TyKind *ntype;    /* [node_cap] node id -> inferred type */
   int *nscope;      /* [node_cap] node id -> owning scope index */
+  int *node_cbody;  /* [node_cap] node id -> enclosing class/module-body class id, or -1 */
   int node_cap;     /* allocated length of ntype/nscope (>= nt->count) */
 
   Scope *scopes;    /* scope[0] = top level */

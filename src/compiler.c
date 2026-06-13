@@ -10,6 +10,8 @@ Compiler *comp_new(const NodeTable *nt) {
   int n = nt->count > 0 ? nt->count : 1;
   c->ntype = calloc((size_t)n, sizeof(TyKind));
   c->nscope = calloc((size_t)n, sizeof(int));   /* default scope 0 */
+  c->node_cbody = malloc((size_t)n * sizeof(int));   /* enclosing class-body, -1 = none */
+  for (int i = 0; i < n; i++) c->node_cbody[i] = -1;
   c->node_cap = n;
   return c;
 }
@@ -21,7 +23,8 @@ void comp_grow_node_arrays(Compiler *c) {
   if (n <= c->node_cap) return;
   c->ntype = realloc(c->ntype, sizeof(TyKind) * (size_t)n);
   c->nscope = realloc(c->nscope, sizeof(int) * (size_t)n);
-  for (int i = c->node_cap; i < n; i++) { c->ntype[i] = TY_UNKNOWN; c->nscope[i] = 0; }
+  c->node_cbody = realloc(c->node_cbody, sizeof(int) * (size_t)n);
+  for (int i = c->node_cap; i < n; i++) { c->ntype[i] = TY_UNKNOWN; c->nscope[i] = 0; c->node_cbody[i] = -1; }
   c->node_cap = n;
 }
 

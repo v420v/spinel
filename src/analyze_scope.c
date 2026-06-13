@@ -334,6 +334,7 @@ void collect_compiler_state(Compiler *c, int id, int class_id) {
 void walk_scope(Compiler *c, int id, int scope_idx, int class_id) {
   if (id < 0 || id >= c->nt->count) return;
   c->nscope[id] = scope_idx;
+  c->node_cbody[id] = g_cbody_class_id;
   const char *ty = nt_type(c->nt, id);
   int child = scope_idx;
   int child_class = class_id;
@@ -1834,6 +1835,10 @@ int infer_ivar_types(Compiler *c) {
       Scope *s = comp_scope_of(c, id);
       int cls_id2 = s->class_id;
       if (!nm) continue;
+      /* A `@ivar = v` directly in a class/module body (not in a method) belongs
+         to that class/module object, like its class methods see it -- attribute
+         it to the enclosing class-body rather than the Toplevel pseudo-class. */
+      if (cls_id2 < 0 && c->node_cbody[id] >= 0) cls_id2 = c->node_cbody[id];
       if (cls_id2 < 0) {
         /* Top-level method: track ivars in the Toplevel pseudo-class */
         int old_nc = c->nclasses;
