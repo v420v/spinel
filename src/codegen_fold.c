@@ -1782,6 +1782,9 @@ int emit_collect_expr(Compiler *c, int id, Buf *b) {
   buf_puts(g_pre, rb.p ? rb.p : "");
   buf_puts(g_pre, ";\n");
   free(rb.p);
+  /* root the iteration source: the loop body may allocate and collect it */
+  emit_indent(g_pre, g_indent);
+  buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", trecv);
   emit_indent(g_pre, g_indent);
   buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", rk, tres, rk);
   emit_indent(g_pre, g_indent);
@@ -1891,6 +1894,8 @@ int emit_predicate_expr(Compiler *c, int id, Buf *b) {
   emit_indent(g_pre, g_indent);
   emit_ctype(c, rt, g_pre);
   buf_printf(g_pre, " _t%d = %s;\n", trecv, rb.p ? rb.p : ""); free(rb.p);
+  emit_indent(g_pre, g_indent);
+  buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", trecv);
   emit_indent(g_pre, g_indent);
   buf_printf(g_pre, "mrb_int _t%d = 0;\n", tcnt);
   emit_indent(g_pre, g_indent);
@@ -2298,15 +2303,16 @@ void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const char *lea
       break;
     }
   }
-  /* GC hazard: with several positional args, evaluating arg N+1 can trigger
-     a collection while arg N's freshly built object sits in an unrooted C
-     temporary (Node.new(make_tree(d), make_tree(d)) loses the first subtree).
-     Pre-evaluate heap-typed args into rooted temps, left to right, whenever
-     a LATER argument's evaluation may allocate; emit_expr then substitutes
-     the temp via g_argov. Plain positional calls only — the splat/kwarg
-     machinery has its own evaluation order. */
+  /* GC hazard: a freshly-allocated heap argument sits in an unrooted C
+     temporary while the rest of the call is evaluated AND while the callee
+     runs. Either a later argument or the callee's own body can trigger a
+     collection that sweeps it — and a constructor (sp_X_new) always
+     allocates, so even `Ray.new(Vec.new(...), eye)` is exposed. Pre-evaluate
+     each allocating heap arg into a rooted temp, left to right; emit_expr
+     substitutes the temp via g_argov. Plain positional calls only — the
+     splat/kwarg machinery has its own evaluation order. */
   int argov_saved = g_n_argov;
-  if (splat_idx < 0 && kwh < 0 && pos_argc >= 2 && argv) {
+  if (splat_idx < 0 && kwh < 0 && argv) {
     for (int k = 0; k < pos_argc && k < m->nparams; k++) {
       if (g_n_argov >= MAX_ARG_OVERRIDE) break;
       TyKind at = comp_ntype(c, argv[k]);
@@ -2318,10 +2324,9 @@ void emit_args_filled(Compiler *c, int callee_idx, int argsNode, const char *lea
                   !strcmp(aty, "ConstantReadNode") ||
                   !strcmp(aty, "SelfNode") || !strcmp(aty, "NilNode") ||
                   !strcmp(aty, "StringNode"))) continue;
-      int later_alloc = 0;
-      for (int j = k + 1; j < pos_argc && !later_alloc; j++)
-        later_alloc = subtree_may_allocate(nt, argv[j]);
-      if (!later_alloc) continue;
+      /* only a fresh allocation needs protecting; a non-allocating heap
+         expression (e.g. a ternary over two already-live reads) does not. */
+      if (!subtree_may_allocate(nt, argv[k])) continue;
       int ht = ++g_tmp;
       /* Evaluate into a side buffer first: the expression may push its own
          setup into g_pre, which must be fully flushed before this temp's
