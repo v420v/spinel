@@ -3300,6 +3300,14 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
     else { buf_puts(b, name[0] == '-' ? "(-" : "(+"); emit_expr(c, recv, b); buf_puts(b, ")"); }
     return;
   }
+  /* poly `<<` in expression position: sp_poly_shl dispatches on the runtime tag
+     (Integer#<< shift -> boxed int, Array#push append -> the array) and returns
+     a poly either way, matching the statement-level path. */
+  if (recv >= 0 && rt == TY_POLY && !strcmp(name, "<<") && argc == 1) {
+    buf_puts(b, "sp_poly_shl("); emit_expr(c, recv, b); buf_puts(b, ", ");
+    emit_boxed(c, argv[0], b); buf_puts(b, ")");
+    return;
+  }
   /* unary bitwise complement: ~int -> (~x); ~poly -> coerce to int first */
   if (!strcmp(name, "~") && recv >= 0 && argc == 0 && (rt == TY_INT || rt == TY_POLY)) {
     if (rt == TY_POLY) { buf_puts(b, "(~sp_poly_to_i("); emit_expr(c, recv, b); buf_puts(b, "))"); }

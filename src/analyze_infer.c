@@ -1785,12 +1785,16 @@ else {
       (!strcmp(name, "&") || !strcmp(name, "|") || !strcmp(name, "^") ||
        !strcmp(name, "<<") || !strcmp(name, ">>")))
     return TY_INT;
-  /* poly recv bitwise op: result is int (sp_poly_to_i applied). `<<` is left out
-     because it is ambiguous on a poly (Integer#<< shift vs Array#push append),
-     and the append form must keep its array result type. */
+  /* poly recv bitwise op: result is int (sp_poly_to_i applied). */
   if (recv >= 0 && argc == 1 && rt == TY_POLY &&
       (!strcmp(name, ">>") || !strcmp(name, "&") || !strcmp(name, "|") || !strcmp(name, "^")))
     return TY_INT;
+  /* poly recv `<<` is ambiguous (Integer#<< shift vs Array#push append); the
+     runtime sp_poly_shl dispatches on the tag and returns a boxed result either
+     way, so the static type is poly. A downstream bitwise op coerces it back to
+     int, and an append keeps its (boxed) array -- both stay consistent. */
+  if (recv >= 0 && argc == 1 && rt == TY_POLY && !strcmp(name, "<<"))
+    return TY_POLY;
   /* boolean &/|/^ */
   if (recv >= 0 && argc == 1 && rt == TY_BOOL &&
       (!strcmp(name, "&") || !strcmp(name, "|") || !strcmp(name, "^")))
