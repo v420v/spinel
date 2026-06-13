@@ -1252,32 +1252,29 @@ void analyze_program(Compiler *c) {
     }
   }
 
-  /* Backstop: a reachable method still has TY_UNKNOWN params if it was never
-     called with typed arguments (BFS marked it live by name, but no typed call
-     site bound its args).  Mark such methods unreachable so codegen skips them
-     rather than exit(1)ing on the unknown type. */
+  /* Backstop step 1: a method reached only via method(:sym) is invoked through
+     the bound Method ABI, which passes mrb_int args -- default its untyped
+     params/ret to int rather than dropping it (which would leave it undeclared).
+     Done before the drop decision below so the freshly-typed params can
+     propagate through poly-dispatch param binding (e.g. a poke dispatch table
+     entry typed here flows into `@pads[0].poke(data)` -> Pad#poke). */
   for (int s = 0; s < c->nscopes; s++) {
     Scope *sc = &c->scopes[s];
-    if (!sc->reachable || sc->nparams == 0) continue;
+    if (!sc->reachable || sc->nparams == 0 || !sc->name) continue;
     int has_unknown = 0;
     for (int i = 0; i < sc->nparams; i++) {
       LocalVar *p = sc->pnames[i] ? scope_local(sc, sc->pnames[i]) : NULL;
       if (p && p->type == TY_UNKNOWN) { has_unknown = 1; break; }
     }
     if (!has_unknown) continue;
-    /* A method reached only via method(:sym) is invoked through the bound
-       Method ABI, which passes mrb_int args -- default its untyped params to
-       int rather than dropping the method (which would leave it undeclared). */
     int taken = 0;
-    if (sc->name) {
-      for (int id = 0; id < c->nt->count && !taken; id++) {
-        const char *nty = nt_type(c->nt, id);
-        if (!nty || strcmp(nty, "CallNode")) continue;
-        const char *nm = nt_str(c->nt, id, "name");
-        if (!nm || strcmp(nm, "method")) continue;
-        const char *msym = method_sym_arg(c, id);
-        if (msym && !strcmp(msym, sc->name)) taken = 1;
-      }
+    for (int id = 0; id < c->nt->count && !taken; id++) {
+      const char *nty = nt_type(c->nt, id);
+      if (!nty || strcmp(nty, "CallNode")) continue;
+      const char *nm = nt_str(c->nt, id, "name");
+      if (!nm || strcmp(nm, "method")) continue;
+      const char *msym = method_sym_arg(c, id);
+      if (msym && !strcmp(msym, sc->name)) taken = 1;
     }
     if (taken) {
       for (int i = 0; i < sc->nparams; i++) {
@@ -1286,8 +1283,8 @@ void analyze_program(Compiler *c) {
       }
       if (sc->ret == TY_UNKNOWN) sc->ret = TY_INT;
     }
-    else sc->reachable = 0;
   }
+
 
   /* Propagate ivar types up the inheritance chain: a base-class method runs on
      subclass instances, so an ivar it reads must carry the union of every
@@ -1314,6 +1311,29 @@ void analyze_program(Compiler *c) {
       }
     }
     if (!prop_changed) break;
+  }
+
+  /* Re-run param binding now that method(:sym) targets are int-typed (step 1
+     above) and ivars carry their inheritance-unioned types: a base method
+     calling `@x.foo(arg)` on a poly @x (only widened to poly by the up-propagation
+     just above) can finally bind foo's params. Without this the bound method
+     would stay TY_UNKNOWN and be dropped below, leaving an undefined function at
+     the poly-dispatch call site. */
+  build_ie_map(c);
+  for (int it = 0; it < 8; it++) { if (!infer_param_types(c)) break; }
+
+  /* Backstop step 2: a reachable method that STILL has TY_UNKNOWN params was
+     never bound by any typed call site -- mark it unreachable so codegen skips
+     it rather than exit(1)ing on the unknown type. */
+  for (int s = 0; s < c->nscopes; s++) {
+    Scope *sc = &c->scopes[s];
+    if (!sc->reachable || sc->nparams == 0) continue;
+    int has_unknown = 0;
+    for (int i = 0; i < sc->nparams; i++) {
+      LocalVar *p = sc->pnames[i] ? scope_local(sc, sc->pnames[i]) : NULL;
+      if (p && p->type == TY_UNKNOWN) { has_unknown = 1; break; }
+    }
+    if (has_unknown) sc->reachable = 0;
   }
 
   /* The method-reference backstop and ivar up-propagation above changed param

@@ -2338,6 +2338,17 @@ else {
         emit_boxed(c, nt_ref(nt, id, "value"), b);
         buf_puts(b, ");\n");
       }
+      else if (!strcmp(op, "<<") || !strcmp(op, ">>") ||
+               !strcmp(op, "|") || !strcmp(op, "&") || !strcmp(op, "^")) {
+        /* bitwise op-assign on a poly slot: coerce to int, re-box the result
+           (same shape as the local poly-bitwise path). */
+        int ival = nt_ref(nt, id, "value");
+        TyKind rhst = comp_ntype(c, ival);
+        buf_printf(b, "%s = sp_box_int((sp_poly_to_i(%s) %s (", ref, ref, op);
+        if (rhst == TY_POLY) { buf_puts(b, "sp_poly_to_i("); emit_expr(c, ival, b); buf_puts(b, ")"); }
+        else emit_expr(c, ival, b);
+        buf_puts(b, ")));\n");
+      }
       else {
         buf_printf(b, "%s %s= ", ref, op);
         emit_expr(c, nt_ref(nt, id, "value"), b); buf_puts(b, ";\n");

@@ -4736,10 +4736,14 @@ else {
       buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b); buf_puts(b, "; ");
       emit_ctype(c, is_scalar_ret(ret) ? ret : TY_INT, b);
       buf_printf(b, " _t%d = %s; ", tr, is_scalar_ret(ret) ? default_value(ret) : "0");
+      /* When the dispatch result feeds a poly context, tr is sp_RbVal, so the
+         length-like int branches must box their integer result. */
+      const char *bopen = (ret == TY_POLY) ? "sp_box_int(" : "";
+      const char *bclose = (ret == TY_POLY) ? ")" : "";
       /* string/symbol-tagged poly values answer length/size directly */
       if (is_lengthlike) {
-        buf_printf(b, "if (_t%d.tag == SP_TAG_SYM) _t%d = (mrb_int)strlen(sp_sym_to_s((sp_sym)_t%d.v.i)); else ", tv, tr, tv);
-        buf_printf(b, "if (_t%d.tag == SP_TAG_STR) _t%d = (mrb_int)sp_str_length(_t%d.v.s); else ", tv, tr, tv);
+        buf_printf(b, "if (_t%d.tag == SP_TAG_SYM) _t%d = %s(mrb_int)strlen(sp_sym_to_s((sp_sym)_t%d.v.i))%s; else ", tv, tr, bopen, tv, bclose);
+        buf_printf(b, "if (_t%d.tag == SP_TAG_STR) _t%d = %s(mrb_int)sp_str_length(_t%d.v.s)%s; else ", tv, tr, bopen, tv, bclose);
       }
       buf_printf(b, "switch (_t%d.cls_id) {", tv);
       for (int k = 0; k < c->nclasses; k++) {
@@ -4790,13 +4794,13 @@ else {
       }
       /* built-in array receivers reaching a length-like poly dispatch */
       if (!strcmp(name, "length") || !strcmp(name, "size") || !strcmp(name, "count")) {
-        buf_printf(b, " case SP_BUILTIN_INT_ARRAY: case SP_BUILTIN_SYM_ARRAY: _t%d = sp_IntArray_length((sp_IntArray *)_t%d.v.p); break;", tr, tv);
-        buf_printf(b, " case SP_BUILTIN_STR_ARRAY: _t%d = sp_StrArray_length((sp_StrArray *)_t%d.v.p); break;", tr, tv);
-        buf_printf(b, " case SP_BUILTIN_FLT_ARRAY: _t%d = sp_FloatArray_length((sp_FloatArray *)_t%d.v.p); break;", tr, tv);
-        buf_printf(b, " case SP_BUILTIN_POLY_ARRAY: _t%d = sp_PolyArray_length((sp_PolyArray *)_t%d.v.p); break;", tr, tv);
-        buf_printf(b, " case SP_BUILTIN_POLY_POLY_HASH: _t%d = ((sp_PolyPolyHash *)_t%d.v.p)->len; break;", tr, tv);
-        buf_printf(b, " case SP_BUILTIN_SYM_POLY_HASH: _t%d = ((sp_SymPolyHash *)_t%d.v.p)->len; break;", tr, tv);
-        buf_printf(b, " case SP_BUILTIN_STR_POLY_HASH: _t%d = ((sp_StrPolyHash *)_t%d.v.p)->len; break;", tr, tv);
+        buf_printf(b, " case SP_BUILTIN_INT_ARRAY: case SP_BUILTIN_SYM_ARRAY: _t%d = %ssp_IntArray_length((sp_IntArray *)_t%d.v.p)%s; break;", tr, bopen, tv, bclose);
+        buf_printf(b, " case SP_BUILTIN_STR_ARRAY: _t%d = %ssp_StrArray_length((sp_StrArray *)_t%d.v.p)%s; break;", tr, bopen, tv, bclose);
+        buf_printf(b, " case SP_BUILTIN_FLT_ARRAY: _t%d = %ssp_FloatArray_length((sp_FloatArray *)_t%d.v.p)%s; break;", tr, bopen, tv, bclose);
+        buf_printf(b, " case SP_BUILTIN_POLY_ARRAY: _t%d = %ssp_PolyArray_length((sp_PolyArray *)_t%d.v.p)%s; break;", tr, bopen, tv, bclose);
+        buf_printf(b, " case SP_BUILTIN_POLY_POLY_HASH: _t%d = %s((sp_PolyPolyHash *)_t%d.v.p)->len%s; break;", tr, bopen, tv, bclose);
+        buf_printf(b, " case SP_BUILTIN_SYM_POLY_HASH: _t%d = %s((sp_SymPolyHash *)_t%d.v.p)->len%s; break;", tr, bopen, tv, bclose);
+        buf_printf(b, " case SP_BUILTIN_STR_POLY_HASH: _t%d = %s((sp_StrPolyHash *)_t%d.v.p)->len%s; break;", tr, bopen, tv, bclose);
       }
       buf_printf(b, " } _t%d; })", tr);
       return;
