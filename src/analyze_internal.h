@@ -177,6 +177,7 @@ int infer_array_params(Compiler *c);
 int infer_string_params(Compiler *c);
 int infer_param_types(Compiler *c);
 int infer_for_index(Compiler *c);
+void infer_bigint_loop_locals(Compiler *c);
 int first_yield(Compiler *c, int si);
 int first_block_call_args(Compiler *c, int si);
 int a_proc_params_node(Compiler *c, int create);

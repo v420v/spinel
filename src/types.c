@@ -106,5 +106,9 @@ TyKind ty_unify(TyKind a, TyKind b) {
   if (a == b) return a;
   if (a == TY_UNKNOWN) return b;
   if (b == TY_UNKNOWN) return a;
+  /* int values flow into bigint slots losslessly (the emitters insert
+     sp_bigint_new_int at the boundary), so a bigint-promoted local that
+     also sees int writes stays bigint instead of widening to poly. */
+  if ((a == TY_BIGINT && b == TY_INT) || (a == TY_INT && b == TY_BIGINT)) return TY_BIGINT;
   return TY_POLY;
 }

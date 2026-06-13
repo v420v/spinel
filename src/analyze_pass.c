@@ -15,6 +15,9 @@ int infer_write_types(Compiler *c) {
          change; block params are typed elsewhere, so leave them alone */
       if (!lv->is_param && !lv->is_block_param) { lv->gc_root = (int)lv->type; lv->type = TY_UNKNOWN; }
     }
+  /* Re-seed loop-growth bigint locals inside the recompute frame (the
+     reset above would otherwise wipe the promotion each iteration). */
+  infer_bigint_loop_locals(c);
 
   for (int id = 0; id < nt->count; id++) {
     const char *ty = nt_type(nt, id);
@@ -2592,3 +2595,136 @@ void cr_collect_calls(const NodeTable *nt, int id,
    Scope 0 (top level), every `initialize`, and implicitly-called methods
    are roots. Any method reachable from a root (directly or transitively)
    is marked live; others are dead-code-eliminated. */
+
+/* ---- Loop-growth bigint promotion ----
+   The legacy compiler's pre_detect_bigint, ported: inside a while loop a
+   local rebuilt by self-referential multiplication (x = a * b or x *= y
+   where an operand flows back from x through local-to-local assignments)
+   or by fibonacci-shaped addition (x = a + b where BOTH operands flow
+   back from x) grows without bound; promote it from int to bigint. The
+   main inference fixpoint then spreads bigint through arithmetic results
+   and assignment chains (ty_unify keeps int+bigint at bigint). */
+
+#define BI_MAX_PAIRS 256
+
+typedef struct { const char *dst, *src; } BiPair;
+
+static const char *bi_local_name(const NodeTable *nt, int id) {
+  if (id < 0) return NULL;
+  const char *ty = nt_type(nt, id);
+  if (!ty || strcmp(ty, "LocalVariableReadNode")) return NULL;
+  return nt_str(nt, id, "name");
+}
+
+/* Collect `dst = src` local-to-local assignments in the loop subtree. */
+static void bi_collect_assigns(const NodeTable *nt, int id, BiPair *pairs, int *np) {
+  if (id < 0) return;
+  const char *ty = nt_type(nt, id);
+  if (!ty || !strcmp(ty, "DefNode") || !strcmp(ty, "ClassNode") || !strcmp(ty, "ModuleNode")) return;
+  if (!strcmp(ty, "LocalVariableWriteNode")) {
+    const char *src = bi_local_name(nt, nt_ref(nt, id, "value"));
+    const char *dst = nt_str(nt, id, "name");
+    if (src && dst && *np < BI_MAX_PAIRS) { pairs[*np].dst = dst; pairs[*np].src = src; (*np)++; }
+  }
+  /* `a, b = c, d` style multi-writes also carry values between locals. */
+  if (!strcmp(ty, "MultiWriteNode")) {
+    int ln = 0, rn = 0;
+    const int *lhs = nt_arr(nt, id, "lefts", &ln);
+    int v = nt_ref(nt, id, "value");
+    const int *rhs = NULL;
+    if (v >= 0 && nt_type(nt, v) && !strcmp(nt_type(nt, v), "ArrayNode"))
+      rhs = nt_arr(nt, v, "elements", &rn);
+    for (int k = 0; lhs && rhs && k < ln && k < rn; k++) {
+      const char *lty = nt_type(nt, lhs[k]);
+      if (!lty || strcmp(lty, "LocalVariableTargetNode")) continue;
+      const char *src = bi_local_name(nt, rhs[k]);
+      const char *dst = nt_str(nt, lhs[k], "name");
+      if (src && dst && *np < BI_MAX_PAIRS) { pairs[*np].dst = dst; pairs[*np].src = src; (*np)++; }
+    }
+  }
+  int nr = nt_num_refs(nt, id);
+  for (int i = 0; i < nr; i++) bi_collect_assigns(nt, nt_ref_at(nt, id, i), pairs, np);
+  int na = nt_num_arrs(nt, id);
+  for (int i = 0; i < na; i++) {
+    int n = 0;
+    const int *ids = nt_arr_at(nt, id, i, &n);
+    for (int j = 0; j < n; j++) bi_collect_assigns(nt, ids[j], pairs, np);
+  }
+}
+
+/* Does `var`'s value flow into `target` through the assignment pairs? */
+static int bi_reaches(const BiPair *pairs, int np, const char *var, const char *target, int depth) {
+  if (!strcmp(var, target)) return 1;
+  if (depth > 10) return 0;
+  for (int i = 0; i < np; i++)
+    if (!strcmp(pairs[i].src, var) &&
+        bi_reaches(pairs, np, pairs[i].dst, target, depth + 1)) return 1;
+  return 0;
+}
+
+static void bi_promote(Compiler *c, int write_id, const char *lname) {
+  Scope *s = comp_scope_of(c, write_id);
+  LocalVar *lv = s ? scope_local(s, lname) : NULL;
+  if (lv && (lv->type == TY_UNKNOWN || lv->type == TY_INT)) lv->type = TY_BIGINT;
+}
+
+static void bi_scan_loop_node(Compiler *c, int id, const BiPair *pairs, int np) {
+  const NodeTable *nt = c->nt;
+  if (id < 0) return;
+  const char *ty = nt_type(nt, id);
+  if (!ty || !strcmp(ty, "DefNode") || !strcmp(ty, "ClassNode") || !strcmp(ty, "ModuleNode")) return;
+  if (!strcmp(ty, "LocalVariableWriteNode")) {
+    const char *lname = nt_str(nt, id, "name");
+    int v = nt_ref(nt, id, "value");
+    const char *vty = v >= 0 ? nt_type(nt, v) : NULL;
+    if (lname && vty && !strcmp(vty, "CallNode")) {
+      const char *op = nt_str(nt, v, "name");
+      const char *rname = bi_local_name(nt, nt_ref(nt, v, "receiver"));
+      const char *aname = NULL;
+      int args = nt_ref(nt, v, "arguments");
+      int an = 0; const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+      if (an >= 1) aname = bi_local_name(nt, argv[0]);
+      if (op && (!strcmp(op, "*") || !strcmp(op, "**"))) {
+        if ((rname && bi_reaches(pairs, np, lname, rname, 0)) ||
+            (aname && bi_reaches(pairs, np, lname, aname, 0)))
+          bi_promote(c, id, lname);
+      }
+      else if (op && !strcmp(op, "+")) {
+        /* fibonacci shape: BOTH operands flow back from lname; this
+           rejects the linear `i = i + 1`. */
+        if (rname && aname &&
+            bi_reaches(pairs, np, lname, rname, 0) &&
+            bi_reaches(pairs, np, lname, aname, 0))
+          bi_promote(c, id, lname);
+      }
+    }
+  }
+  if (!strcmp(ty, "LocalVariableOperatorWriteNode")) {
+    const char *op = nt_str(nt, id, "binary_operator");
+    const char *lname = nt_str(nt, id, "name");
+    if (op && lname && (!strcmp(op, "*") || !strcmp(op, "**")))
+      bi_promote(c, id, lname);
+  }
+  int nr = nt_num_refs(nt, id);
+  for (int i = 0; i < nr; i++) bi_scan_loop_node(c, nt_ref_at(nt, id, i), pairs, np);
+  int na = nt_num_arrs(nt, id);
+  for (int i = 0; i < na; i++) {
+    int n = 0;
+    const int *ids = nt_arr_at(nt, id, i, &n);
+    for (int j = 0; j < n; j++) bi_scan_loop_node(c, ids[j], pairs, np);
+  }
+}
+
+void infer_bigint_loop_locals(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, "WhileNode")) continue;
+    int body = nt_ref(nt, id, "statements");
+    if (body < 0) continue;
+    BiPair pairs[BI_MAX_PAIRS];
+    int np = 0;
+    bi_collect_assigns(nt, body, pairs, &np);
+    bi_scan_loop_node(c, body, pairs, np);
+  }
+}
