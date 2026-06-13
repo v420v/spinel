@@ -1839,10 +1839,10 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
               buf_printf(b, "sp_int_mul(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
             }
             if (!strcmp(name, "/") && ac2 == 1) {
-              buf_printf(b, "sp_idiv(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+              buf_printf(b, "sp_idiv(%s, ", s); emit_int_divisor(c, av2[0], b); buf_puts(b, ")"); return;
             }
             if (!strcmp(name, "%") && ac2 == 1) {
-              buf_printf(b, "sp_imod(%s, ", s); emit_expr(c, av2[0], b); buf_puts(b, ")"); return;
+              buf_printf(b, "sp_imod(%s, ", s); emit_int_divisor(c, av2[0], b); buf_puts(b, ")"); return;
             }
           }
           else if (brt == TY_FLOAT) {
@@ -3482,8 +3482,11 @@ else {
       else if (rt == TY_INT && (a0 == TY_INT || a0 == TY_UNKNOWN)) eff_res = TY_INT;
     }
     if (eff_res == TY_INT) {
+      int isdivmod = !strcmp(name, "/") || !strcmp(name, "%");
       buf_printf(b, "%s(", int_arith_fn(name));
-      emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b);
+      emit_expr(c, recv, b); buf_puts(b, ", ");
+      if (isdivmod) emit_int_divisor(c, argv[0], b);
+      else emit_expr(c, argv[0], b);
       buf_puts(b, ")");
       return;
     }
@@ -7530,11 +7533,11 @@ else {
         buf_printf(b, "; sp_IntArray *_t%d = sp_IntArray_new(); sp_IntArray_push(_t%d, sp_idiv(%s, _t%d));"
                       " sp_IntArray_push(_t%d, sp_imod(%s, _t%d)); _t%d; })", o, o, r, tb, o, r, tb, o);
       }
-      else if (!strcmp(name, "div") && argc == 1) { buf_printf(b, "sp_idiv(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else if (!strcmp(name, "div") && argc == 1) { buf_printf(b, "sp_idiv(%s, ", r); emit_int_divisor(c, argv[0], b); buf_puts(b, ")"); }
       else if (!strcmp(name, "gcd") && argc == 1) { buf_printf(b, "sp_gcd(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       else if (!strcmp(name, "lcm") && argc == 1) { buf_printf(b, "sp_lcm(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       else if (!strcmp(name, "magnitude") && argc == 0) buf_printf(b, "((%s) < 0 ? -(%s) : (%s))", r, r, r);
-      else if (!strcmp(name, "modulo") && argc == 1) { buf_printf(b, "sp_imod(%s, ", r); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else if (!strcmp(name, "modulo") && argc == 1) { buf_printf(b, "sp_imod(%s, ", r); emit_int_divisor(c, argv[0], b); buf_puts(b, ")"); }
       else if (!strcmp(name, "remainder") && argc == 1) { buf_printf(b, "((%s) %% (", r); emit_expr(c, argv[0], b); buf_puts(b, "))"); }
       else if (!strcmp(name, "size") && argc == 0) buf_puts(b, "((mrb_int)sizeof(mrb_int))");
       else if (!strcmp(name, "gcdlcm") && argc == 1) {

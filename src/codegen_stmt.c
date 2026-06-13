@@ -519,7 +519,13 @@ void emit_op_assign(Compiler *c, int id, Buf *b, int indent) {
       return;
     }
     const char *fn = int_arith_fn(op);
-    if (fn) { buf_printf(b, "%s(", fn); emit_local_ref(c, id, nm, b); buf_puts(b, ", "); emit_expr(c, v, b); buf_puts(b, ");\n"); return; }
+    if (fn) {
+      int isdivmod = !strcmp(op, "/") || !strcmp(op, "%");
+      buf_printf(b, "%s(", fn); emit_local_ref(c, id, nm, b); buf_puts(b, ", ");
+      if (isdivmod) emit_int_divisor(c, v, b);
+      else emit_expr(c, v, b);
+      buf_puts(b, ");\n"); return;
+    }
     emit_local_ref(c, id, nm, b); buf_printf(b, " %s ", op); emit_expr(c, v, b); buf_puts(b, ";\n");
     return;
   }
@@ -541,7 +547,13 @@ else {
   }
   if (t == TY_INT) {
     const char *fn = int_arith_fn(op);
-    if (fn) { buf_printf(b, "lv_%s = %s(lv_%s, ", en, fn, en); emit_expr(c, v, b); buf_puts(b, ");\n"); return; }
+    if (fn) {
+      int isdivmod = !strcmp(op, "/") || !strcmp(op, "%");
+      buf_printf(b, "lv_%s = %s(lv_%s, ", en, fn, en);
+      if (isdivmod) emit_int_divisor(c, v, b);
+      else emit_expr(c, v, b);
+      buf_puts(b, ");\n"); return;
+    }
   }
   /* Bitwise op-assign on an int: shift/and/or/xor map straight to the C
      operator (fixed-width wrap, same as the binary `x << y` path). */

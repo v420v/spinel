@@ -174,6 +174,79 @@ else {
 
 /* ---- expression ---- */
 
+static int fold_int_const_name(Compiler *c, const char *name, long long *out, int depth);
+
+/* Fold a compile-time integer-constant expression to its value: integer
+   literals, references to other int-literal constants, and binary integer
+   arithmetic over folded operands (no `/`/`%` -- Ruby floor semantics differ
+   from C for negatives). Returns 1 + *out on success. */
+static int fold_int_node(Compiler *c, int id, long long *out, int depth) {
+  if (id < 0 || depth > 16) return 0;
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, id);
+  if (!ty) return 0;
+  if (!strcmp(ty, "IntegerNode")) { *out = nt_int(nt, id, "value", 0); return 1; }
+  if (!strcmp(ty, "ConstantReadNode")) return fold_int_const_name(c, nt_str(nt, id, "name"), out, depth + 1);
+  if (!strcmp(ty, "ParenthesesNode")) {
+    int bd = nt_ref(nt, id, "body"); int n = 0; const int *bb = bd >= 0 ? nt_arr(nt, bd, "body", &n) : NULL;
+    return (n == 1) ? fold_int_node(c, bb[0], out, depth + 1) : 0;
+  }
+  if (!strcmp(ty, "CallNode")) {
+    int recv = nt_ref(nt, id, "receiver");
+    const char *nm = nt_str(nt, id, "name");
+    int args = nt_ref(nt, id, "arguments"); int an = 0;
+    const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+    if (recv < 0 || an != 1 || !nm) return 0;
+    long long a, bb2;
+    if (!fold_int_node(c, recv, &a, depth + 1) || !fold_int_node(c, av[0], &bb2, depth + 1)) return 0;
+    if (!strcmp(nm, "+")) { *out = a + bb2; return 1; }
+    if (!strcmp(nm, "-")) { *out = a - bb2; return 1; }
+    if (!strcmp(nm, "*")) { *out = a * bb2; return 1; }
+    if (!strcmp(nm, "<<")) { *out = a << bb2; return 1; }
+    if (!strcmp(nm, ">>")) { *out = a >> bb2; return 1; }
+    if (!strcmp(nm, "&")) { *out = a & bb2; return 1; }
+    if (!strcmp(nm, "|")) { *out = a | bb2; return 1; }
+    if (!strcmp(nm, "^")) { *out = a ^ bb2; return 1; }
+    return 0;
+  }
+  return 0;
+}
+
+static int fold_int_const_name(Compiler *c, const char *name, long long *out, int depth) {
+  if (!name || depth > 16) return 0;
+  int wnode = -1;
+  for (int i = 0; i < c->nt->count; i++) {
+    const char *t = nt_type(c->nt, i);
+    if (!t) continue;
+    /* a compound/or/and write mutates the constant slot at runtime -> not a
+       stable compile-time value, don't fold. */
+    if (!strcmp(t, "ConstantOperatorWriteNode") || !strcmp(t, "ConstantOrWriteNode") ||
+        !strcmp(t, "ConstantAndWriteNode")) {
+      const char *n = nt_str(c->nt, i, "name");
+      if (n && !strcmp(n, name)) return 0;
+      continue;
+    }
+    if (strcmp(t, "ConstantWriteNode")) continue;
+    const char *n = nt_str(c->nt, i, "name");
+    if (!n || strcmp(n, name)) continue;
+    if (wnode >= 0) return 0;   /* reassigned -> not a stable constant */
+    wnode = i;
+  }
+  if (wnode < 0) return 0;
+  return fold_int_node(c, nt_ref(c->nt, wnode, "value"), out, depth);
+}
+
+/* Emit an integer divisor operand, substituting a compile-time-constant
+   value with its literal so the C compiler can strength-reduce `/`/`%` by
+   a constant. Falls back to the normal expression emit otherwise. Folding
+   is restricted to divisor positions: literalizing arbitrary constants
+   (e.g. loop bounds in optcarrot) regresses layout-sensitive hot loops. */
+void emit_int_divisor(Compiler *c, int node, Buf *b) {
+  long long v;
+  if (fold_int_node(c, node, &v, 0)) { buf_printf(b, "%lldLL", v); return; }
+  emit_expr(c, node, b);
+}
+
 void emit_expr(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *ty = nt_type(nt, id);
