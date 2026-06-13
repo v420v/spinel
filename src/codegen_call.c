@@ -1593,10 +1593,13 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
        !strcmp(name, "dup") || !strcmp(name, "clone"))) {
     int args = nt_ref(nt, id, "arguments");
     int argc0 = 0; if (args >= 0) nt_arr(nt, args, "arguments", &argc0);
-    /* hash and string dup/clone require deep copies -- skip the identity shortcut for them */
+    /* hash, string, and array dup/clone require real copies (they are mutable
+       reference types) -- skip the identity shortcut for them so the dedicated
+       sp_*_dup paths run. freeze/itself on any value stay identity. */
     TyKind recv_t = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
     int is_dup_clone = !strcmp(name, "dup") || !strcmp(name, "clone");
-    if (argc0 == 0 && !ty_is_hash(recv_t) && !(recv_t == TY_STRING && is_dup_clone)) {
+    if (argc0 == 0 && !ty_is_hash(recv_t) &&
+        !(is_dup_clone && (recv_t == TY_STRING || ty_is_array(recv_t)))) {
       emit_expr(c, recv, b); return;
     }
     if (argc0 == 0 && recv_t == TY_STRING && is_dup_clone) {
@@ -6263,6 +6266,11 @@ else {
           buf_printf(b, "; sp_%sArray_%s(_t%d); _t%d; })", k, base, t, t);
           return;
         }
+      }
+      if ((!strcmp(name, "dup") || !strcmp(name, "clone")) && argc == 0) {
+        /* a real copy: arrays are mutable, so dup/clone must not alias. */
+        buf_printf(b, "sp_%sArray_dup(", k); emit_expr(c, recv, b); buf_puts(b, ")");
+        return;
       }
       if (!strcmp(name, "reverse") && argc == 0) {
         /* copy + reverse in place; sp_*Array_dup exists for Int/Str/Float/Poly */
