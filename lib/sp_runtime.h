@@ -3418,6 +3418,31 @@ static void sp_poly_splice(sp_RbVal recv, mrb_int start, mrb_int len, sp_RbVal s
     }
   }
 }
+/* Array#replace(other): replace recv's contents with other's, returning recv.
+   recv keeps the same boxed pointer (the underlying array is mutated in place),
+   so a nullable-array slot typed poly stays valid. A nil/non-array recv is a
+   no-op (the call sites that reach a nil poly are dead-guarded in Ruby). */
+static sp_RbVal sp_poly_replace(sp_RbVal recv, sp_RbVal src) {
+  if (recv.tag != SP_TAG_OBJ || src.tag != SP_TAG_OBJ) return recv;
+  if (recv.cls_id == SP_BUILTIN_INT_ARRAY && src.cls_id == SP_BUILTIN_INT_ARRAY)
+    sp_IntArray_replace((sp_IntArray *)recv.v.p, (sp_IntArray *)src.v.p);
+  else if (recv.cls_id == SP_BUILTIN_FLT_ARRAY && src.cls_id == SP_BUILTIN_FLT_ARRAY)
+    sp_FloatArray_replace((sp_FloatArray *)recv.v.p, (sp_FloatArray *)src.v.p);
+  else if (recv.cls_id == SP_BUILTIN_STR_ARRAY && src.cls_id == SP_BUILTIN_STR_ARRAY)
+    sp_StrArray_replace((sp_StrArray *)recv.v.p, (sp_StrArray *)src.v.p);
+  else if (recv.cls_id == SP_BUILTIN_POLY_ARRAY) {
+    sp_PolyArray *d = (sp_PolyArray *)recv.v.p;
+    d->len = 0;
+    switch (src.cls_id) {
+      case SP_BUILTIN_INT_ARRAY: { sp_IntArray *s = (sp_IntArray *)src.v.p; for (mrb_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_box_int(s->data[s->start + i])); break; }
+      case SP_BUILTIN_FLT_ARRAY: { sp_FloatArray *s = (sp_FloatArray *)src.v.p; for (mrb_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_box_float(s->data[i])); break; }
+      case SP_BUILTIN_STR_ARRAY: { sp_StrArray *s = (sp_StrArray *)src.v.p; for (mrb_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_box_str(s->data[i])); break; }
+      case SP_BUILTIN_POLY_ARRAY: { sp_PolyArray *s = (sp_PolyArray *)src.v.p; for (mrb_int i = 0; i < s->len; i++) sp_PolyArray_push(d, s->data[i]); break; }
+      default: break;
+    }
+  }
+  return recv;
+}
 static sp_PolyArray *sp_PolyArray_slice_bang(sp_PolyArray *a, mrb_int from, mrb_int n) {
   if (!a) return sp_PolyArray_new();
   if (a->frozen) { sp_raise_frozen_array(); return sp_PolyArray_new(); }
@@ -5423,6 +5448,16 @@ sp_Bigint *sp_bigint_not(sp_Bigint *a);
 const char *sp_IntArray_pack(sp_IntArray *arr, const char *fmt);
 const char *sp_PolyArray_pack(sp_PolyArray *arr, const char *fmt);
 sp_PolyArray *sp_str_unpack(const char *str, const char *fmt);
+
+/* Array#pack on a poly (nullable-array) receiver: dispatch on the runtime tag.
+   A nil/non-array recv packs to the empty string. */
+static inline const char *sp_poly_pack(sp_RbVal recv, const char *fmt) {
+  if (recv.tag == SP_TAG_OBJ && recv.cls_id == SP_BUILTIN_INT_ARRAY)
+    return sp_IntArray_pack((sp_IntArray *)recv.v.p, fmt);
+  if (recv.tag == SP_TAG_OBJ && recv.cls_id == SP_BUILTIN_POLY_ARRAY)
+    return sp_PolyArray_pack((sp_PolyArray *)recv.v.p, fmt);
+  return "";
+}
 
 /* ---- StringScanner (linked from sp_strscan.o) ----
    GC-allocated; the source / matched fields are marked by

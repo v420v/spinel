@@ -578,6 +578,18 @@ else {
       return;
     }
   }
+  /* Poly local bitwise op-assign (`x &= v`, `x >>= v`, ...): the result is an
+     int, re-boxed into the poly slot. The poly value is coerced via to_i, like
+     the binary poly-bitwise path. */
+  if (t == TY_POLY && (!strcmp(op, "<<") || !strcmp(op, ">>") ||
+                       !strcmp(op, "|") || !strcmp(op, "&") || !strcmp(op, "^"))) {
+    TyKind vt = comp_ntype(c, v);
+    buf_printf(b, "lv_%s = sp_box_int((sp_poly_to_i(lv_%s) %s (", en, en, op);
+    if (vt == TY_POLY) { buf_puts(b, "sp_poly_to_i("); emit_expr(c, v, b); buf_puts(b, ")"); }
+    else emit_expr(c, v, b);
+    buf_puts(b, ")));\n");
+    return;
+  }
   unsupported(c, id, "operator assignment");
 }
 

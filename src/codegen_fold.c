@@ -2568,7 +2568,11 @@ else {
   /* The aliased name may differ from the defining method's real name. */
   const char *mname = m ? m->name : name;
 
-  int virtual = dispatch_impl_count(c, cid, name) > 1 && is_scalar_ret(ret);
+  /* Force a runtime switch when there is no base implementation (m == NULL):
+     a template method defined only in subclasses cannot be called directly as
+     sp_<base>_<name>, so even a single descendant impl must dispatch virtually. */
+  int impl_n = dispatch_impl_count(c, cid, name);
+  int virtual = is_scalar_ret(ret) && (impl_n > 1 || (!m && impl_n >= 1));
 
   if (!virtual) {
     buf_printf(b, "sp_%s_%s((sp_%s *)%s", c->classes[defcls].name, mc(mname), c->classes[defcls].name, selfptr);
@@ -2621,8 +2625,18 @@ else {
       buf_puts(b, "); break;");
     }
   }
+  /* When the method is defined only in descendants (m == NULL), the base class
+     has no implementation. The default arm is unreachable (self is always a
+     descendant that has the method), so emit a typed placeholder rather than a
+     call to a nonexistent sp_<base>_<name>. */
+  if (!m) {
+    buf_printf(b, " default: _t%d = %s; break; } _t%d; })", rtmp,
+               ret == TY_POLY ? "sp_box_nil()" : default_value(ret), rtmp);
+    free(atmp);
+    return;
+  }
   /* default arm uses the base-class (defcls) implementation */
-  TyKind def_ret = m ? (TyKind)m->ret : TY_UNKNOWN;
+  TyKind def_ret = (TyKind)m->ret;
   if (def_ret == TY_VOID || def_ret == TY_NIL) {
     buf_printf(b, " default: sp_%s_%s((sp_%s *)%s",
                c->classes[defcls].name, mc(mname), c->classes[defcls].name, selfptr);

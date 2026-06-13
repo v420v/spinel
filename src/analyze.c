@@ -1289,6 +1289,16 @@ void analyze_program(Compiler *c) {
     else sc->reachable = 0;
   }
 
+  /* A block param that inference never resolved holds a yielded value of
+     unknown static type (e.g. an element of a poly receiver iterated by
+     uniq!/each): declare it boxed (poly) rather than failing codegen. Set
+     before the node-type cache is rebuilt so reads of the param see poly. */
+  for (int s = 0; s < c->nscopes; s++)
+    for (int i = 0; i < c->scopes[s].nlocals; i++) {
+      LocalVar *blv = &c->scopes[s].locals[i];
+      if (blv->is_block_param && blv->type == TY_UNKNOWN) blv->type = TY_POLY;
+    }
+
   /* finalize: gc-root needs + full node type cache */
   for (int s = 0; s < c->nscopes; s++)
     for (int i = 0; i < c->scopes[s].nlocals; i++)

@@ -1760,6 +1760,16 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
         return;
       }
       int mi = comp_method_in_chain(c, dispatch_cid, name, NULL);
+      /* Template-method pattern: a base-class method calls an abstract method
+         that is implemented only in subclasses. Not found up the chain, but if a
+         descendant defines it, emit_dispatch can still resolve it virtually on
+         self's runtime class. */
+      if (mi < 0 && !self->is_cmethod) {
+        for (int k = 0; k < c->nclasses; k++) {
+          if (k == dispatch_cid || !is_descendant(c, k, dispatch_cid)) continue;
+          if (comp_method_in_chain(c, k, name, NULL) >= 0) { mi = k; break; }
+        }
+      }
       if (mi >= 0) {
         emit_dispatch(c, dispatch_cid, name, g_self, nt_ref(nt, id, "arguments"), nt_ref(nt, id, "block"), b);
         return;
@@ -3290,6 +3300,25 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
     else { buf_puts(b, name[0] == '-' ? "(-" : "(+"); emit_expr(c, recv, b); buf_puts(b, ")"); }
     return;
   }
+  /* unary bitwise complement: ~int -> (~x); ~poly -> coerce to int first */
+  if (!strcmp(name, "~") && recv >= 0 && argc == 0 && (rt == TY_INT || rt == TY_POLY)) {
+    if (rt == TY_POLY) { buf_puts(b, "(~sp_poly_to_i("); emit_expr(c, recv, b); buf_puts(b, "))"); }
+    else { buf_puts(b, "(~"); emit_expr(c, recv, b); buf_puts(b, ")"); }
+    return;
+  }
+  /* poly numeric predicates: coerce the poly value to int and test. */
+  if (recv >= 0 && rt == TY_POLY && argc == 0 &&
+      (!strcmp(name, "even?") || !strcmp(name, "odd?") || !strcmp(name, "zero?") ||
+       !strcmp(name, "positive?") || !strcmp(name, "negative?"))) {
+    int t = ++g_tmp;
+    buf_printf(b, "({ mrb_int _t%d = sp_poly_to_i(", t); emit_expr(c, recv, b); buf_puts(b, "); ");
+    if (!strcmp(name, "even?")) buf_printf(b, "(_t%d %% 2 == 0); })", t);
+    else if (!strcmp(name, "odd?")) buf_printf(b, "(_t%d %% 2 != 0); })", t);
+    else if (!strcmp(name, "zero?")) buf_printf(b, "(_t%d == 0); })", t);
+    else if (!strcmp(name, "positive?")) buf_printf(b, "(_t%d > 0); })", t);
+    else buf_printf(b, "(_t%d < 0); })", t);
+    return;
+  }
   if (!strcmp(name, "!") && recv >= 0 && argc == 0) {
     /* Ruby truthiness: only nil and false are falsy */
     if (rt == TY_BOOL) { buf_puts(b, "(!"); emit_expr(c, recv, b); buf_puts(b, ")"); }
@@ -3829,6 +3858,18 @@ else {
     buf_puts(b, "sp_poly_join("); emit_expr(c, recv, b);
     buf_puts(b, ", "); if (argc >= 1) emit_expr(c, argv[0], b); else buf_puts(b, "\"\"");
     buf_puts(b, ")"); return;
+  }
+  /* poly receiver: replace(other) -> runtime dispatch (nullable array). */
+  if (recv >= 0 && rt == TY_POLY && !strcmp(name, "replace") && argc == 1) {
+    buf_puts(b, "sp_poly_replace("); emit_expr(c, recv, b);
+    buf_puts(b, ", "); emit_boxed(c, argv[0], b); buf_puts(b, ")");
+    return;
+  }
+  /* poly receiver: pack(fmt) -> runtime dispatch (nullable array). */
+  if (recv >= 0 && rt == TY_POLY && !strcmp(name, "pack") && argc == 1) {
+    buf_puts(b, "sp_poly_pack("); emit_expr(c, recv, b);
+    buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, ")");
+    return;
   }
 
   /* poly receiver: gsub/sub with a regex literal -- extract the string

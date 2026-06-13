@@ -1,5 +1,40 @@
 #include "analyze_internal.h"
 
+/* True when `recv` reads an ivar/local that has at least one direct write of a
+   numeric scalar (an Integer/Float literal, or a numeric-inferred value). Used
+   to disambiguate `x << y`: a numeric-assigned slot means Integer#<< (a bit
+   shift), not Array#push, so the slot must not be promoted to an array. The
+   Integer/Float *literal* test is syntactic and therefore stable across
+   fixpoint iterations, which keeps an early push pass from corrupting the slot
+   to an array before the numeric assignment has been folded in (after which the
+   array would unify with the int writes to poly and break every later shift). */
+static int recv_has_scalar_numeric_write(Compiler *c, int recv) {
+  const NodeTable *nt = c->nt;
+  const char *rty = recv >= 0 ? nt_type(nt, recv) : NULL;
+  if (!rty) return 0;
+  int is_ivar = !strcmp(rty, "InstanceVariableReadNode");
+  int is_local = !strcmp(rty, "LocalVariableReadNode");
+  if (!is_ivar && !is_local) return 0;
+  const char *rnm = nt_str(nt, recv, "name");
+  if (!rnm) return 0;
+  Scope *rscope = is_local ? comp_scope_of(c, recv) : NULL;
+  const char *wkind = is_ivar ? "InstanceVariableWriteNode" : "LocalVariableWriteNode";
+  for (int id = 0; id < nt->count; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty || strcmp(ty, wkind)) continue;
+    const char *wnm = nt_str(nt, id, "name");
+    if (!wnm || strcmp(wnm, rnm)) continue;
+    if (is_local && comp_scope_of(c, id) != rscope) continue;
+    int v = nt_ref(nt, id, "value");
+    if (v < 0) continue;
+    const char *vty = nt_type(nt, v);
+    if (vty && (!strcmp(vty, "IntegerNode") || !strcmp(vty, "FloatNode"))) return 1;
+    TyKind vt = infer_type(c, v);
+    if (vt == TY_INT || vt == TY_FLOAT || vt == TY_BIGINT) return 1;
+  }
+  return 0;
+}
+
 int infer_write_types(Compiler *c) {
   const NodeTable *nt = c->nt;
   int changed = 0;
@@ -569,6 +604,9 @@ int infer_write_types(Compiler *c) {
       int an = 0;
       const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
       if (name && (!strcmp(name, "push") || !strcmp(name, "<<")) && an == 1) {
+        /* `<<` is ambiguous (Array#push vs Integer#<< shift): a numeric-assigned
+           receiver is a shift, so don't promote its slot to an array. */
+        if (!strcmp(name, "<<") && recv_has_scalar_numeric_write(c, recv)) continue;
         is_push = 1; vt = infer_type(c, argv[0]);
       }
       else if (name && !strcmp(name, "[]=") && an == 2) {
@@ -652,7 +690,10 @@ int infer_write_types(Compiler *c) {
       }
       else continue;
     }
-    else if (!strcmp(ty, "IndexOperatorWriteNode")) {
+    else if (!strcmp(ty, "IndexOperatorWriteNode") ||
+             !strcmp(ty, "IndexOrWriteNode") ||
+             !strcmp(ty, "IndexAndWriteNode")) {
+      /* h[k] op= v / h[k] ||= v / h[k] &&= v: same promotion as h[k] = v. */
       is_idx_write = 1;
       recv = nt_ref(nt, id, "receiver");
       int args = nt_ref(nt, id, "arguments");
@@ -2040,6 +2081,7 @@ int infer_block_params(Compiler *c) {
               !strcmp(name, "bsearch") || !strcmp(name, "find_index") ||
               !strcmp(name, "map!") || !strcmp(name, "collect!") ||
               !strcmp(name, "select!") || !strcmp(name, "filter!") || !strcmp(name, "reject!") ||
+              !strcmp(name, "uniq") || !strcmp(name, "uniq!") ||
               !strcmp(name, "keep_if") || !strcmp(name, "delete_if") || !strcmp(name, "each_index") ||
               !strcmp(name, "flat_map") || !strcmp(name, "each_with_object") ||
               !strcmp(name, "chunk") || !strcmp(name, "group_by") ||
@@ -2053,7 +2095,9 @@ int infer_block_params(Compiler *c) {
     else if (rt == TY_POLY &&
              (!strcmp(name, "each") || !strcmp(name, "map") || !strcmp(name, "collect") ||
               !strcmp(name, "select") || !strcmp(name, "reject") || !strcmp(name, "find") ||
-              !strcmp(name, "detect") || !strcmp(name, "any?") || !strcmp(name, "all?")))
+              !strcmp(name, "detect") || !strcmp(name, "any?") || !strcmp(name, "all?") ||
+              !strcmp(name, "uniq") || !strcmp(name, "uniq!") || !strcmp(name, "sort_by") ||
+              !strcmp(name, "min_by") || !strcmp(name, "max_by")))
       pt = TY_POLY;
 
     /* array.each_cons(n) / each_slice(n) { |a, b, ...| } -- a single param

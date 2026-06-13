@@ -1711,6 +1711,9 @@ else {
 
   if ((!strcmp(name, "-@") || !strcmp(name, "+@")) && recv >= 0 && argc == 0)
     return ty_is_numeric(rt) ? rt : rt == TY_POLY ? TY_POLY : TY_UNKNOWN;
+  /* unary bitwise complement: ~int / ~poly -> int (poly value coerced via to_i) */
+  if (!strcmp(name, "~") && recv >= 0 && argc == 0 && (rt == TY_INT || rt == TY_POLY))
+    return TY_INT;
   if (!strcmp(name, "!")) return TY_BOOL;
   if (!strcmp(name, "respond_to?") && recv >= 0) return TY_BOOL;
   if ((!strcmp(name, "method_defined?") || !strcmp(name, "const_defined?")) && recv >= 0) return TY_BOOL;
@@ -1782,7 +1785,9 @@ else {
       (!strcmp(name, "&") || !strcmp(name, "|") || !strcmp(name, "^") ||
        !strcmp(name, "<<") || !strcmp(name, ">>")))
     return TY_INT;
-  /* poly recv bitwise shift: result is int (sp_poly_to_i applied) */
+  /* poly recv bitwise op: result is int (sp_poly_to_i applied). `<<` is left out
+     because it is ambiguous on a poly (Integer#<< shift vs Array#push append),
+     and the append form must keep its array result type. */
   if (recv >= 0 && argc == 1 && rt == TY_POLY &&
       (!strcmp(name, ">>") || !strcmp(name, "&") || !strcmp(name, "|") || !strcmp(name, "^")))
     return TY_INT;
@@ -1924,7 +1929,9 @@ TyKind infer_uncached(Compiler *c, int id) {
       !strcmp(ty, "InstanceVariableOrWriteNode") ||
       !strcmp(ty, "InstanceVariableAndWriteNode") ||
       !strcmp(ty, "InstanceVariableOperatorWriteNode")) {
-    /* expression evaluates to the ivar slot's type (same as a read) */
+    /* expression evaluates to the ivar slot's type (same as a read): codegen
+       lowers `@a = expr` to `({ iv_a = ...; iv_a; })`, so the chain value IS the
+       slot, and inference must match to keep `@x = @a = expr` boxing consistent. */
     const char *nm = nt_str(nt, id, "name");
     Scope *s = comp_scope_of(c, id);
     if (s->class_id < 0) return infer_type(c, nt_ref(nt, id, "value"));
