@@ -42,6 +42,16 @@ void emit_unbox_text(Compiler *c, TyKind t, const char *expr, Buf *b) {
   else buf_printf(b, "(%s).v.i", expr);
 }
 
+/* Emit a node as an mrb_int, coercing a poly value through sp_poly_to_i. Used
+   where the runtime ABI demands a raw integer (array indices, etc.) but the
+   expression's static type widened to poly. */
+void emit_int_expr(Compiler *c, int node, Buf *b) {
+  if (comp_ntype(c, node) == TY_POLY) {
+    buf_puts(b, "sp_poly_to_i("); emit_expr(c, node, b); buf_puts(b, ")");
+  }
+  else emit_expr(c, node, b);
+}
+
 void emit_boxed(Compiler *c, int node, Buf *b) {
   TyKind t = comp_ntype(c, node);
   if (t == TY_POLY) { emit_expr(c, node, b); return; }

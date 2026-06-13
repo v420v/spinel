@@ -256,9 +256,9 @@ void emit_expr(Compiler *c, int id, Buf *b) {
     int right = nt_ref(nt, id, "right");
     int excl = (int)(nt_int(nt, id, "flags", 0) & 4) ? 1 : 0;
     buf_puts(b, "sp_range_new(");
-    if (left >= 0) emit_expr(c, left, b); else buf_puts(b, "INTPTR_MIN");  /* beginless */
+    if (left >= 0) emit_int_expr(c, left, b); else buf_puts(b, "INTPTR_MIN");  /* beginless */
     buf_puts(b, ", ");
-    if (right >= 0) emit_expr(c, right, b); else buf_puts(b, "INTPTR_MAX");  /* endless */
+    if (right >= 0) emit_int_expr(c, right, b); else buf_puts(b, "INTPTR_MAX");  /* endless */
     buf_printf(b, ", %d)", excl);
     return;
   }

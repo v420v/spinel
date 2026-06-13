@@ -5700,7 +5700,7 @@ else {
       /* src is an array: copy elements from src into arr starting at i */
       int ta = ++g_tmp, ti = ++g_tmp, ts = ++g_tmp, tj = ++g_tmp;
       buf_printf(b, "({ sp_%sArray *_t%d = ", k, ta); emit_expr(c, recv, b);
-      buf_printf(b, "; mrb_int _t%d = ", ti); emit_expr(c, argv[0], b); buf_puts(b, "; ");
+      buf_printf(b, "; mrb_int _t%d = ", ti); emit_int_expr(c, argv[0], b); buf_puts(b, "; ");
       buf_printf(b, "sp_%sArray *_t%d = ", k, ts); emit_expr(c, argv[2], b); buf_puts(b, "; ");
       buf_printf(b, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++)", tj, tj, k, ts, tj);
       buf_printf(b, " sp_%sArray_set(_t%d, _t%d + _t%d, sp_%sArray_get(_t%d, _t%d));", k, ta, ti, tj, k, ts, tj);
@@ -5712,7 +5712,7 @@ else {
          unbox via v.p cast and copy elements */
       int ta3 = ++g_tmp, ti3 = ++g_tmp, ts3 = ++g_tmp, tj3 = ++g_tmp;
       buf_printf(b, "({ sp_%sArray *_t%d = ", k, ta3); emit_expr(c, recv, b);
-      buf_printf(b, "; mrb_int _t%d = ", ti3); emit_expr(c, argv[0], b); buf_puts(b, "; ");
+      buf_printf(b, "; mrb_int _t%d = ", ti3); emit_int_expr(c, argv[0], b); buf_puts(b, "; ");
       buf_printf(b, "sp_RbVal _tv%d = ", ts3); emit_expr(c, argv[2], b); buf_puts(b, "; ");
       buf_printf(b, "sp_%sArray *_t%d = (sp_%sArray *)_tv%d.v.p; ", k, ts3, k, ts3);
       buf_printf(b, "for (mrb_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++)", tj3, tj3, k, ts3, tj3);
@@ -5724,7 +5724,7 @@ else {
       /* poly_array recv + poly src (array at runtime): copy src elements to recv[start..] */
       int ta4 = ++g_tmp, tst4 = ++g_tmp, tsrc4 = ++g_tmp, tlen4 = ++g_tmp, tj4 = ++g_tmp;
       buf_printf(b, "({ sp_PolyArray *_t%d = ", ta4); emit_expr(c, recv, b); buf_puts(b, ";");
-      buf_printf(b, " mrb_int _t%d = ", tst4); emit_expr(c, argv[0], b); buf_puts(b, ";");
+      buf_printf(b, " mrb_int _t%d = ", tst4); emit_int_expr(c, argv[0], b); buf_puts(b, ";");
       buf_printf(b, " sp_RbVal _t%d = ", tsrc4); emit_expr(c, argv[2], b); buf_puts(b, ";");
       buf_printf(b, " mrb_int _t%d = sp_poly_arr_len(_t%d);", tlen4, tsrc4);
       buf_printf(b, " for (mrb_int _t%d = 0; _t%d < _t%d; _t%d++)", tj4, tj4, tlen4, tj4);
@@ -5736,7 +5736,7 @@ else {
       /* scalar RHS: set element at start index and return the scalar value */
       int ta2 = ++g_tmp, ti2 = ++g_tmp, tv2 = ++g_tmp;
       buf_printf(b, "({ sp_%sArray *_t%d = ", k, ta2); emit_expr(c, recv, b);
-      buf_printf(b, "; mrb_int _t%d = ", ti2); emit_expr(c, argv[0], b); buf_puts(b, "; ");
+      buf_printf(b, "; mrb_int _t%d = ", ti2); emit_int_expr(c, argv[0], b); buf_puts(b, "; ");
       if (rt == TY_POLY_ARRAY) {
         buf_printf(b, "sp_RbVal _t%d = ", tv2); emit_boxed(c, argv[2], b);
       }
@@ -5757,7 +5757,7 @@ else {
     if (k) {
       int t = ++g_tmp, ti = ++g_tmp, tv = ++g_tmp;
       buf_printf(b, "({ sp_%sArray *_t%d = ", k, t); emit_expr(c, recv, b);
-      buf_printf(b, "; mrb_int _t%d = ", ti); emit_expr(c, argv[0], b); buf_puts(b, "; ");
+      buf_printf(b, "; mrb_int _t%d = ", ti); emit_int_expr(c, argv[0], b); buf_puts(b, "; ");
       if (rt == TY_POLY_ARRAY) {
         buf_printf(b, "sp_RbVal _t%d = ", tv); emit_boxed(c, argv[1], b);
       }
@@ -8183,7 +8183,7 @@ int emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent) {
     if (!strcmp(name, "[]=") && argc == 2) {
       emit_indent(b, indent);
       buf_puts(b, "sp_PolyArray_set("); emit_expr(c, recv, b); buf_puts(b, ", ");
-      emit_expr(c, argv[0], b); buf_puts(b, ", "); emit_boxed(c, argv[1], b); buf_puts(b, ");\n");
+      emit_int_expr(c, argv[0], b); buf_puts(b, ", "); emit_boxed(c, argv[1], b); buf_puts(b, ");\n");
       return 1;
     }
     if ((!strcmp(name, "push") || !strcmp(name, "<<") || !strcmp(name, "append")) && argc >= 1) {
@@ -8216,8 +8216,15 @@ int emit_array_mutate_stmt(Compiler *c, int id, Buf *b, int indent) {
     emit_indent(b, indent);
     buf_printf(b, "sp_%sArray_set(", k);
     emit_expr(c, recv, b); buf_puts(b, ", ");
-    emit_expr(c, argv[0], b); buf_puts(b, ", ");
-    emit_expr(c, argv[1], b); buf_puts(b, ");\n");
+    emit_int_expr(c, argv[0], b); buf_puts(b, ", ");
+    /* coerce a poly RHS to the typed array's element representation */
+    TyKind et = ty_array_elem(rt);
+    TyKind vt = comp_ntype(c, argv[1]);
+    if (vt == TY_POLY && et == TY_INT) { buf_puts(b, "sp_poly_to_i("); emit_expr(c, argv[1], b); buf_puts(b, ")"); }
+    else if (vt == TY_POLY && et == TY_STRING) { buf_puts(b, "sp_poly_to_s("); emit_expr(c, argv[1], b); buf_puts(b, ")"); }
+    else if (vt == TY_POLY && et == TY_FLOAT) { buf_puts(b, "sp_poly_to_f("); emit_expr(c, argv[1], b); buf_puts(b, ")"); }
+    else emit_expr(c, argv[1], b);
+    buf_puts(b, ");\n");
     return 1;
   }
   if ((!strcmp(name, "push") || !strcmp(name, "<<") || !strcmp(name, "append")) && argc >= 1) {
