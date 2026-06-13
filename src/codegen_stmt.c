@@ -130,6 +130,24 @@ void emit_puts_one(Compiler *c, int arg, Buf *b, int indent) {
 void emit_print_one(Compiler *c, int arg, Buf *b, int indent) {
   TyKind t = comp_ntype(c, arg);
   emit_indent(b, indent);
+  /* `print n.chr`: write the byte directly. Going through the C-string
+     path would drop a NUL byte (the P4/P6 image benchmarks emit those). */
+  {
+    const NodeTable *nt = c->nt;
+    const char *aty = nt_type(nt, arg);
+    if (aty && !strcmp(aty, "CallNode") &&
+        nt_str(nt, arg, "name") && !strcmp(nt_str(nt, arg, "name"), "chr")) {
+      int crecv = nt_ref(nt, arg, "receiver");
+      int cargs = nt_ref(nt, arg, "arguments");
+      int can = 0; if (cargs >= 0) nt_arr(nt, cargs, "arguments", &can);
+      if (crecv >= 0 && can == 0 && comp_ntype(c, crecv) == TY_INT) {
+        buf_puts(b, "putchar((int)((");
+        emit_expr(c, crecv, b);
+        buf_puts(b, ") & 0xff));\n");
+        return;
+      }
+    }
+  }
   if (t == TY_INT) {
     buf_puts(b, "printf(\"%lld\", (long long)"); emit_expr(c, arg, b); buf_puts(b, ");\n");
   }
