@@ -80,6 +80,57 @@ static TyKind aset_value_type(Compiler *c, int recv) {
   return acc;
 }
 
+/* Seed a hash parameter's value type from its own `param[k] = v` writes. The
+   usage-driven hash promotion skips parameters (they are typed from call
+   sites), so a param filled internally by `p[s] = int` and read back via
+   `p.fetch(s)` defaults to str_poly through a monotonic cycle. Narrow it to
+   the concrete hash its writes establish.
+
+   ONLY string/symbol-keyed writes are considered: an int-keyed `p[i] = v` is
+   ambiguous with array element assignment (e.g. an int_array RAM param filled
+   by `ram[i] = b`), so int keys must not be read as hash evidence. */
+int infer_param_hash_value(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int changed = 0;
+  for (int s = 0; s < c->nscopes; s++) {
+    Scope *sc = &c->scopes[s];
+    for (int p = 0; p < sc->nparams; p++) {
+      if (p == sc->rest_idx || p == sc->kwrest_idx) continue;
+      LocalVar *lv = scope_local(sc, sc->pnames[p]);
+      if (!lv || lv->is_block_param) continue;
+      TyKind cur = lv->type;
+      int seedable = cur == TY_UNKNOWN || cur == TY_POLY ||
+                     (ty_is_hash(cur) && ty_hash_val(cur) == TY_POLY);
+      if (!seedable) continue;
+      TyKind kt = TY_UNKNOWN, vt = TY_UNKNOWN;
+      int saw = 0, ambiguous = 0;
+      for (int id = 0; id < nt->count; id++) {
+        if (nt_kind(nt, id) != NK_CallNode) continue;
+        const char *nm = nt_str(nt, id, "name");
+        if (!nm || strcmp(nm, "[]=")) continue;
+        int wr = nt_ref(nt, id, "receiver");
+        if (wr < 0 || nt_kind(nt, wr) != NK_LocalVariableReadNode) continue;
+        const char *wn = nt_str(nt, wr, "name");
+        if (!wn || strcmp(wn, sc->pnames[p]) || comp_scope_of(c, wr) != sc) continue;
+        int args = nt_ref(nt, id, "arguments");
+        int an = 0;
+        const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+        if (an < 2) continue;
+        TyKind k = infer_type(c, av[0]);
+        if (k != TY_STRING && k != TY_SYMBOL) { ambiguous = 1; break; }
+        kt = ty_unify(kt, k);
+        vt = ty_unify(vt, infer_type(c, av[1]));
+        saw = 1;
+      }
+      if (!saw || ambiguous) continue;
+      TyKind hv = ty_hash_of(kt, vt);
+      if (hv == TY_UNKNOWN) continue;
+      if (hv != cur && ty_hash_val(hv) != TY_POLY) { lv->type = hv; changed = 1; }
+    }
+  }
+  return changed;
+}
+
 int infer_write_types(Compiler *c) {
   const NodeTable *nt = c->nt;
   int changed = 0;

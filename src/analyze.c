@@ -966,6 +966,7 @@ void analyze_program(Compiler *c) {
     build_ie_map(c);  /* refresh instance_exec receiver-class map each pass */
     ch |= infer_write_types(c);
     ch |= infer_param_types(c);
+    ch |= infer_param_hash_value(c);
     ch |= propagate_prep_params(c);
     ch |= infer_string_params(c);
     ch |= infer_default_param_types(c);
@@ -1011,6 +1012,7 @@ void analyze_program(Compiler *c) {
         sp_narrow_memo_bump();  /* invalidate per-iteration narrow-helper memo */
         ch |= infer_write_types(c);
         ch |= infer_param_types(c);
+        ch |= infer_param_hash_value(c);
         ch |= propagate_prep_params(c);
         ch |= infer_string_params(c);
         ch |= infer_default_param_types(c);
