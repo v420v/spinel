@@ -1385,6 +1385,28 @@ void analyze_program(Compiler *c) {
      would stay TY_UNKNOWN and be dropped below, leaving an undefined function at
      the poly-dispatch call site. */
   build_ie_map(c);
+  /* Seed the synthesized compiler_state IR-emit helpers' signature types. They
+     are called only by the synthesized dump_compiler_state_ir (which has no
+     AST), so the param backstop below can't bind them from a call site;
+     unseeded they stay TY_UNKNOWN, get pruned, and the dump then references an
+     undefined function. Seeding BEFORE the backstop lets the binding propagate
+     into the helpers they call (ir_join_ints / ir_escape). */
+  for (int s = 0; s < c->nscopes; s++) {
+    Scope *sc = &c->scopes[s];
+    const char *snm = sc->name;
+    if (!snm || sc->nparams < 3) continue;
+    if (strcmp(snm, "ir_emit_int") && strcmp(snm, "ir_emit_str") &&
+        strcmp(snm, "ir_emit_sa") && strcmp(snm, "ir_emit_ia")) continue;
+    LocalVar *pb = scope_local(sc, sc->pnames[0]);
+    LocalVar *pn = scope_local(sc, sc->pnames[1]);
+    LocalVar *pv = scope_local(sc, sc->pnames[2]);
+    if (pb) pb->type = TY_STRING;
+    if (pn) pn->type = TY_STRING;
+    if (pv) pv->type = !strcmp(snm, "ir_emit_int") ? TY_INT :
+                       !strcmp(snm, "ir_emit_str") ? TY_STRING :
+                       !strcmp(snm, "ir_emit_sa")  ? TY_STR_ARRAY : TY_INT_ARRAY;
+    sc->ret = TY_STRING;  /* each returns the accumulated buf (a string) */
+  }
   for (int it = 0; it < 8; it++) { if (!infer_param_types(c)) break; }
 
   /* Backstop step 2: a reachable method that STILL has TY_UNKNOWN params was

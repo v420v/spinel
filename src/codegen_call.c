@@ -9074,20 +9074,36 @@ int emit_iteration_stmt(Compiler *c, int id, Buf *b, int indent) {
     buf_printf(b, "for (mrb_int _t%d = 0; _t%d < ", t, t);
     buf_puts(b, rb.p); buf_printf(b, "->len; _t%d++) {\n", t);
     if (p0) {
-      emit_indent(b, indent + 1);
+      /* The param may be poly (a name shared across hashes of differing element
+         types); box a concrete key into the poly slot. */
+      const char *raw0 = block_param_name(c, block, 0);
+      LocalVar *pv0 = raw0 ? scope_local(comp_scope_of(c, block), raw0) : NULL;
+      TyKind want0 = ty_hash_key(rt);
+      int box0 = pv0 && pv0->type == TY_POLY && want0 != TY_POLY;
+      char src0[256];
       if (rt == TY_POLY_POLY_HASH)
-        buf_printf(b, "lv_%s = %s->keys[%s->order[_t%d]];\n", p0, rb.p, rb.p, t);
+        snprintf(src0, sizeof src0, "%s->keys[%s->order[_t%d]]", rb.p, rb.p, t);
       else
-        buf_printf(b, "lv_%s = %s->order[_t%d];\n", p0, rb.p, t);
+        snprintf(src0, sizeof src0, "%s->order[_t%d]", rb.p, t);
+      emit_indent(b, indent + 1);
+      buf_printf(b, "lv_%s = ", p0);
+      if (box0) emit_boxed_text(c, want0, src0, b); else buf_puts(b, src0);
+      buf_puts(b, ";\n");
     }
     if (p1) {
-      emit_indent(b, indent + 1);
+      const char *raw1 = block_param_name(c, block, 1);
+      LocalVar *pv1 = raw1 ? scope_local(comp_scope_of(c, block), raw1) : NULL;
+      TyKind want1 = ty_hash_val(rt);
+      int box1 = pv1 && pv1->type == TY_POLY && want1 != TY_POLY;
+      char src1[256];
       if (rt == TY_POLY_POLY_HASH)
-        buf_printf(b, "lv_%s = %s->vals[%s->order[_t%d]];\n", p1, rb.p, rb.p, t);
-      else {
-        buf_printf(b, "lv_%s = sp_%sHash_get(", p1, hn);
-        buf_puts(b, rb.p); buf_puts(b, ", "); buf_puts(b, rb.p); buf_printf(b, "->order[_t%d]);\n", t);
-      }
+        snprintf(src1, sizeof src1, "%s->vals[%s->order[_t%d]]", rb.p, rb.p, t);
+      else
+        snprintf(src1, sizeof src1, "sp_%sHash_get(%s, %s->order[_t%d])", hn, rb.p, rb.p, t);
+      emit_indent(b, indent + 1);
+      buf_printf(b, "lv_%s = ", p1);
+      if (box1) emit_boxed_text(c, want1, src1, b); else buf_puts(b, src1);
+      buf_puts(b, ";\n");
     }
     emit_loop_body(c, body, b, indent + 1);
     emit_indent(b, indent); buf_puts(b, "}\n");
