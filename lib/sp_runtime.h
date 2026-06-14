@@ -2015,6 +2015,14 @@ static inline const char *sp_File_gets(sp_File *f) {
   memcpy(r, buf, n);
   return r;
 }
+/* Read a line into a caller-provided buffer without allocating. The returned
+   pointer is `buf` (or NULL at EOF); valid only until the next call. Used by
+   each_line loops where the line does not escape the loop body. */
+static inline const char *sp_File_gets_buf(sp_File *f, char *buf, int size) {
+  if (!f || !f->fp) return NULL;
+  if (!fgets(buf, size, f->fp)) return NULL;
+  return buf;
+}
 static inline const char *sp_File_read(sp_File *f) {
   if (!f || !f->fp) return sp_str_empty;
   long pos = ftell(f->fp);

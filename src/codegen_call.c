@@ -800,11 +800,15 @@ void emit_call(Compiler *c, int id, Buf *b) {
       const char *bpn = bp ? rename_local(bp) : NULL;
       int bdy = nt_ref(nt, blk, "body");
       int bbn = 0; const int *bbb = bdy >= 0 ? nt_arr(nt, bdy, "body", &bbn) : NULL;
-      int lt = ++g_tmp, rf = ++g_tmp;
+      int lt = ++g_tmp, rf = ++g_tmp, buft = ++g_tmp;
       buf_puts(b, "({ ");
       buf_printf(b, "sp_File *_t%d = %s; ", rf, r);
       free(rb.p); r = NULL;
-      buf_printf(b, "const char *_t%d; while ((_t%d = sp_File_gets(_t%d)) != NULL) {", lt, lt, rf);
+      /* Read each line into a reusable stack buffer instead of allocating a
+         GC string per line; the line does not escape the loop body. */
+      buf_printf(b, "char _t%d[65536]; const char *_t%d; "
+                    "while ((_t%d = sp_File_gets_buf(_t%d, _t%d, sizeof(_t%d))) != NULL) {",
+                 buft, lt, lt, rf, buft, buft);
       if (bpn) buf_printf(b, " const char *lv_%s = _t%d;", bpn, lt);
       for (int k = 0; k < bbn; k++) emit_stmt(c, bbb[k], b, 0);
       buf_printf(b, " } (sp_File *)_t%d; })", rf);
