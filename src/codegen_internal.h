@@ -105,6 +105,14 @@ extern TyKind g_ret_type;
    Persists into inner proc literal bodies so { yield } forwards __yblk__. */
 extern int g_current_scope_is_lowered;
 
+/* When set (SPINEL_LINE_MAP / SPINEL_DEBUG), emit `#line N "file"` directives
+   at statement boundaries so a C compile error is reported against the
+   original Ruby source line. Set once by codegen_program. */
+extern int g_line_map;
+/* Emit a `#line` directive for node `id` into `b`, deduped against the last
+   one emitted. No-op when g_line_map is off or the node has no line stamp. */
+void emit_line_directive(Compiler *c, int id, Buf *b);
+
 /* Ensure context stack for deferred `return` inside begin..ensure.
    When `return` appears in the body of a begin..ensure block, the return
    is deferred until after the ensure clause runs.  Each ensure clause

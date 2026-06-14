@@ -1448,6 +1448,11 @@ char *codegen_program(const NodeTable *nt) {
   Compiler *c = comp_new(nt);
   analyze_program(c);
 
+  /* `#line` directives are emitted only when the parser stamped per-node
+     source lines (SPINEL_LINE_MAP / SPINEL_DEBUG); the same env gates both
+     sides so codegen and the AST agree. */
+  g_line_map = (getenv("SPINEL_LINE_MAP") || getenv("SPINEL_DEBUG")) ? 1 : 0;
+
   Buf b; memset(&b, 0, sizeof b);
   memset(&g_procs, 0, sizeof g_procs);
   memset(&g_proc_protos, 0, sizeof g_proc_protos);

@@ -1951,10 +1951,32 @@ void emit_with_prelude(Compiler *c, int id, Buf *b, int indent,
   free(line.p);
 }
 
+int g_line_map = 0;
+/* Last (line, file) pair emitted, to suppress consecutive duplicates. line 0
+   is the sentinel for "none yet" since real source lines are 1-based. */
+static int g_lm_last_line = 0;
+static int g_lm_last_fid = -1;
+
+void emit_line_directive(Compiler *c, int id, Buf *b) {
+  if (!g_line_map) return;
+  int ln = (int)nt_int(c->nt, id, "node_line", 0);
+  if (ln <= 0) return;
+  int fid = (int)nt_int(c->nt, id, "node_file", 0);
+  if (ln == g_lm_last_line && fid == g_lm_last_fid) return;
+  g_lm_last_line = ln;
+  g_lm_last_fid = fid;
+  const char *path = nt_file_path(c->nt, fid);
+  if (!path) path = c->nt->source_file;
+  if (!path || !*path) path = "source.rb";
+  buf_printf(b, "#line %d \"%s\"\n", ln, path);
+}
+
 void emit_stmt(Compiler *c, int id, Buf *b, int indent) {
+  emit_line_directive(c, id, b);
   emit_with_prelude(c, id, b, indent, emit_stmt_inner);
 }
 void emit_stmt_tail(Compiler *c, int id, Buf *b, int indent) {
+  emit_line_directive(c, id, b);
   emit_with_prelude(c, id, b, indent, emit_stmt_tail_inner);
 }
 

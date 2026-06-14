@@ -37,6 +37,8 @@ typedef struct {
   int count;           /* number of allocated node slots */
   int root_id;
   char *source_file;   /* SOURCE_FILE path (unescaped), NULL if none */
+  char **files;        /* FILE id -> path (unescaped); for multi-file #line maps */
+  int nfiles;          /* length of `files` */
 } NodeTable;
 
 
@@ -199,6 +201,10 @@ int nt_clone_subtree(NodeTable *nt, int root);
 
 /* Accessors. id must be in [0, nt->count). Out-of-range ids return the
    given defaults so callers can walk freely without bounds checks. */
+/* Resolve a `node_file` id to its source path, or NULL if out of range.
+   Used by codegen to emit `#line N "path"` directives in multi-file builds. */
+const char *nt_file_path(const NodeTable *nt, int fid);
+
 const char *nt_type(const NodeTable *nt, int id);          /* NULL if unset */
 const char *nt_str(const NodeTable *nt, int id, const char *key);   /* NULL */
 /* Overwrite an existing string field's value (no-op if the key is absent).

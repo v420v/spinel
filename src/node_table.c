@@ -187,6 +187,24 @@ NodeTable *nt_load_text(const char *text) {
           /* path is parts[1] plus possibly value; emitted as one token */
           nt->source_file = unescape_dup(parts[1].p, parts[1].len, NULL);
         }
+        else if (tok_eq(parts[0], "FILE") && np >= 3) {
+          /* FILE <id> <escaped-path>: the multi-file source map for #line.
+             Take the path as everything after "FILE <id> " so embedded
+             spaces (if any survive escaping) are preserved. */
+          int fid = (int)parse_ll(parts[1].p, parts[1].len);
+          if (fid >= 0) {
+            if (fid >= nt->nfiles) {
+              int newn = fid + 1;
+              nt->files = realloc(nt->files, sizeof(char *) * (size_t)newn);
+              for (int k = nt->nfiles; k < newn; k++) nt->files[k] = NULL;
+              nt->nfiles = newn;
+            }
+            const char *pstart = parts[2].p;
+            size_t plen = (size_t)((line + llen) - pstart);
+            free(nt->files[fid]);
+            nt->files[fid] = unescape_dup(pstart, plen, NULL);
+          }
+        }
         else {
           /* N/S/I/F/R/A all carry a node id in parts[1] */
           char c = parts[0].p[0];
@@ -346,10 +364,17 @@ void nt_free(NodeTable *nt) {
   }
   free(nt->nodes);
   free(nt->source_file);
+  for (int k = 0; k < nt->nfiles; k++) free(nt->files[k]);
+  free(nt->files);
   free(nt);
 }
 
 /* ---- accessors ---- */
+
+const char *nt_file_path(const NodeTable *nt, int fid) {
+  if (!nt || fid < 0 || fid >= nt->nfiles) return NULL;
+  return nt->files[fid];
+}
 
 static const SpNode *node_at(const NodeTable *nt, int id) {
   if (id < 0 || id >= nt->count) return NULL;
