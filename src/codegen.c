@@ -1442,6 +1442,113 @@ void emit_regex_section(Buf *b) {
   buf_puts(b, "}\n\n");
 }
 
+/* ---- analyze-only / side-artifact emit modes ----
+   These mirror the legacy Ruby backend's --emit-* flags. Each is gated on an
+   environment variable (set by the `spinel` driver) and consumes only the
+   analysis result, so they run right after analyze_program and short-circuit
+   codegen. */
+
+/* Append `s` to `b`, escaping it as a JSON string body (no surrounding quotes). */
+static void json_escape_into(Buf *b, const char *s) {
+  if (!s) return;
+  for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+    unsigned char ch = *p;
+    switch (ch) {
+      case '"':  buf_puts(b, "\\\""); break;
+      case '\\': buf_puts(b, "\\\\"); break;
+      case '\n': buf_puts(b, "\\n"); break;
+      case '\t': buf_puts(b, "\\t"); break;
+      case '\r': buf_puts(b, "\\r"); break;
+      default:
+        if (ch < 0x20) buf_printf(b, "\\u%04x", (unsigned)ch);
+        else buf_printf(b, "%c", (int)ch);
+    }
+  }
+}
+
+/* C class name `Foo_Bar` -> Ruby `Foo::Bar`. Lossy when a namespace segment
+   itself contains a literal underscore (same assumption as the backtrace
+   symbolizer). */
+static void class_ruby_name_into(Buf *b, const char *cn) {
+  for (const char *p = cn; *p; p++) {
+    if (*p == '_') buf_puts(b, "::");
+    else buf_printf(b, "%c", (int)*p);
+  }
+}
+
+/* Resolve the source file/line of a method's `def`, falling back gracefully
+   when positions weren't stamped (no SPINEL_DEBUG / SPINEL_LINE_MAP). */
+static int scope_def_line(Compiler *c, Scope *s) {
+  if (s->def_node < 0) return 0;
+  return (int)nt_int(c->nt, s->def_node, "node_line", 0);
+}
+static const char *scope_def_file(Compiler *c, Scope *s) {
+  int fid = s->def_node >= 0 ? (int)nt_int(c->nt, s->def_node, "node_file", 0) : 0;
+  const char *path = nt_file_path(c->nt, fid);
+  if (!path) path = c->nt->source_file;
+  if (!path || !*path) path = "source.rb";
+  return path;
+}
+
+/* Build the emitted-C-symbol -> Ruby-name map as JSON. The C name is taken
+   from emit_method_cname so it matches exactly what codegen emits (e.g.
+   `sp_<Class>_s_<m>` for a singleton method). */
+static char *build_symbol_map_json(Compiler *c) {
+  Buf b; memset(&b, 0, sizeof b);
+  buf_puts(&b, "{\n  \"symbols\": [\n");
+  int n = 0;
+  for (int si = 1; si < c->nscopes; si++) {
+    Scope *s = &c->scopes[si];
+    if (!s->name || !*s->name) continue;
+    Buf cb; memset(&cb, 0, sizeof cb);
+    emit_method_cname(c, s, &cb);
+    Buf rb; memset(&rb, 0, sizeof rb);
+    const char *kind;
+    if (s->class_id < 0) {
+      kind = "toplevel";
+      buf_puts(&rb, s->name);
+    }
+    else {
+      class_ruby_name_into(&rb, c->classes[s->class_id].name);
+      buf_puts(&rb, s->is_cmethod ? "." : "#");
+      buf_puts(&rb, s->name);
+      kind = s->is_cmethod ? "cmeth" : "imeth";
+    }
+    if (n > 0) buf_puts(&b, ",\n");
+    buf_puts(&b, "    {\"c\":\"");
+    json_escape_into(&b, cb.p ? cb.p : "");
+    buf_puts(&b, "\",\"ruby\":\"");
+    json_escape_into(&b, rb.p ? rb.p : "");
+    buf_printf(&b, "\",\"kind\":\"%s\"", kind);
+    int ln = scope_def_line(c, s);
+    if (ln > 0) {
+      buf_puts(&b, ",\"file\":\"");
+      json_escape_into(&b, scope_def_file(c, s));
+      buf_printf(&b, "\",\"line\":%d}", ln);
+    }
+    else {
+      buf_puts(&b, ",\"file\":null,\"line\":null}");
+    }
+    free(cb.p);
+    free(rb.p);
+    n++;
+  }
+  buf_puts(&b, "\n  ]\n}\n");
+  return b.p ? b.p : strdup("{\n  \"symbols\": [\n\n  ]\n}\n");
+}
+
+/* Write `text` to `path`; warn (but don't abort) on failure. */
+static int emit_write_file(const char *path, const char *text) {
+  FILE *f = fopen(path, "wb");
+  if (!f) {
+    fprintf(stderr, "spinelc: cannot write '%s'\n", path);
+    return 0;
+  }
+  fputs(text, f);
+  fclose(f);
+  return 1;
+}
+
 /* ---- top level ---- */
 
 char *codegen_program(const NodeTable *nt) {
@@ -1452,6 +1559,18 @@ char *codegen_program(const NodeTable *nt) {
      source lines (SPINEL_LINE_MAP / SPINEL_DEBUG); the same env gates both
      sides so codegen and the AST agree. */
   g_line_map = (getenv("SPINEL_LINE_MAP") || getenv("SPINEL_DEBUG")) ? 1 : 0;
+
+  /* Analyze-only emit modes (legacy --emit-*): write the requested artifact
+     from the analysis result and skip codegen. Returns an empty translation
+     unit so the driver writes no binary. */
+  const char *sym_out = getenv("SPINEL_EMIT_SYMBOL_MAP");
+  if (sym_out && *sym_out) {
+    char *json = build_symbol_map_json(c);
+    emit_write_file(sym_out, json);
+    free(json);
+    comp_free(c);
+    return strdup("");
+  }
 
   Buf b; memset(&b, 0, sizeof b);
   memset(&g_procs, 0, sizeof g_procs);

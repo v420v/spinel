@@ -18,6 +18,7 @@
 # Options:
 #   -o FILE    Output file (binary, or C when combined with -c)
 #   -c         Generate C source only, don't compile
+#   --emit-symbol-map  Dump emitted-symbol -> Ruby-name map as JSON, no binary
 #   -S         Print generated C to stdout
 #   -E         Run the compiled binary instead of saving it; the
 #              first .rb file ends spinel-flag parsing, and the rest
@@ -51,6 +52,7 @@ OUTPUT=""
 C_ONLY=0
 STDOUT_MODE=0
 RUN_MODE=0
+EMIT_SYMBOL_MAP=0
 OPT_LEVEL="2"
 CC_CMD="cc"
 EXTRA_FLAGS=""
@@ -115,6 +117,9 @@ $1"
                 EVAL_USED=1
                 shift ;;
     -c)         C_ONLY=1; shift ;;
+    --emit-symbol-map) # Dump emitted-C-symbol -> Ruby-name map as JSON
+                # (-> app.symbols.json). Analyze-only; writes no binary.
+                EMIT_SYMBOL_MAP=1; shift ;;
     -S)         STDOUT_MODE=1; shift ;;
     -E)         RUN_MODE=1; shift ;;
     *.rb)
@@ -175,6 +180,7 @@ if [ -z "$SOURCE" ]; then
   echo "Options:" >&2
   echo "  -o FILE     Output file" >&2
   echo "  -c          C source only (don't compile)" >&2
+  echo "  --emit-symbol-map  Dump emitted-symbol -> Ruby-name map as JSON, no binary" >&2
   echo "  -S          Print C to stdout" >&2
   echo "  -E          Run the compiled binary; leftover args become its ARGV" >&2
   echo "  -O LEVEL    Optimization level (default: 2)" >&2
@@ -221,6 +227,21 @@ if [ "$DEBUG" -eq 1 ]; then
   esac
 elif [ "$LINE_MAP" -eq 1 ]; then
   export SPINEL_LINE_MAP=1
+fi
+
+# --emit-symbol-map: analyze-only. spinelc writes the JSON itself (driven by
+# SPINEL_EMIT_SYMBOL_MAP) and emits an empty translation unit; SPINEL_DEBUG
+# makes the parser stamp node positions so each symbol carries its file/line.
+if [ "$EMIT_SYMBOL_MAP" -eq 1 ]; then
+  SYM_OUT="${OUTPUT:-$BASENAME.symbols.json}"
+  export SPINEL_DEBUG=1
+  export SPINEL_EMIT_SYMBOL_MAP="$SYM_OUT"
+  if ! "$SPINELC" "$SOURCE" >/dev/null; then
+    echo "spinel: emit-symbol-map failed" >&2
+    exit 1
+  fi
+  echo "Wrote $SYM_OUT" >&2
+  exit 0
 fi
 
 # Step 1: Compile (parse + analyze + codegen) — spinelc emits C.
