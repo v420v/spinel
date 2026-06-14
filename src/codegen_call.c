@@ -76,6 +76,60 @@ int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
   return 1;
 }
 
+/* `s[i]` on a string with a single non-negative-style int index. Records the
+   string receiver and index nodes. Used to fold `s[i] == "c"` into a raw byte
+   comparison (no per-access 1-char string allocation). */
+static int str_index1(Compiler *c, int node, int *out_recv, int *out_idx) {
+  const NodeTable *nt = c->nt;
+  const char *ty = nt_type(nt, node);
+  if (!ty || strcmp(ty, "CallNode")) return 0;
+  const char *nm = nt_str(nt, node, "name");
+  if (!nm || (strcmp(nm, "[]") && strcmp(nm, "slice"))) return 0;
+  if (nt_ref(nt, node, "block") >= 0) return 0;
+  int recv = nt_ref(nt, node, "receiver");
+  if (recv < 0 || comp_ntype(c, recv) != TY_STRING) return 0;
+  int args = nt_ref(nt, node, "arguments");
+  int an = 0;
+  const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+  if (an != 1 || comp_ntype(c, av[0]) != TY_INT) return 0;
+  *out_recv = recv;
+  *out_idx = av[0];
+  return 1;
+}
+
+/* A bare single-byte string literal, e.g. `"{"`. */
+static int single_byte_lit(Compiler *c, int node, unsigned char *out) {
+  const char *ty = nt_type(c->nt, node);
+  if (!ty || strcmp(ty, "StringNode")) return 0;
+  const char *s = nt_str(c->nt, node, "unescaped");
+  if (!s) s = nt_str(c->nt, node, "content");
+  if (!s || s[0] == '\0' || s[1] != '\0') return 0;
+  *out = (unsigned char)s[0];
+  return 1;
+}
+
+/* Emit `s[i] == "c"` / `!=` as a raw byte compare when one operand is a
+   single-char string index and the other a single-byte literal. The index is
+   guarded against negatives (Ruby `s[-1]` indexes from the end) by falling
+   back to the general path. Returns 1 if it emitted the optimized form. */
+static int emit_strchar_cmp(Compiler *c, int recv, int arg, int eq, Buf *b) {
+  int sr, si;
+  unsigned char ch;
+  int ok = (str_index1(c, recv, &sr, &si) && single_byte_lit(c, arg, &ch)) ||
+           (str_index1(c, arg, &sr, &si) && single_byte_lit(c, recv, &ch));
+  if (!ok) return 0;
+  /* A negative literal index would read out of bounds; only fold when the
+     index can't be a negative literal. */
+  const char *ity = nt_type(c->nt, si);
+  if (ity && !strcmp(ity, "IntegerNode") && nt_int(c->nt, si, "value", 0) < 0) return 0;
+  buf_puts(b, "((unsigned char)(");
+  emit_expr(c, sr, b);
+  buf_puts(b, ")[(mrb_int)(");
+  emit_expr(c, si, b);
+  buf_printf(b, ")] %s %u)", eq ? "==" : "!=", (unsigned)ch);
+  return 1;
+}
+
 void emit_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   if (emit_partition_expr(c, id, b)) return;
@@ -4243,6 +4297,7 @@ else {
       int fr = eq_family(rt), fa = eq_family(a0);
       /* same comparable family: compare by value */
       if (fr && fa && fr == fa) {
+        if (fr == 2 && emit_strchar_cmp(c, recv, argv[0], eq, b)) return;
         if (fr == 2) { buf_puts(b, eq ? "sp_str_eq(" : "(!sp_str_eq("); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, eq ? ")" : "))"); }
         else if (fr == 5) { buf_puts(b, eq ? "sp_range_eq(" : "(!sp_range_eq("); emit_expr(c, recv, b); buf_puts(b, ", "); emit_expr(c, argv[0], b); buf_puts(b, eq ? ")" : "))"); }
         else { buf_puts(b, "("); emit_expr(c, recv, b); buf_printf(b, " %s ", eq ? "==" : "!="); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
