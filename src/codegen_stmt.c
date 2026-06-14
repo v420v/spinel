@@ -493,6 +493,10 @@ void emit_assign(Compiler *c, int id, Buf *b, int indent) {
   else if (lv && lv->type == TY_FLOAT && comp_ntype(c, v) == TY_POLY) {
     buf_puts(b, "sp_poly_to_f("); emit_expr(c, v, b); buf_puts(b, ")");
   }
+  else if (lv && lv->type == TY_STRING && comp_ntype(c, v) == TY_POLY) {
+    /* string slot, poly RHS (holds a string at runtime): coerce */
+    buf_puts(b, "sp_poly_to_s("); emit_expr(c, v, b); buf_puts(b, ")");
+  }
   else {
     emit_expr(c, v, b);
   }
