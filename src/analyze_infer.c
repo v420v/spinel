@@ -2161,6 +2161,22 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (hi >= 0) infer_type(c, hi);
     return TY_RANGE;
   }
+  /* A splat inside an array literal (`[*0..10]`, `[*arr]`) contributes the
+     element type of the splatted collection, so the literal stays a typed
+     array instead of widening to poly_array. The value returned here is the
+     would-be element type, which the ArrayNode arm unifies in. */
+  if (!strcmp(ty, "SplatNode")) {
+    int inner = nt_ref(nt, id, "expression");
+    if (inner < 0) return TY_UNKNOWN;
+    const char *ity = nt_type(nt, inner);
+    if (ity && !strcmp(ity, "RangeNode")) {
+      int lo = nt_ref(nt, inner, "left");
+      return (lo >= 0 && infer_type(c, lo) == TY_STRING) ? TY_STRING : TY_INT;
+    }
+    TyKind it = infer_type(c, inner);
+    if (ty_is_array(it)) return ty_array_elem(it);
+    return TY_POLY;
+  }
   if (!strcmp(ty, "LambdaNode"))              return TY_PROC;
   /* an assignment expression evaluates to the assigned value -- but codegen
      lowers `x = expr` to `({ lv_x = ...; lv_x; })`, so the chain value IS the
