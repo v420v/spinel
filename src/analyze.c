@@ -962,6 +962,7 @@ void analyze_program(Compiler *c) {
 
   for (int iter = 0; iter < 128; iter++) {
     int ch = 0;
+    sp_narrow_memo_bump();  /* invalidate per-iteration narrow-helper memo */
     build_ie_map(c);  /* refresh instance_exec receiver-class map each pass */
     ch |= infer_write_types(c);
     ch |= infer_param_types(c);
@@ -996,7 +997,7 @@ void analyze_program(Compiler *c) {
     int any = 0;
     for (int ci = 0; ci < c->nclasses; ci++)
       for (int iv = 0; iv < c->classes[ci].nivars; iv++)
-        if (c->classes[ci].ivar_types[iv] == TY_POLY) { c->classes[ci].ivar_types[iv] = TY_UNKNOWN; any = 1; }
+        if (c->classes[ci].ivar_types[iv] == TY_POLY) { const char *_n = c->classes[ci].ivars[iv]; sp_ivwatch(_n && _n[0]=='@' ? _n+1 : _n, "renarrow_reset", TY_POLY, TY_UNKNOWN); c->classes[ci].ivar_types[iv] = TY_UNKNOWN; any = 1; }
     for (int s = 0; s < c->nscopes; s++) {
       Scope *sc = &c->scopes[s];
       for (int i = 0; i < sc->nparams; i++) {
@@ -1007,6 +1008,7 @@ void analyze_program(Compiler *c) {
     if (any) {
       for (int iter = 0; iter < 128; iter++) {
         int ch = 0;
+        sp_narrow_memo_bump();  /* invalidate per-iteration narrow-helper memo */
         ch |= infer_write_types(c);
         ch |= infer_param_types(c);
         ch |= propagate_prep_params(c);
@@ -1111,7 +1113,7 @@ void analyze_program(Compiler *c) {
   for (int ci = 0; ci < c->nclasses; ci++) {
     ClassInfo *cl = &c->classes[ci];
     for (int iv = 0; iv < cl->nivars; iv++)
-      if (cl->ivar_types[iv] == TY_UNKNOWN) { cl->ivar_types[iv] = TY_POLY; ivar_backstop_changed = 1; }
+      if (cl->ivar_types[iv] == TY_UNKNOWN) { const char *_n = cl->ivars[iv]; sp_ivwatch(_n && _n[0]=='@' ? _n+1 : _n, "unknown_backstop", TY_UNKNOWN, TY_POLY); cl->ivar_types[iv] = TY_POLY; ivar_backstop_changed = 1; }
   }
   /* An attr_reader/attr_accessor ivar typed via a writer call (scalar type),
      but whose class has no initialize that writes it, starts nil on fresh
@@ -1364,6 +1366,7 @@ void analyze_program(Compiler *c) {
           int ai = comp_ivar_index(&c->classes[a], ivn);
           if (ai < 0) continue;
           TyKind merged = ty_unify(c->classes[a].ivar_types[ai], kt);
+          sp_ivwatch(ivn[0] == '@' ? ivn + 1 : ivn, "inherited_merge", c->classes[a].ivar_types[ai], merged);
           if (merged != c->classes[a].ivar_types[ai]) {
             c->classes[a].ivar_types[ai] = merged; prop_changed = 1;
           }

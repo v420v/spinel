@@ -361,6 +361,34 @@ const char *nt_type(const NodeTable *nt, int id) {
   return nd ? nd->type : NULL;
 }
 
+/* Sorted node-type names; index i corresponds to enum value (i + 1) because
+   NK_NONE = 0 precedes the X-macro entries. The X-macro list is alphabetically
+   sorted, so this array is sorted and bsearch-able. */
+static const char *const sp_kind_names[] = {
+#define X(n) #n,
+  SP_NODE_KINDS(X)
+#undef X
+};
+
+static int sp_kind_cmp(const void *a, const void *b) {
+  return strcmp((const char *)a, *(const char *const *)b);
+}
+
+NodeKind nt_kind(const NodeTable *nt, int id) {
+  SpNode *nd = (SpNode *)node_at(nt, id);
+  if (!nd) return NK_NONE;
+  if (nd->kind) return (NodeKind)(nd->kind - 1);  /* cached (stored as kind+1) */
+  NodeKind k = NK_NONE;
+  if (nd->type) {
+    const char *const *hit = (const char *const *)bsearch(
+        nd->type, sp_kind_names, sizeof sp_kind_names / sizeof sp_kind_names[0],
+        sizeof sp_kind_names[0], sp_kind_cmp);
+    if (hit) k = (NodeKind)((hit - sp_kind_names) + 1);
+  }
+  nd->kind = (int)k + 1;  /* cache; 0 stays "uncomputed" */
+  return k;
+}
+
 const char *nt_str(const NodeTable *nt, int id, const char *key) {
   const SpNode *nd = node_at(nt, id);
   if (!nd) return NULL;

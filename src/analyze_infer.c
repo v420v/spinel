@@ -1,5 +1,33 @@
 #include "analyze_internal.h"
 
+/* Per-iteration memo for the (cid, ivname) full-table-scan narrow helpers
+   below. Each is O(nodes); they are queried once per `@ivar[i]` expression,
+   so on a large input (the self-compile) the naive form is O(nodes^2). The
+   result is stable within one fixpoint iteration, so a generation-stamped
+   direct-mapped cache collapses the repeats to O(nodes) per (cid, ivar).
+   The generation is bumped once per fixpoint iteration (sp_narrow_memo_bump),
+   so a stale entry can only survive within an iteration the fixpoint will
+   re-run anyway. */
+#define SP_NMEMO_SZ 16384
+static unsigned g_narrow_gen = 1;
+static struct { unsigned gen; long key; signed char val; } g_nmemo[SP_NMEMO_SZ];
+void sp_narrow_memo_bump(void) { g_narrow_gen++; }
+static long narrow_key(int which, int cid, const char *ivname) {
+  unsigned long h = 1469598103934665603UL ^ (unsigned)which;
+  h = (h * 1099511628211UL) ^ (unsigned)cid;
+  for (const char *p = ivname; p && *p; p++) h = (h * 1099511628211UL) ^ (unsigned char)*p;
+  return (long)(h & 0x7fffffffffffffffUL);
+}
+static int narrow_memo_get(long key, int *hit) {
+  unsigned slot = (unsigned)((unsigned long)key % SP_NMEMO_SZ);
+  if (g_nmemo[slot].gen == g_narrow_gen && g_nmemo[slot].key == key) { *hit = 1; return g_nmemo[slot].val; }
+  *hit = 0; return 0;
+}
+static void narrow_memo_put(long key, int val) {
+  unsigned slot = (unsigned)((unsigned long)key % SP_NMEMO_SZ);
+  g_nmemo[slot].gen = g_narrow_gen; g_nmemo[slot].key = key; g_nmemo[slot].val = (signed char)val;
+}
+
 /* Whether every element written into the poly-array ivar `@<ivname>` of class
    `cid` is an int-returning kind: a bound method (a dispatch-table entry, called
    with an int arg returns int), an int array, an int, or nil filler. Mirrors
@@ -16,7 +44,7 @@ static int table_elem_int_returning(TyKind vt) {
   return 0;
 }
 
-static int ivar_array_elems_int_returning(Compiler *c, int cid, const char *ivname) {
+static int ivar_array_elems_int_returning_impl(Compiler *c, int cid, const char *ivname) {
   const NodeTable *nt = c->nt;
   int saw = 0;
   for (int id = 0; id < nt->count; id++) {
@@ -77,6 +105,15 @@ static int ivar_array_elems_int_returning(Compiler *c, int cid, const char *ivna
    (a method dispatch table) yields an int. Returns 1 if `id` matches that shape
    for the enclosing class. The index types don't matter (they may themselves be
    poly mid-fixpoint); the result type follows from the table's element kinds. */
+static int ivar_array_elems_int_returning(Compiler *c, int cid, const char *ivname) {
+  long k = narrow_key(0, cid, ivname);
+  int hit; int v = narrow_memo_get(k, &hit);
+  if (hit) return v;
+  v = ivar_array_elems_int_returning_impl(c, cid, ivname);
+  narrow_memo_put(k, v);
+  return v;
+}
+
 static int poly_double_index_int(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   const char *nm = nt_str(nt, id, "name");
@@ -114,7 +151,7 @@ static int poly_double_index_int(Compiler *c, int id) {
 /* Whether every element stored into poly-array ivar `@<ivname>` is an int
    array (a nested array of int arrays, e.g. @chr_banks / @nmt_mem). Element
    reads then yield an int array rather than a boxed poly. */
-static int ivar_array_elems_all_int_array(Compiler *c, int cid, const char *ivname) {
+static int ivar_array_elems_all_int_array_impl(Compiler *c, int cid, const char *ivname) {
   const NodeTable *nt = c->nt;
   int saw = 0;
   for (int id = 0; id < nt->count; id++) {
@@ -183,6 +220,15 @@ static int ivar_array_elems_all_int_array(Compiler *c, int cid, const char *ivna
 /* `@nested[i]` (single index) where @nested is a poly array whose every
    element is an int array yields an int array (not a boxed poly). Returns the
    ivar name via *out_iv for codegen, or NULL. */
+static int ivar_array_elems_all_int_array(Compiler *c, int cid, const char *ivname) {
+  long k = narrow_key(1, cid, ivname);
+  int hit; int v = narrow_memo_get(k, &hit);
+  if (hit) return v;
+  v = ivar_array_elems_all_int_array_impl(c, cid, ivname);
+  narrow_memo_put(k, v);
+  return v;
+}
+
 static int poly_index_int_array(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   const char *nm = nt_str(nt, id, "name");
@@ -2136,25 +2182,26 @@ TyKind infer_uncached(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   const char *ty = nt_type(nt, id);
   if (!ty) return TY_UNKNOWN;
+  NodeKind nk = nt_kind(nt, id);
 
-  if (!strcmp(ty, "IntegerNode"))             return TY_INT;
-  if (!strcmp(ty, "FloatNode"))               return TY_FLOAT;
-  if (!strcmp(ty, "ImaginaryNode"))           return TY_COMPLEX;
-  if (!strcmp(ty, "RationalNode"))            return TY_RATIONAL;
-  if (!strcmp(ty, "StringNode"))              return TY_STRING;
-  if (!strcmp(ty, "SourceFileNode"))          return TY_STRING;
-  if (!strcmp(ty, "SourceLineNode"))          return TY_INT;
-  if (!strcmp(ty, "SourceEncodingNode"))      return TY_POLY;
-  if (!strcmp(ty, "RegularExpressionNode") ||
-      !strcmp(ty, "InterpolatedRegularExpressionNode")) return TY_REGEX;
-  if (!strcmp(ty, "InterpolatedStringNode"))  return TY_STRING;
-  if (!strcmp(ty, "XStringNode") || !strcmp(ty, "InterpolatedXStringNode")) return TY_STRING;
-  if (!strcmp(ty, "InterpolatedSymbolNode"))  return TY_SYMBOL;
-  if (!strcmp(ty, "SymbolNode"))              return TY_SYMBOL;
-  if (!strcmp(ty, "TrueNode"))                return TY_BOOL;
-  if (!strcmp(ty, "FalseNode"))               return TY_BOOL;
-  if (!strcmp(ty, "NilNode"))                 return TY_NIL;
-  if (!strcmp(ty, "RangeNode")) {
+  if (nk == NK_IntegerNode)             return TY_INT;
+  if (nk == NK_FloatNode)               return TY_FLOAT;
+  if (nk == NK_ImaginaryNode)           return TY_COMPLEX;
+  if (nk == NK_RationalNode)            return TY_RATIONAL;
+  if (nk == NK_StringNode)              return TY_STRING;
+  if (nk == NK_SourceFileNode)          return TY_STRING;
+  if (nk == NK_SourceLineNode)          return TY_INT;
+  if (nk == NK_SourceEncodingNode)      return TY_POLY;
+  if (nk == NK_RegularExpressionNode ||
+      nk == NK_InterpolatedRegularExpressionNode) return TY_REGEX;
+  if (nk == NK_InterpolatedStringNode)  return TY_STRING;
+  if (nk == NK_XStringNode || nk == NK_InterpolatedXStringNode) return TY_STRING;
+  if (nk == NK_InterpolatedSymbolNode)  return TY_SYMBOL;
+  if (nk == NK_SymbolNode)              return TY_SYMBOL;
+  if (nk == NK_TrueNode)                return TY_BOOL;
+  if (nk == NK_FalseNode)               return TY_BOOL;
+  if (nk == NK_NilNode)                 return TY_NIL;
+  if (nk == NK_RangeNode) {
     /* infer the bounds so codegen can tell an int range from a string range */
     int lo = nt_ref(nt, id, "left"), hi = nt_ref(nt, id, "right");
     if (lo >= 0) infer_type(c, lo);
@@ -2165,7 +2212,7 @@ TyKind infer_uncached(Compiler *c, int id) {
      element type of the splatted collection, so the literal stays a typed
      array instead of widening to poly_array. The value returned here is the
      would-be element type, which the ArrayNode arm unifies in. */
-  if (!strcmp(ty, "SplatNode")) {
+  if (nk == NK_SplatNode) {
     int inner = nt_ref(nt, id, "expression");
     if (inner < 0) return TY_UNKNOWN;
     const char *ity = nt_type(nt, inner);
@@ -2177,22 +2224,22 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (ty_is_array(it)) return ty_array_elem(it);
     return TY_POLY;
   }
-  if (!strcmp(ty, "LambdaNode"))              return TY_PROC;
+  if (nk == NK_LambdaNode)              return TY_PROC;
   /* an assignment expression evaluates to the assigned value -- but codegen
      lowers `x = expr` to `({ lv_x = ...; lv_x; })`, so the chain value IS the
      slot. Return the local's slot type (when known) so a chained `a = b = expr`
      boxes consistently with the slot, mirroring the ivar-write rule below. */
-  if (!strcmp(ty, "LocalVariableWriteNode")) {
+  if (nk == NK_LocalVariableWriteNode) {
     const char *lwn = nt_str(nt, id, "name");
     Scope *lws = comp_scope_of(c, id);
     LocalVar *lwv = lwn ? scope_local(lws, lwn) : NULL;
     if (lwv && lwv->type != TY_UNKNOWN) return lwv->type;
     return infer_type(c, nt_ref(nt, id, "value"));
   }
-  if (!strcmp(ty, "InstanceVariableWriteNode") ||
-      !strcmp(ty, "InstanceVariableOrWriteNode") ||
-      !strcmp(ty, "InstanceVariableAndWriteNode") ||
-      !strcmp(ty, "InstanceVariableOperatorWriteNode")) {
+  if (nk == NK_InstanceVariableWriteNode ||
+      nk == NK_InstanceVariableOrWriteNode ||
+      nk == NK_InstanceVariableAndWriteNode ||
+      nk == NK_InstanceVariableOperatorWriteNode) {
     /* expression evaluates to the ivar slot's type (same as a read): codegen
        lowers `@a = expr` to `({ iv_a = ...; iv_a; })`, so the chain value IS the
        slot, and inference must match to keep `@x = @a = expr` boxing consistent. */
@@ -2203,7 +2250,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     int iv = nm ? comp_ivar_index(ci, nm) : -1;
     return iv >= 0 ? ci->ivar_types[iv] : TY_UNKNOWN;
   }
-  if (!strcmp(ty, "LocalVariableOperatorWriteNode")) {
+  if (nk == NK_LocalVariableOperatorWriteNode) {
     const char *nm2 = nt_str(nt, id, "name");
     Scope *s2 = comp_scope_of(c, id);
     LocalVar *lv2 = nm2 ? scope_local(s2, nm2) : NULL;
@@ -2214,7 +2261,7 @@ TyKind infer_uncached(Compiler *c, int id) {
       return (ct2 == TY_FLOAT || vt2 == TY_FLOAT) ? TY_FLOAT : TY_INT;
     return ct2 != TY_UNKNOWN ? ct2 : vt2;
   }
-  if (!strcmp(ty, "LocalVariableOrWriteNode") || !strcmp(ty, "LocalVariableAndWriteNode")) {
+  if (nk == NK_LocalVariableOrWriteNode || nk == NK_LocalVariableAndWriteNode) {
     const char *nm = nt_str(nt, id, "name");
     Scope *s = comp_scope_of(c, id);
     LocalVar *lv = nm ? scope_local(s, nm) : NULL;
@@ -2222,7 +2269,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     return ty_unify(ct, infer_type(c, nt_ref(nt, id, "value")));
   }
 
-  if (!strcmp(ty, "LocalVariableReadNode")) {
+  if (nk == NK_LocalVariableReadNode) {
     const char *nm = nt_str(nt, id, "name");
     Scope *s = comp_scope_of(c, id);
     /* &block param that escapes (not yield-inlined): the LocalVar slot type is
@@ -2235,7 +2282,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (lv) return lv->type;
     return TY_UNKNOWN;
   }
-  if (!strcmp(ty, "GlobalVariableReadNode")) {
+  if (nk == NK_GlobalVariableReadNode) {
     const char *nm = nt_str(nt, id, "name");
     /* predefined punctuation globals: $/ defaults to "\n"; $! / $; / $, read nil */
     if (nm && !strcmp(nm, "$/")) return TY_STRING;
@@ -2249,7 +2296,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     LocalVar *lv = rn ? comp_gvar(c, rn) : NULL;
     return lv ? lv->type : TY_UNKNOWN;
   }
-  if (!strcmp(ty, "ConstantReadNode")) {
+  if (nk == NK_ConstantReadNode) {
     const char *nm = nt_str(nt, id, "name");
     LocalVar *lv = nm ? comp_const(c, nm) : NULL;
     if (lv) return lv->type;
@@ -2262,10 +2309,10 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (nm && is_builtin_class_name(nm)) return TY_CLASS;
     return TY_UNKNOWN;
   }
-  if (!strcmp(ty, "DefinedNode")) return TY_STRING;  /* a label string, or nil (NULL) */
-  if (!strcmp(ty, "NumberedReferenceReadNode")) return TY_STRING;  /* $1..$9: capture, or nil (NULL) */
-  if (!strcmp(ty, "BackReferenceReadNode")) return TY_STRING;  /* $&/$`/$'/$~/$+: nullable string */
-  if (!strcmp(ty, "ConstantPathNode")) {
+  if (nk == NK_DefinedNode) return TY_STRING;  /* a label string, or nil (NULL) */
+  if (nk == NK_NumberedReferenceReadNode) return TY_STRING;  /* $1..$9: capture, or nil (NULL) */
+  if (nk == NK_BackReferenceReadNode) return TY_STRING;  /* $&/$`/$'/$~/$+: nullable string */
+  if (nk == NK_ConstantPathNode) {
     /* M::CONST -> resolve by the final path component (constants register
        under their unqualified name) */
     const char *nm = nt_str(nt, id, "name");
@@ -2303,7 +2350,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     }
     return TY_UNKNOWN;
   }
-  if (!strcmp(ty, "SelfNode")) {
+  if (nk == NK_SelfNode) {
     Scope *s = comp_scope_of(c, id);
     int self_cls = s->class_id;
     /* `self` inside an instance_eval/exec block is the rebound receiver. */
@@ -2319,7 +2366,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (!strcmp(cn, "Object"))  return TY_POLY;  /* dynamic: called on any receiver type */
     return ty_object(self_cls);
   }
-  if (!strcmp(ty, "InstanceVariableReadNode")) {
+  if (nk == NK_InstanceVariableReadNode) {
     const char *nm = nt_str(nt, id, "name");
     Scope *s = comp_scope_of(c, id);
     int cls_id = (s->class_id >= 0) ? s->class_id : an_ie_class_id;
@@ -2330,7 +2377,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     int iv = nm ? comp_ivar_index(ci, nm) : -1;
     return iv >= 0 ? ci->ivar_types[iv] : TY_UNKNOWN;
   }
-  if (!strcmp(ty, "ClassVariableReadNode")) {
+  if (nk == NK_ClassVariableReadNode) {
     const char *nm = nt_str(nt, id, "name");
     Scope *s = comp_scope_of(c, id);
     int cid = s->class_id;
@@ -2339,12 +2386,12 @@ TyKind infer_uncached(Compiler *c, int id) {
     int idx = nm ? comp_cvar_index(&c->classes[cid], nm) : -1;
     return idx >= 0 ? c->classes[cid].cvar_types[idx] : TY_UNKNOWN;
   }
-  if (!strcmp(ty, "ClassVariableWriteNode") ||
-      !strcmp(ty, "ClassVariableOperatorWriteNode") ||
-      !strcmp(ty, "ClassVariableOrWriteNode") ||
-      !strcmp(ty, "ClassVariableAndWriteNode"))
+  if (nk == NK_ClassVariableWriteNode ||
+      nk == NK_ClassVariableOperatorWriteNode ||
+      nk == NK_ClassVariableOrWriteNode ||
+      nk == NK_ClassVariableAndWriteNode)
     return infer_type(c, nt_ref(nt, id, "value"));
-  if (!strcmp(ty, "IndexOrWriteNode") || !strcmp(ty, "IndexAndWriteNode")) {
+  if (nk == NK_IndexOrWriteNode || nk == NK_IndexAndWriteNode) {
     int recv = nt_ref(nt, id, "receiver");
     if (recv < 0) return TY_UNKNOWN;
     TyKind rt = infer_type(c, recv);
@@ -2352,19 +2399,19 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (ty_is_hash(rt)) return ty_hash_val(rt);
     return TY_POLY;
   }
-  if (!strcmp(ty, "ParenthesesNode")) {
+  if (nk == NK_ParenthesesNode) {
     int body = nt_ref(nt, id, "body");
     if (body < 0) return TY_NIL;
     int n = 0;
     const int *b = nt_arr(nt, body, "body", &n);
     return n > 0 ? infer_type(c, b[n - 1]) : TY_NIL;
   }
-  if (!strcmp(ty, "StatementsNode")) {
+  if (nk == NK_StatementsNode) {
     int n = 0;
     const int *b = nt_arr(nt, id, "body", &n);
     return n > 0 ? infer_type(c, b[n - 1]) : TY_NIL;
   }
-  if (!strcmp(ty, "CaseNode")) {
+  if (nk == NK_CaseNode) {
     /* value = unify of each when's body; a missing else means a no-match
        falls through to nil */
     int nw = 0; const int *whens = nt_arr(nt, id, "conditions", &nw);
@@ -2378,7 +2425,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     else r = ty_unify(r, TY_NIL);
     return r;
   }
-  if (!strcmp(ty, "CaseMatchNode")) {
+  if (nk == NK_CaseMatchNode) {
     /* case X; in PATTERN; ... — value = unify of each arm's body (+ else). */
     int nw = 0; const int *conds = nt_arr(nt, id, "conditions", &nw);
     int else_c = nt_ref(nt, id, "else_clause");
@@ -2390,19 +2437,19 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (else_c >= 0) { int st = nt_ref(nt, else_c, "statements"); r = ty_unify(r, st >= 0 ? infer_type(c, st) : TY_NIL); }
     return r;
   }
-  if (!strcmp(ty, "IfNode") || !strcmp(ty, "UnlessNode")) {
-    int is_unless = !strcmp(ty, "UnlessNode");
+  if (nk == NK_IfNode || nk == NK_UnlessNode) {
+    int is_unless = nk == NK_UnlessNode;
     int then_b = nt_ref(nt, id, "statements");
     int else_b = nt_ref(nt, id, is_unless ? "else_clause" : "subsequent");
     TyKind tt = then_b >= 0 ? infer_type(c, then_b) : TY_NIL;
     TyKind et = else_b >= 0 ? infer_type(c, else_b) : TY_NIL;
     return ty_unify(tt, et);
   }
-  if (!strcmp(ty, "ElseNode")) {
+  if (nk == NK_ElseNode) {
     int s = nt_ref(nt, id, "statements");
     return s >= 0 ? infer_type(c, s) : TY_NIL;
   }
-  if (!strcmp(ty, "ArrayNode")) {
+  if (nk == NK_ArrayNode) {
     int n = 0;
     const int *els = nt_arr(nt, id, "elements", &n);
     if (n == 0) return TY_UNKNOWN;  /* empty: element type comes from usage */
@@ -2410,7 +2457,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     for (int k = 0; k < n; k++) e = ty_unify(e, infer_type(c, els[k]));
     return ty_array_of(e);
   }
-  if (!strcmp(ty, "HashNode") || !strcmp(ty, "KeywordHashNode")) {
+  if (nk == NK_HashNode || nk == NK_KeywordHashNode) {
     int n = 0;
     const int *els = nt_arr(nt, id, "elements", &n);
     if (n == 0) return TY_UNKNOWN;
@@ -2437,9 +2484,9 @@ TyKind infer_uncached(Compiler *c, int id) {
     if (hv == TY_UNKNOWN && vt != TY_UNKNOWN) return TY_POLY_POLY_HASH;
     return hv;
   }
-  if (!strcmp(ty, "YieldNode"))
+  if (nk == NK_YieldNode)
     return yield_value_type(c, (int)(comp_scope_of(c, id) - c->scopes));
-  if (!strcmp(ty, "SuperNode") || !strcmp(ty, "ForwardingSuperNode")) {
+  if (nk == NK_SuperNode || nk == NK_ForwardingSuperNode) {
     Scope *s = comp_scope_of(c, id);
     if (s->class_id < 0 || !s->name) return TY_UNKNOWN;
     const char *shadow = comp_prep_chain_target(c, s->class_id, s->name);
@@ -2453,13 +2500,13 @@ TyKind infer_uncached(Compiler *c, int id) {
     int mi = comp_method_in_chain(c, p, uname, NULL);
     return mi >= 0 ? c->scopes[mi].ret : TY_UNKNOWN;
   }
-  if (!strcmp(ty, "AndNode") || !strcmp(ty, "OrNode")) {
+  if (nk == NK_AndNode || nk == NK_OrNode) {
     TyKind lt = infer_type(c, nt_ref(nt, id, "left"));
     TyKind rt = infer_type(c, nt_ref(nt, id, "right"));
     if (lt == TY_BOOL && rt == TY_BOOL) return TY_BOOL;
     return ty_unify(lt, rt);  /* value form: a || b -> common type */
   }
-  if (!strcmp(ty, "BeginNode")) {
+  if (nk == NK_BeginNode) {
     /* value = body value unified with each rescue handler's value */
     int body = nt_ref(nt, id, "statements");
     TyKind r = body >= 0 ? infer_type(c, body) : TY_NIL;
@@ -2469,9 +2516,9 @@ TyKind infer_uncached(Compiler *c, int id) {
     }
     return r;
   }
-  if (!strcmp(ty, "CallNode")) return infer_call(c, id);
+  if (nk == NK_CallNode) return infer_call(c, id);
 
-  if (!strcmp(ty, "RescueModifierNode")) {
+  if (nk == NK_RescueModifierNode) {
     int e = nt_ref(nt, id, "expression");
     int r = nt_ref(nt, id, "rescue_expression");
     TyKind et = e >= 0 ? infer_type(c, e) : TY_NIL;
@@ -2482,7 +2529,7 @@ TyKind infer_uncached(Compiler *c, int id) {
   }
 
   /* MultiWriteNode as expression: value is the RHS array. */
-  if (!strcmp(ty, "MultiWriteNode"))
+  if (nk == NK_MultiWriteNode)
     return infer_type(c, nt_ref(nt, id, "value"));
 
   return TY_UNKNOWN;

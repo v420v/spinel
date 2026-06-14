@@ -710,6 +710,7 @@ int infer_write_types(Compiler *c) {
     /* fold into a local's type or an ivar's type (an empty `@buf=[]` filled by
        `@buf << x` infers its element type the same way a local does) */
     TyKind *slot = NULL;
+    const char *watch_nm = NULL;  /* ivar name for SP_IVWATCH, NULL for locals */
     if (rty && !strcmp(rty, "LocalVariableReadNode")) {
       const char *rnm = nt_str(nt, recv, "name");
       Scope *lsc = rnm ? comp_scope_of(c, recv) : NULL;
@@ -742,6 +743,7 @@ int infer_write_types(Compiler *c) {
       int iv = inm ? comp_ivar_index(ci, inm) : -1;
       if (iv < 0) continue;
       slot = &ci->ivar_types[iv];
+      watch_nm = inm;
       /* If the slot is TY_UNKNOWN but has a direct InstanceVariableWriteNode
          that assigns a typed value OR an empty array/hash literal (e.g.
          @buf = [nil]*7 or @free = []), skip usage-driven hash promotion
@@ -860,6 +862,7 @@ int infer_write_types(Compiler *c) {
       if (*slot != TY_UNKNOWN && !ty_is_hash(*slot)) continue;
       *slot = TY_POLY_POLY_HASH;
     }
+    sp_ivwatch(watch_nm, is_push ? "usage_push" : (is_idx_write ? "usage_idxwrite" : "usage_read"), before, *slot);
     if (*slot != before) changed = 1;
   }
 
@@ -2557,6 +2560,25 @@ TyKind return_node_type(Compiler *c, int id) {
 int infer_return_types(Compiler *c) {
   const NodeTable *nt = c->nt;
   int changed = 0;
+  int ns = c->nscopes;
+  /* Accumulate each scope's explicit-return type in a single node pass.
+     The naive form rescanned every node for every scope (O(scopes*nodes));
+     on a large input that dominates. Group ReturnNodes by their owning scope
+     once instead. */
+  TyKind *ret_acc = (TyKind *)malloc(sizeof(TyKind) * (size_t)ns);
+  char *has_ret = (char *)calloc((size_t)ns, 1);
+  if (ret_acc && has_ret) {
+    for (int id = 0; id < nt->count; id++) {
+      if (nt_kind(nt, id) != NK_ReturnNode) continue;
+      Scope *rs = comp_scope_of(c, id);
+      if (!rs) continue;
+      int si = (int)(rs - c->scopes);
+      if (si < 0 || si >= ns) continue;
+      TyKind rt = return_node_type(c, id);
+      ret_acc[si] = has_ret[si] ? ty_unify(ret_acc[si], rt) : rt;
+      has_ret[si] = 1;
+    }
+  }
   /* implicit return: the body's value */
   for (int s = 1; s < c->nscopes; s++) {
     Scope *sc = &c->scopes[s];
@@ -2568,16 +2590,12 @@ int infer_return_types(Compiler *c) {
     /* An empty method body returns nil; if its value is used at all it must
        be poly (a void C function yields nothing to read). */
     int empty_body = sc->body < 0;
-    if (sc->body >= 0 && nt_type(nt, sc->body) && !strcmp(nt_type(nt, sc->body), "StatementsNode")) {
+    if (sc->body >= 0 && nt_kind(nt, sc->body) == NK_StatementsNode) {
       int bn = 0; nt_arr(nt, sc->body, "body", &bn); if (bn == 0) empty_body = 1;
     }
     TyKind r = empty_body ? TY_POLY : infer_type(c, sc->body);
-    /* explicit returns within this scope */
-    for (int id = 0; id < nt->count; id++) {
-      const char *ty = nt_type(nt, id);
-      if (ty && !strcmp(ty, "ReturnNode") && comp_scope_of(c, id) == sc)
-        r = ty_unify(r, return_node_type(c, id));
-    }
+    /* explicit returns within this scope (collected above) */
+    if (has_ret && has_ret[s]) r = ty_unify(r, ret_acc[s]);
     if (r != sc->ret) { sc->ret = r; changed = 1; }
     /* For a method with a &block param, record the value type its block yields
        (unified across all call sites). Blocks passed to it are emitted returning
@@ -2605,6 +2623,7 @@ int infer_return_types(Compiler *c) {
       if (pr != TY_UNKNOWN && sc->ret_proc_ret != (int)pr) { sc->ret_proc_ret = (int)pr; changed = 1; }
     }
   }
+  free(ret_acc); free(has_ret);
   return changed;
 }
 

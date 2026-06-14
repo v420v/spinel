@@ -1,4 +1,21 @@
 #include "analyze_internal.h"
+#include <stdio.h>
+#include <stdlib.h>
+
+/* Debug: trace a single ivar's type transitions. Gated by SP_IVWATCH=<name>
+   (bare name, no @). Zero-cost when the env var is unset. */
+void sp_ivwatch(const char *name, const char *where, TyKind old, TyKind nw) {
+  if (old == nw || !name) return;
+  static const char *want = NULL;
+  static int inited = 0;
+  if (!inited) { want = getenv("SP_IVWATCH"); inited = 1; }
+  if (!want) return;
+  if (name[0] == '@') name++;        /* match with or without leading @ */
+  if (strcmp(want, name)) return;
+  fprintf(stderr, "[ivwatch %s] %-28s %d(%s) -> %d(%s)\n",
+          name, where, (int)old, ty_name(old < 1000 ? old : TY_POLY),
+          (int)nw, ty_name(nw < 1000 ? nw : TY_POLY));
+}
 
 void collect_def_params(Compiler *c, int def_id, Scope *s) {
   int pn = nt_ref(c->nt, def_id, "parameters");
@@ -1862,6 +1879,7 @@ int infer_ivar_types(Compiler *c) {
           vt = ci->ivar_types[iv];  /* keep existing type, don't widen */
       }
       TyKind merged = ty_unify(ci->ivar_types[iv], vt);
+      sp_ivwatch(nm, "ivar_write_merge", ci->ivar_types[iv], merged);
       if (merged != ci->ivar_types[iv]) { ci->ivar_types[iv] = merged; changed = 1; }
       /* Propagate to transplanted copies (module included into a class).
          Body nodes still point to the module scope, so cls_id2 is the module.
@@ -1876,6 +1894,7 @@ int infer_ivar_types(Compiler *c) {
           ClassInfo *tc = &c->classes[ts->class_id];
           int tiv = comp_ivar_intern(tc, nm);
           TyKind tmerged = ty_unify(tc->ivar_types[tiv], vt);
+          sp_ivwatch(nm, "transplant_merge", tc->ivar_types[tiv], tmerged);
           if (tmerged != tc->ivar_types[tiv]) { tc->ivar_types[tiv] = tmerged; changed = 1; }
         }
       }

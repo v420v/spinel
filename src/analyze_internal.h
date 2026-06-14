@@ -166,6 +166,8 @@ void inherit_members(Compiler *c);
 int infer_inherited_ivars(Compiler *c);
 int infer_cvar_types(Compiler *c);
 int infer_ivar_types(Compiler *c);
+void sp_ivwatch(const char *name, const char *where, TyKind old, TyKind nw);
+void sp_narrow_memo_bump(void);
 int infer_write_types(Compiler *c);
 int bind_call_params(Compiler *c, int call_id, int mi);
 int propagate_prep_params(Compiler *c);

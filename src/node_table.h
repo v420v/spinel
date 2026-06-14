@@ -29,6 +29,7 @@ typedef struct {
   SpIntField *i; int ni, ci;
   SpRefField *r; int nr, cr;
   SpArrField *a; int na, ca;
+  int kind;            /* cached NodeKind+1; 0 = not yet computed (see nt_kind) */
 } SpNode;
 
 typedef struct {
@@ -37,6 +38,152 @@ typedef struct {
   int root_id;
   char *source_file;   /* SOURCE_FILE path (unescaped), NULL if none */
 } NodeTable;
+
+
+/* Node-type kinds. The parser emits the type as a string ("CallNode"); to
+   avoid an strcmp ladder on every per-node dispatch in the (iterated) analysis
+   passes, each node caches an integer kind, computed once by nt_kind. */
+#define SP_NODE_KINDS(X) \
+  X(AliasGlobalVariableNode) \
+  X(AliasMethodNode) \
+  X(AlternationPatternNode) \
+  X(AndNode) \
+  X(ArrayNode) \
+  X(ArrayPatternNode) \
+  X(AssocNode) \
+  X(AssocSplatNode) \
+  X(BackReferenceReadNode) \
+  X(BeginNode) \
+  X(BlockArgumentNode) \
+  X(BlockNode) \
+  X(BlockParameterNode) \
+  X(BlockParametersNode) \
+  X(BreakNode) \
+  X(CallAndWriteNode) \
+  X(CallNode) \
+  X(CallOrWriteNode) \
+  X(CallTargetNode) \
+  X(CapturePatternNode) \
+  X(CaseMatchNode) \
+  X(CaseNode) \
+  X(ClassNode) \
+  X(ClassVariableAndWriteNode) \
+  X(ClassVariableOperatorWriteNode) \
+  X(ClassVariableOrWriteNode) \
+  X(ClassVariableReadNode) \
+  X(ClassVariableTargetNode) \
+  X(ClassVariableWriteNode) \
+  X(ConstantAndWriteNode) \
+  X(ConstantOperatorWriteNode) \
+  X(ConstantOrWriteNode) \
+  X(ConstantPathAndWriteNode) \
+  X(ConstantPathNode) \
+  X(ConstantPathOperatorWriteNode) \
+  X(ConstantPathOrWriteNode) \
+  X(ConstantPathTargetNode) \
+  X(ConstantPathWriteNode) \
+  X(ConstantReadNode) \
+  X(ConstantTargetNode) \
+  X(ConstantWriteNode) \
+  X(DefNode) \
+  X(DefinedNode) \
+  X(ElseNode) \
+  X(EmbeddedStatementsNode) \
+  X(FalseNode) \
+  X(FloatNode) \
+  X(ForNode) \
+  X(ForwardingSuperNode) \
+  X(GlobalVariableAndWriteNode) \
+  X(GlobalVariableOperatorWriteNode) \
+  X(GlobalVariableOrWriteNode) \
+  X(GlobalVariableReadNode) \
+  X(GlobalVariableTargetNode) \
+  X(GlobalVariableWriteNode) \
+  X(HashNode) \
+  X(HashPatternNode) \
+  X(IfNode) \
+  X(ImaginaryNode) \
+  X(InNode) \
+  X(IndexAndWriteNode) \
+  X(IndexOperatorWriteNode) \
+  X(IndexOrWriteNode) \
+  X(IndexTargetNode) \
+  X(InstanceVariableAndWriteNode) \
+  X(InstanceVariableOperatorWriteNode) \
+  X(InstanceVariableOrWriteNode) \
+  X(InstanceVariableReadNode) \
+  X(InstanceVariableTargetNode) \
+  X(InstanceVariableWriteNode) \
+  X(IntegerNode) \
+  X(InterpolatedRegularExpressionNode) \
+  X(InterpolatedStringNode) \
+  X(InterpolatedSymbolNode) \
+  X(InterpolatedXStringNode) \
+  X(KeywordHashNode) \
+  X(KeywordRestParameterNode) \
+  X(LambdaNode) \
+  X(LocalVariableAndWriteNode) \
+  X(LocalVariableOperatorWriteNode) \
+  X(LocalVariableOrWriteNode) \
+  X(LocalVariableReadNode) \
+  X(LocalVariableTargetNode) \
+  X(LocalVariableWriteNode) \
+  X(MatchRequiredNode) \
+  X(ModuleNode) \
+  X(MultiTargetNode) \
+  X(MultiWriteNode) \
+  X(NextNode) \
+  X(NilNode) \
+  X(NumberedParametersNode) \
+  X(NumberedReferenceReadNode) \
+  X(OperatorWriteNode) \
+  X(OptionalKeywordParameterNode) \
+  X(OrNode) \
+  X(ParametersNode) \
+  X(ParenthesesNode) \
+  X(PinnedExpressionNode) \
+  X(PinnedVariableNode) \
+  X(PostExecutionNode) \
+  X(PreExecutionNode) \
+  X(RangeNode) \
+  X(RationalNode) \
+  X(RedoNode) \
+  X(RegularExpressionNode) \
+  X(RequiredParameterNode) \
+  X(RescueModifierNode) \
+  X(RescueNode) \
+  X(RestParameterNode) \
+  X(RetryNode) \
+  X(ReturnNode) \
+  X(SelfNode) \
+  X(SingletonClassNode) \
+  X(SourceEncodingNode) \
+  X(SourceFileNode) \
+  X(SourceLineNode) \
+  X(SplatNode) \
+  X(StatementsNode) \
+  X(StringNode) \
+  X(SuperNode) \
+  X(SymbolNode) \
+  X(TrueNode) \
+  X(UndefNode) \
+  X(UnlessNode) \
+  X(UntilNode) \
+  X(WhileNode) \
+  X(XStringNode) \
+  X(YieldNode)
+
+typedef enum {
+  NK_NONE = 0,
+#define X(n) NK_##n,
+  SP_NODE_KINDS(X)
+#undef X
+  NK__COUNT
+} NodeKind;
+
+/* Integer node-type, computed once per node and cached. NK_NONE if the node
+   has no type or an unrecognized one. */
+NodeKind nt_kind(const NodeTable *nt, int id);
 
 /* Build a node table from the parser's text AST (NUL-terminated). The
    buffer is consumed read-only; the table owns its own copies. Returns
