@@ -22,6 +22,9 @@
 #include <stdarg.h>
 #include <limits.h>
 #include <prism.h>
+#if defined(_WIN32)
+#include <process.h>  /* _getpid -- for a unique temp-file name (no open_memstream on MinGW) */
+#endif
 
 /* ---- Output buffer ---- */
 static char **lines;
@@ -2337,6 +2340,34 @@ int main(int argc, char **argv) {
    frees), or NULL on error. `argv0` locates the stdlib for plain requires.
    Avoids any on-disk intermediate by writing to an in-memory stream. */
 char *sp_parse_file_to_text(const char *source_file, const char *argv0) {
+#if defined(_WIN32)
+  /* MinGW/MSVCRT has no open_memstream, and tmpfile() opens in the (often
+     unwritable) drive root on CI. Capture sp_parse_emit's output through a
+     uniquely-named temp file in TEMP/TMP, then read it back. */
+  const char *td = getenv("TEMP");
+  if (!td) td = getenv("TMP");
+  if (!td) td = ".";
+  char path[4096];
+  snprintf(path, sizeof path, "%s\\spinel_ast_%d.tmp", td, (int)_getpid());
+  FILE *out = fopen(path, "wb+");
+  if (!out) return NULL;
+  int rc = sp_parse_emit(source_file, argv0, out);
+  char *buf = NULL;
+  if (rc == 0 && fflush(out) == 0 && fseek(out, 0, SEEK_END) == 0) {
+    long sz = ftell(out);
+    if (sz >= 0) {
+      rewind(out);
+      buf = (char *)malloc((size_t)sz + 1);
+      if (buf) {
+        size_t n = fread(buf, 1, (size_t)sz, out);
+        buf[n] = '\0';
+      }
+    }
+  }
+  fclose(out);
+  remove(path);
+  return buf;
+#else
   char *buf = NULL;
   size_t sz = 0;
   FILE *out = open_memstream(&buf, &sz);
@@ -2348,4 +2379,5 @@ char *sp_parse_file_to_text(const char *source_file, const char *argv0) {
     return NULL;
   }
   return buf;
+#endif
 }
