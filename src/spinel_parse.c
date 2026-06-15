@@ -2259,6 +2259,14 @@ static int sp_parse_emit(const char *source_file, const char *argv0, SpStrBuf *o
   }
 
   /* Resolve require_relative and plain require */
+  /* Register the entry file itself as already-included, so a circular
+     require_relative pointing back at it resolves to the dedup stub
+     instead of splicing the entry's body a second time (#1373). */
+  {
+    char *entry_canon = sp_canonical_path(source_file);
+    sp_mark_path_included(entry_canon);
+    free(entry_canon);
+  }
   char *resolved = resolve_requires(source, source_file);
   free(source);
   source = resolve_plain_requires(resolved, argv0);
