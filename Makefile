@@ -175,8 +175,8 @@ rbs-missing:
 else
 rbs_extract: spinel_rbs_extract$(EXE)
 
-spinel_rbs_extract$(EXE): spinel_rbs_extract.c $(RBS_LIB)
-	$(CC) $(CFLAGS) -I$(RBS_INC) spinel_rbs_extract.c $(RBS_LIB) -o $@
+spinel_rbs_extract$(EXE): tools/spinel_rbs_extract.c $(RBS_LIB)
+	$(CC) $(CFLAGS) -I$(RBS_INC) tools/spinel_rbs_extract.c $(RBS_LIB) -o $@
 endif
 
 # ---- Runtime library (regexp + bigint + …) ----
