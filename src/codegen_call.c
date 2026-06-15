@@ -2839,11 +2839,13 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
               buf_printf(b, " + %d)); _t%d ? sp_box_obj(_t%d, SP_BUILTIN_OBJECT) : sp_box_nil(); })", off, rt3, rt3);
             }
             else {
-              buf_printf(b, "((mrb_int)(*(((%s *)((char *)(", ctype);
+              /* `+ off` must apply to the char* (byte offset), not the typed
+                 pointer (which would scale it by sizeof(elem)). */
+              buf_printf(b, "((mrb_int)(*(%s *)((char *)(", ctype);
               TyKind at = comp_ntype(c, argv[0]);
               if (at == TY_POLY) { emit_expr(c, argv[0], b); buf_puts(b, ").v.p"); }
               else emit_expr(c, argv[0], b);
-              buf_printf(b, ") + %d))))", off);
+              buf_printf(b, " + %d)))", off);
             }
           }
           return;
