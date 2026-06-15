@@ -118,6 +118,20 @@ int sp_system_args(int argc, const char *const *argv) {
   }
   fflush(NULL);
 #ifdef _WIN32
+  if (argc == 1) {
+    /* Single-string form: run through the shell (cmd.exe) so builtins like
+       `echo` and shell parsing work, mirroring the POSIX `/bin/sh -c` path.
+       _spawnvp would instead try to locate the whole string as an .exe. */
+    int rc = system(argv[0]);
+    if (rc == -1) {
+      sp_last_status = -1;
+      return FALSE;
+    }
+    /* MSVCRT system() returns the plain exit code; shift to match the POSIX
+       `$?` layout the callers compare against. */
+    sp_last_status = rc << 8;
+    return rc == 0 ? TRUE : FALSE;
+  }
   char **quoted_argv = (char **)malloc(sizeof(char *) * (size_t)(argc + 1));
   if (!quoted_argv) {
     sp_last_status = -1;
