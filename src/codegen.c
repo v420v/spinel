@@ -366,11 +366,18 @@ void emit_method(Compiler *c, Scope *s, Buf *b) {
   if (s->class_id >= 0 && !s->is_cmethod && s->name &&
       comp_trampoline_kind(c, s->class_id, s->name, NULL)) {
     emit_method_signature(c, s, b);
-    buf_puts(b, " {\n  return ");
-    if (method_is_void(s)) buf_puts(b, "0");
-    else if (ty_is_object(s->ret)) buf_puts(b, "NULL");
-    else buf_puts(b, default_value(s->ret));
-    buf_puts(b, ";\n}\n");
+    if (method_is_void(s)) {
+      /* A `return <value>;` in a void function is a constraint violation that
+         MinGW gcc flags under -Werror (-Wno-all doesn't cover -Wreturn-type
+         there); emit an empty body instead. */
+      buf_puts(b, " {\n}\n");
+    }
+    else {
+      buf_puts(b, " {\n  return ");
+      if (ty_is_object(s->ret)) buf_puts(b, "NULL");
+      else buf_puts(b, default_value(s->ret));
+      buf_puts(b, ";\n}\n");
+    }
     return;
   }
   emit_method_signature(c, s, b);
