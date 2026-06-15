@@ -2160,7 +2160,17 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
         const char *kp = block_param_name(c, hblk, 1);
         int dn = ++g_proc_counter;
         Buf *pb = &g_procs;
-        buf_printf(pb, "static sp_RbVal _sp_hash_dproc_%d(sp_StrPolyHash *_self_h, const char *_key) {\n", dn);
+        /* If the default block runs inside an instance/class method, thread
+           that receiver in as `self` so the block can call instance methods
+           or read ivars (the enclosing self is named `self` with `->`
+           deref). Value-typed / top-level enclosers carry no usable pointer
+           self, so pass NULL there. (#1379) */
+        int dp_self = (g_emitting_class_id >= 0 && g_self && !strcmp(g_self, "self") &&
+                       g_self_deref && !strcmp(g_self_deref, "->"));
+        const char *dp_cls = dp_self ? c->classes[g_emitting_class_id].name : NULL;
+        buf_printf(pb, "static sp_RbVal _sp_hash_dproc_%d(sp_StrPolyHash *_self_h, const char *_key, void *_dproc_self) {\n", dn);
+        if (dp_self) buf_printf(pb, "  sp_%s *self = (sp_%s *)_dproc_self; (void)self;\n", dp_cls, dp_cls);
+        else buf_puts(pb, "  (void)_dproc_self;\n");
         if (hp) buf_printf(pb, "  sp_StrPolyHash *lv_%s = _self_h; (void)lv_%s;\n", rename_local(hp), rename_local(hp));
         if (kp) buf_printf(pb, "  const char *lv_%s = _key; (void)lv_%s;\n", rename_local(kp), rename_local(kp));
         Buf *sv_pre = g_pre; int sv_ind = g_indent; const char *sv_self = g_self;
@@ -2178,8 +2188,19 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
             int san = 0; const int *sav = sargs >= 0 ? nt_arr(nt, sargs, "arguments", &san) : NULL;
             if (san == 2) {
               int vtmp = ++g_tmp;
+              /* Emit the value via a side-buffer so any hoisted prelude (e.g.
+                 an instance-method call needing arg temps) lands on its own
+                 lines before this assignment, not spliced mid-line. */
+              Buf vexpr; memset(&vexpr, 0, sizeof vexpr);
+              Buf vpre; memset(&vpre, 0, sizeof vpre);
+              Buf *svp = g_pre; g_pre = &vpre;
+              emit_expr(c, sav[1], &vexpr);
+              g_pre = svp;
+              if (vpre.p) buf_puts(pb, vpre.p);
+              free(vpre.p);
               emit_indent(pb, 1); emit_ctype(c, comp_ntype(c, sav[1]), pb);
-              buf_printf(pb, " _t%d = ", vtmp); emit_expr(c, sav[1], pb); buf_puts(pb, ";\n");
+              buf_printf(pb, " _t%d = %s;\n", vtmp, vexpr.p ? vexpr.p : "0");
+              free(vexpr.p);
               emit_indent(pb, 1); buf_puts(pb, "sp_StrPolyHash_set(");
               emit_expr(c, srecv, pb); buf_puts(pb, ", ");
               emit_expr(c, sav[0], pb); buf_puts(pb, ", ");
@@ -2193,16 +2214,24 @@ else { memcpy(dir, sf, n); dir[n] = 0; } }
             }
           }
           else {
-            emit_indent(pb, 1); buf_puts(pb, "return ");
-            if (comp_ntype(c, last) == TY_POLY) emit_expr(c, last, pb);
-            else emit_boxed(c, last, pb);
-            buf_puts(pb, ";\n");
+            Buf vexpr; memset(&vexpr, 0, sizeof vexpr);
+            Buf vpre; memset(&vpre, 0, sizeof vpre);
+            Buf *svp = g_pre; g_pre = &vpre;
+            if (comp_ntype(c, last) == TY_POLY) emit_expr(c, last, &vexpr);
+            else emit_boxed(c, last, &vexpr);
+            g_pre = svp;
+            if (vpre.p) buf_puts(pb, vpre.p);
+            free(vpre.p);
+            emit_indent(pb, 1);
+            buf_printf(pb, "return %s;\n", vexpr.p ? vexpr.p : "sp_box_nil()");
+            free(vexpr.p);
           }
         }
         else { emit_indent(pb, 1); buf_puts(pb, "return sp_box_nil();\n"); }
         g_pre = sv_pre; g_indent = sv_ind; g_self = sv_self;
         buf_puts(pb, "}\n");
-        buf_printf(b, "sp_StrPolyHash_new_dproc(_sp_hash_dproc_%d)", dn);
+        if (dp_self) buf_printf(b, "sp_StrPolyHash_new_dproc(_sp_hash_dproc_%d, (void *)self)", dn);
+        else buf_printf(b, "sp_StrPolyHash_new_dproc(_sp_hash_dproc_%d, NULL)", dn);
         return;
       }
       if (cn && !strcmp(cn, "StringScanner") && argc == 1) {
